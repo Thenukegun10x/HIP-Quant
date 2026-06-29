@@ -26,6 +26,13 @@ Optimized non-linear quants that preserve quality at extreme low bits:
 - `TQ1_0` (1.69 bpw)
 - `TQ2_0` (2.06 bpw)
 
+### 🧪 FP8 Training Formats
+Raw FP8 block formats are available for training and mixed-precision pipelines:
+- `F8_E4M3`: 4 exponent bits, 3 mantissa bits. Best for forward-pass weights and activations where precision matters more than dynamic range.
+- `F8_E5M2`: 5 exponent bits, 2 mantissa bits. Best for backward-pass gradients where larger dynamic range helps avoid overflow and underflow.
+
+Both FP8 formats use 32-element blocks with one byte per element and no block scale. `F8_E4M3` uses OCP finite-only E4M3 semantics with saturation to max finite. `F8_E5M2` uses IEEE/OCP E5M2 semantics with infinities and NaNs.
+
 ---
 
 ## 🛠️ Build Instructions
@@ -43,7 +50,7 @@ To compile the C++ source into the required Windows DLL (`hip_quantize.dll`), si
 You can build and install the Python wrapper directly via standard Python tools:
 ```powershell
 python -m build
-pip install dist/hip_quant-0.1.0-py3-none-any.whl
+pip install dist/hip_quant-0.3.0-py3-none-any.whl
 ```
 
 ### Python API Example
@@ -59,6 +66,37 @@ weights = np.random.randn(hidden_size, hidden_size).astype(np.float32)
 # Returns a tightly packed uint8 byte array exactly matching GGUF formats
 q4k_bytes = quantize(weights, type_num=12) # 12 = Q4_K
 ```
+
+### FP8 API Example
+```python
+import numpy as np
+from hip_quant import GGML_TYPE, get_hip_quant
+
+hq = get_hip_quant()
+
+x = np.random.randn(4096, 4096).astype(np.float32)
+grad = (np.random.randn(4096, 4096) * 128).astype(np.float32)
+
+# Forward-pass tensors: use E4M3 for more mantissa precision.
+x_e4m3 = hq.quantize_numpy(x, GGML_TYPE["F8_E4M3"])
+
+# Backward-pass gradients: use E5M2 for wider dynamic range.
+grad_e5m2 = hq.quantize_numpy(grad, GGML_TYPE["F8_E5M2"])
+
+# FP8 input can be expanded on the GPU before quantizing to another format.
+q4_from_e4m3 = hq.quantize_from_fp8(
+    x_e4m3.reshape(x.shape),
+    GGML_TYPE["Q4_K"],
+    source_format="E4M3",
+)
+q8_from_e5m2 = hq.quantize_from_fp8(
+    grad_e5m2.reshape(grad.shape),
+    GGML_TYPE["Q8_0"],
+    source_format="E5M2",
+)
+```
+
+`F8_E4M3` and `F8_E5M2` are project-local raw FP8 type IDs. Confirm your downstream loader agrees with these IDs before writing them into GGUF/GGML files intended for stock tooling.
 
 ---
 

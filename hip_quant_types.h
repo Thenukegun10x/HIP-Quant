@@ -140,3 +140,6 @@ typedef struct {
     uint8_t qs[QK_F8]; // 32 raw FP8 E4M3 values, no scale
 } block_f8_e4m3;
 
+typedef struct {
+    uint8_t qs[QK_F8]; // 32 raw FP8 E5M2 values, no scale
+} block_f8_e5m2;

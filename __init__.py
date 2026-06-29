@@ -27,6 +27,7 @@ GGML_TYPE = {
     "TQ1_0": 34,
     "TQ2_0": 35,
     "F8_E4M3": 36,
+    "F8_E5M2": 37,
 }
 
 GGML_TYPE_BLOCK_SIZE = {
@@ -51,6 +52,7 @@ GGML_TYPE_BLOCK_SIZE = {
     34: 256,
     35: 256,
     36: 32,
+    37: 32,
 }
 
 GGML_TYPE_BLOCK_BYTES = {
@@ -75,6 +77,7 @@ GGML_TYPE_BLOCK_BYTES = {
     34: 54,
     35: 66,
     36: 32,
+    37: 32,
 }
 
 _ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
@@ -119,6 +122,19 @@ class HipQuant:
             ctypes.c_int64,
             ctypes.POINTER(ctypes.c_float),
         ]
+        try:
+            self._quantize_tensor_fp8_e5m2_input = self._dll.quantize_tensor_fp8_e5m2_input
+            self._quantize_tensor_fp8_e5m2_input.restype = ctypes.c_size_t
+            self._quantize_tensor_fp8_e5m2_input.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float),
+            ]
+        except AttributeError:
+            self._quantize_tensor_fp8_e5m2_input = None
         self._dll.ggml_type_size_for.restype = ctypes.c_size_t
         self._dll.ggml_type_size_for.argtypes = [ctypes.c_int]
         self._dll.ggml_blck_size_for.restype = ctypes.c_size_t
@@ -213,10 +229,10 @@ class HipQuant:
             )
         return dst
 
-    def quantize_from_fp8(self, arr_fp8, type_num, imatrix=None):
-        """Quantize from FP8 E4M3 input to the given GGML type.
+    def quantize_from_fp8(self, arr_fp8, type_num, imatrix=None, source_format="E4M3"):
+        """Quantize from FP8 input to the given GGML type.
 
-        Accepts FP8 E4M3 encoded data (uint8 array, 1 byte per element).
+        Accepts FP8 E4M3 or E5M2 encoded data (uint8 array, 1 byte per element).
         The data is expanded to float32 on the GPU before quantizing,
         using 4x less host memory and transfer bandwidth than float32.
 
@@ -225,10 +241,13 @@ class HipQuant:
         prefer quantize_numpy() with float32 input.
 
         Args:
-            arr_fp8: 2-D uint8 numpy array (nrows, n_per_row) of FP8 E4M3 values,
-                     or the output of quantize_numpy(..., GGML_TYPE["F8_E4M3"]).
+            arr_fp8: 2-D uint8 numpy array (nrows, n_per_row) of FP8 values,
+                     or the output of quantize_numpy(..., GGML_TYPE["F8_E4M3"])
+                     / quantize_numpy(..., GGML_TYPE["F8_E5M2"]).
             type_num: GGML type number for the output format.
             imatrix: Optional float32 importance matrix (same logical shape).
+            source_format: "E4M3"/GGML_TYPE["F8_E4M3"] or
+                           "E5M2"/GGML_TYPE["F8_E5M2"].
 
         Returns:
             np.uint8 array of quantized bytes.
@@ -252,9 +271,20 @@ class HipQuant:
         if imatrix is not None:
             imatrix = np.ascontiguousarray(imatrix, dtype=np.float32)
             im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        result = self._dll.quantize_tensor_fp8_input(
-            int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
-        )
+        if isinstance(source_format, str):
+            source_format = source_format.upper()
+        if source_format in ("E4M3", "F8_E4M3", GGML_TYPE["F8_E4M3"]):
+            result = self._dll.quantize_tensor_fp8_input(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
+            )
+        elif source_format in ("E5M2", "F8_E5M2", GGML_TYPE["F8_E5M2"]):
+            if self._quantize_tensor_fp8_e5m2_input is None:
+                raise RuntimeError("Loaded hip_quantize.dll does not support E5M2 FP8 input")
+            result = self._quantize_tensor_fp8_e5m2_input(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
+            )
+        else:
+            raise ValueError(f"Unsupported FP8 source_format: {source_format}")
         if result != out_nbytes:
             raise RuntimeError(
                 f"Quantize (FP8 input) returned {result} bytes, expected {out_nbytes}"

@@ -25,6 +25,7 @@
 #include "kernels/quant_tq1_0.cu"
 #include "kernels/quant_tq2_0.cu"
 #include "kernels/quant_f8_e4m3.cu"
+#include "kernels/quant_f8_e5m2.cu"
 #include "kernels/fp8_expand.cu"
 #include "hip_quant_iq2xxs_data.h"
 #include "hip_quant_iq2xs_data.h"
@@ -167,6 +168,7 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 34: return sizeof(block_tq1_0) * (n_per_row / QK_K);
         case 35: return sizeof(block_tq2_0) * (n_per_row / QK_K);
         case 36: return sizeof(block_f8_e4m3) * (n_per_row / QK_F8);
+        case 37: return sizeof(block_f8_e5m2) * (n_per_row / QK_F8);
         default: return 0;
     }
 }
@@ -179,7 +181,7 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
         case 23: return (int)(n_per_row / QK_K);
-        case 36: return (int)(n_per_row / QK_F8);
+        case 36: case 37: return (int)(n_per_row / QK_F8);
         default: return 0;
     }
 }
@@ -207,6 +209,7 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
         case 34: return sizeof(block_tq1_0);
         case 35: return sizeof(block_tq2_0);
         case 36: return sizeof(block_f8_e4m3);
+        case 37: return sizeof(block_f8_e5m2);
         default: return 0;
     }
 }
@@ -217,7 +220,7 @@ __declspec(dllexport) int ggml_blck_size_for(int type) {
         case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
-        case 36: return QK_F8;
+        case 36: case 37: return QK_F8;
         default: return 0;
     }
 }
@@ -351,6 +354,11 @@ static int dispatch_quantize_kernel(
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
             break;
         }
+        case 37: {
+            hipLaunchKernelGGL(quantize_f8_e5m2_kernel, gridDim, 32, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
+            break;
+        }
         default:
             return 0;
     }
@@ -441,11 +449,11 @@ __declspec(dllexport) size_t quantize_tensor(
 }
 
 // ============================================================
-// quantize_tensor_fp8_input — FP8 E4M3 input path
+// quantize_tensor_fp8_input_impl — FP8 input path
 //
-// Accepts FP8 E4M3 source data (1 byte per element) instead of
-// float32 (4 bytes). The data is uploaded to the GPU and expanded
-// to float32 on-device before quantizing to the target type.
+// Accepts FP8 source data (1 byte per element) instead of float32
+// (4 bytes). The data is uploaded to the GPU and expanded to float32
+// on-device before quantizing to the target type.
 //
 // Benefits:
 //   - Host memory: 4x less than F32, 2x less than BF16
@@ -457,13 +465,14 @@ __declspec(dllexport) size_t quantize_tensor(
 // the standard F32 input path.
 // ============================================================
 
-__declspec(dllexport) size_t quantize_tensor_fp8_input(
+static size_t quantize_tensor_fp8_input_impl(
     int type,
     const uint8_t* src_fp8,
     uint8_t* dst,
     int64_t nrows,
     int64_t n_per_row,
-    const float* imatrix
+    const float* imatrix,
+    int src_fp8_type
 ) {
     ensure_initialized();
 
@@ -489,7 +498,7 @@ __declspec(dllexport) size_t quantize_tensor_fp8_input(
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_src_fp8) failed: %s\n", hipGetErrorString(e)); hipFree(d_src_fp8); return 0; }
     }
 
-    // === Phase 2: Expand FP8 → F32 on device ===
+    // === Phase 2: Expand FP8 -> F32 on device ===
     float *d_src = NULL;
     size_t src_f32_bytes = (size_t)total_elements * sizeof(float);
     {
@@ -499,8 +508,13 @@ __declspec(dllexport) size_t quantize_tensor_fp8_input(
     {
         int threads = 256;
         int blocks = (int)((total_elements + threads - 1) / threads);
-        hipLaunchKernelGGL(fp8_to_f32_expand_kernel, dim3(blocks), dim3(threads), 0, 0,
-            d_src_fp8, d_src, total_elements);
+        if (src_fp8_type == 37) {
+            hipLaunchKernelGGL(fp8_e5m2_to_f32_expand_kernel, dim3(blocks), dim3(threads), 0, 0,
+                d_src_fp8, d_src, total_elements);
+        } else {
+            hipLaunchKernelGGL(fp8_to_f32_expand_kernel, dim3(blocks), dim3(threads), 0, 0,
+                d_src_fp8, d_src, total_elements);
+        }
         hipError_t e = hipGetLastError();
         if (e != hipSuccess) {
             fprintf(stderr, "hip_quantize: fp8_expand kernel error: %s\n", hipGetErrorString(e));
@@ -565,6 +579,28 @@ __declspec(dllexport) size_t quantize_tensor_fp8_input(
     if (d_imatrix) hipFree(d_imatrix);
 
     return total_size;
+}
+
+__declspec(dllexport) size_t quantize_tensor_fp8_input(
+    int type,
+    const uint8_t* src_fp8,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix
+) {
+    return quantize_tensor_fp8_input_impl(type, src_fp8, dst, nrows, n_per_row, imatrix, 36);
+}
+
+__declspec(dllexport) size_t quantize_tensor_fp8_e5m2_input(
+    int type,
+    const uint8_t* src_fp8,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix
+) {
+    return quantize_tensor_fp8_input_impl(type, src_fp8, dst, nrows, n_per_row, imatrix, 37);
 }
 
 __declspec(dllexport) void quantize_reset() {
