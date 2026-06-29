@@ -1,12 +1,25 @@
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.backends._legacy._Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
 version = "0.1.0"
 description = "HIP/ROCm GPU quantization kernels for GGML types"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Thenukegun10x" }]
 dependencies = [
     "numpy>=1.23",
 ]
+
+[project.scripts]
+hip-quant = "hip_quant.__main__:main"
+hip-quant-build = "hip_quant.build:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hip_quant = ["*.h", "*.cpp", "*.ps1", "kernels/*.cu"]

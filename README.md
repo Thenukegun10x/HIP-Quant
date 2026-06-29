@@ -15,41 +15,90 @@ PyTorch is not required. If your weights are in a PyTorch tensor, convert them t
 ## Build
 
 ```powershell
-cd src\hip_quant
-.\build.ps1
+python -m hip_quant.build
 ```
 
 Produces `hip_quantize.dll`.
+
+You can override the ROCm path or GPU arch:
+
+```powershell
+python -m hip_quant.build --rocm-bin "C:\Program Files\AMD\ROCm\7.1\bin" --arch gfx1201
+```
 
 ## Usage
 
 ```python
 import numpy as np
-from hip_quant import HipQuant, GGML_TYPE
+from hip_quant import HipQuant
 
 # Load or create float32 weights as a NumPy array.
 # Shape is (nrows, n_per_row), and n_per_row must be a multiple of the quant block size.
 weights = np.random.randn(4096, 11008).astype(np.float32)
 
-# Quantize to Q4_K
 hq = HipQuant()
-qweight = hq.quantize_numpy(weights, GGML_TYPE["Q4_K"])
+print(hq.device_name)
+
+# Type names and numeric IDs both work.
+qweight = hq.quantize_numpy(weights, "Q4_K")
 
 # qweight is a flat np.uint8 array containing GGML-packed quantized bytes.
 print(qweight.dtype, qweight.shape)
+
+# Row-shaped output is often easier to write into GGUF tensor buffers.
+qrows = hq.quantize_rows(weights, "Q4_K")
+print(qrows.shape)  # (nrows, packed_row_bytes)
+
+# Write raw packed bytes directly.
+hq.quantize_to_file(weights, "Q4_K", "weight.Q4_K.bin")
+```
+
+### Imatrix Types
+
+`IQ2_XXS`, `IQ2_XS`, and `IQ1_S` require an importance matrix for GGML-compatible quantization:
+
+```python
+weights = np.random.randn(256, 4096).astype(np.float32)
+imatrix = np.ones_like(weights, dtype=np.float32)
+
+hq = HipQuant()
+qweight = hq.quantize_numpy(weights, "IQ2_XS", imatrix=imatrix)
+```
+
+If you intentionally want to run without an imatrix, pass `require_imatrix=False`.
+
+### CLI
+
+```powershell
+python -m hip_quant --type Q4_K weights.npy weights.Q4_K.bin
+```
+
+With imatrix:
+
+```powershell
+python -m hip_quant --type IQ2_XS --imatrix imatrix.npy weights.npy weights.IQ2_XS.bin
+```
+
+Installed console scripts are also provided:
+
+```powershell
+hip-quant --list-types
+hip-quant --info
+hip-quant -t Q5_K weights.npy weights.Q5_K.bin
+hip-quant-build --arch gfx1201
 ```
 
 ### Optional PyTorch Input
 
 ```python
 import torch
-from hip_quant import HipQuant, GGML_TYPE
+from hip_quant import HipQuant
 
 tensor = torch.randn(4096, 11008, dtype=torch.float32, device="cuda")
 weights = tensor.detach().cpu().numpy().astype("float32", copy=False)
 
 hq = HipQuant()
-qweight = hq.quantize_numpy(weights, GGML_TYPE["Q4_K"])
+qweight = hq.quantize_numpy(weights, "Q4_K")
 ```
 
 ### Supported types
@@ -86,6 +135,8 @@ The kernels mirror `ggml_quantize_chunk` behavior. The build uses `-ffp-contract
 ```
 src/hip_quant/
 ├── __init__.py              # Python bindings (HipQuant class)
+├── __main__.py              # CLI entry point
+├── build.py                 # python -m hip_quant.build helper
 ├── build.ps1                # Compilation script (hipcc)
 ├── hip_quant_types.h        # Block struct definitions
 ├── hip_quant_util.h         # FP16 conversion helpers
