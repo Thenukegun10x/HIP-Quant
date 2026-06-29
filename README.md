@@ -8,7 +8,6 @@ Drop-in replacement for `ggml_quantize_chunk` with identical byte-exact output (
 
 - AMD ROCm 7.1+ SDK (`hipcc`, `hipruntime`)
 - Python 3.10+
-- PyTorch with ROCm support (`pip install torch --index-url https://download.pytorch.org/whl/rocm6.2`)
 
 ## Build
 
