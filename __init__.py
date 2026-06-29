@@ -148,6 +148,10 @@ class HipQuant:
         self._dll.quantize_reset.argtypes = []
 
     @property
+    def dll_path(self):
+        return self._dll_path
+
+    @property
     def device_count(self):
         return self._dll.get_device_count()
 

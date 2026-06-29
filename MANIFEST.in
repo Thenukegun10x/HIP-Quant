@@ -3,3 +3,7 @@ include *.h
 include *.cpp
 include build.ps1
 recursive-include kernels *
+recursive-include torch_ext *
+recursive-include tests *
+include torch_api.py
+include setup_torch.py

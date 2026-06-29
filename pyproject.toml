@@ -14,6 +14,14 @@ dependencies = [
     "numpy"
 ]
 
+[project.optional-dependencies]
+torch = [
+    "torch>=2.0"
+]
+
+[project.scripts]
+hip-quant = "hip_quant.__main__:main"
+
 [tool.setuptools]
 packages = ["hip_quant"]
 
@@ -21,4 +29,14 @@ packages = ["hip_quant"]
 "hip_quant" = "."
 
 [tool.setuptools.package-data]
-"hip_quant" = ["hip_quantize.dll", "*.h", "*.cpp", "build.ps1", "kernels/*"]
+"hip_quant" = [
+    "hip_quantize.dll",
+    "*.h",
+    "*.cpp",
+    "build.ps1",
+    "kernels/*",
+    "torch_ext/*",
+    "torch_api.py",
+    "setup_torch.py",
+    "tests/torch/*.py",
+]
