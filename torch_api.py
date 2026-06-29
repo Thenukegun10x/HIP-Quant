@@ -5,28 +5,26 @@ hip_quant/torch_api.py
 Phase 2 & 3 Python API for GPU-resident FP8 operations.
 
 This module provides:
-  - Thin Python wrappers over the compiled ``hip_quant._C`` extension
-    (Phase 2: element-wise quantize / dequantize).
-  - ``Fp8LinearFunction`` — autograd-safe fake-FP8 linear layer (Phase 3).
-  - ``Fp8Linear`` — drop-in ``nn.Module`` replacement (Phase 3).
-  - ``Fp8TensorMeta`` — scale / amax tracking scaffold (Phase 4 preview).
+  Phase 2 — element-wise FP8 quant / dequant wrappers over ``hip_quant._C``.
+  Phase 3 — autograd-safe FP8 linear layers for LLM training:
+    ``Fp8LinearFunction``       — base autograd.Function (unscaled)
+    ``Fp8Linear``               — drop-in nn.Linear replacement
+    ``Fp8ScaledLinearFunction`` — autograd.Function with per-tensor amax scaling
+    ``Fp8ScaledLinear``         — Fp8Linear + delayed-scaling via Fp8TensorMeta
+    ``convert_to_fp8()``        — convert any nn.Module's Linear layers in-place
+  Phase 4 — direct HIP GEMM kernel bindings + ``Fp8TensorMeta`` scaffold.
 
-The NumPy/ctypes API in ``hip_quant.__init__`` is *not* touched; this module
-is purely additive and optional.
-
-Import guard
-------------
-The ``_C`` extension is only available after building with ``setup_torch.py``.
-This file is importable even without the extension (it raises a clear error
-at call time rather than at import time) so that the rest of the package
-can be imported in environments without PyTorch.
+The NumPy/ctypes API in ``hip_quant.__init__`` is *not* touched.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import math
+from typing import Dict, Optional, Set, Tuple, Union
 
-# Lazy import so the file can be imported without torch installed.
+# ---------------------------------------------------------------------------
+# Lazy imports — file remains importable without torch or the _C extension
+# ---------------------------------------------------------------------------
 try:
     import torch
     import torch.nn as nn
@@ -34,7 +32,6 @@ try:
 except ImportError:
     _TORCH_AVAILABLE = False
 
-# Lazy import of the C extension — not required at import time.
 _C = None
 
 
@@ -64,257 +61,501 @@ def _load_extension() -> object:
 # ===========================================================================
 
 def quantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
-    """Quantize a float32 GPU tensor to FP8 E4M3 (returned as uint8).
-
-    Args:
-        x: float32, contiguous, CUDA/HIP device tensor.
-
-    Returns:
-        uint8 tensor of same shape on the same device.
-    """
-    ext = _load_extension()
-    return ext.quantize_e4m3(x.contiguous())
+    """Quantize a float32 GPU tensor to FP8 E4M3 (returned as uint8)."""
+    return _load_extension().quantize_e4m3(x.contiguous())
 
 
 def quantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
-    """Quantize a float32 GPU tensor to FP8 E5M2 (returned as uint8).
-
-    Args:
-        x: float32, contiguous, CUDA/HIP device tensor.
-
-    Returns:
-        uint8 tensor of same shape on the same device.
-    """
-    ext = _load_extension()
-    return ext.quantize_e5m2(x.contiguous())
+    """Quantize a float32 GPU tensor to FP8 E5M2 (returned as uint8)."""
+    return _load_extension().quantize_e5m2(x.contiguous())
 
 
 def dequantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
-    """Dequantize an FP8 E4M3 uint8 tensor to float32 on-device.
-
-    Args:
-        x: uint8, contiguous, CUDA/HIP device tensor.
-
-    Returns:
-        float32 tensor of same shape on the same device.
-    """
-    ext = _load_extension()
-    return ext.dequantize_e4m3(x.contiguous())
+    """Dequantize an FP8 E4M3 uint8 tensor to float32 on-device."""
+    return _load_extension().dequantize_e4m3(x.contiguous())
 
 
 def dequantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
-    """Dequantize an FP8 E5M2 uint8 tensor to float32 on-device.
-
-    Args:
-        x: uint8, contiguous, CUDA/HIP device tensor.
-
-    Returns:
-        float32 tensor of same shape on the same device.
-    """
-    ext = _load_extension()
-    return ext.dequantize_e5m2(x.contiguous())
+    """Dequantize an FP8 E5M2 uint8 tensor to float32 on-device."""
+    return _load_extension().dequantize_e5m2(x.contiguous())
 
 
 # ===========================================================================
-# Phase 3: Autograd-safe fake FP8 linear
+# Phase 3: Autograd-safe FP8 linear
 # ===========================================================================
+
+def _sim_fp8_e4m3(x: "torch.Tensor") -> "torch.Tensor":
+    """Quantize-then-dequantize in E4M3 — applies FP8 quantization noise."""
+    return dequantize_e4m3(quantize_e4m3(x.contiguous()))
+
+
+def _sim_fp8_e5m2(x: "torch.Tensor") -> "torch.Tensor":
+    """Quantize-then-dequantize in E5M2 — applies FP8 quantization noise."""
+    return dequantize_e5m2(quantize_e5m2(x.contiguous()))
+
+
+# ---------------------------------------------------------------------------
+# Fp8LinearFunction — unscaled
+# ---------------------------------------------------------------------------
 
 class Fp8LinearFunction(torch.autograd.Function):
-    """Fake-FP8 linear operation with full autograd support.
+    """Autograd-safe fake-FP8 linear operator.
 
-    Forward pass:
-        Quantize activations and weights to E4M3, dequantize back to float32,
-        then run standard matmul + optional bias.
+    Forward  : E4M3 noise on input and weight, then float32 matmul.
+    Backward : E5M2 noise on grad_output.
 
-    Backward pass:
-        Quantize grad_output to E5M2, dequantize back, then compute grad_input
-        and grad_weight using standard matmul.
-
-    This keeps all tensors on GPU and honours autograd without requiring a
-    custom FP8 GEMM kernel.  Performance is not optimised (matmul still runs
-    in float32); use Phase 4 kernels for throughput.
+    Backward accuracy fix
+    ---------------------
+    We save ``input_f32`` (the FP8-simulated activation) rather than the raw
+    input and use it to compute ``grad_weight``.  This matches real FP8
+    hardware where the weight-gradient accumulator sees the quantized
+    activation, not the full-precision one.  The full-precision weight is
+    kept for ``grad_input`` (standard mixed-precision master-weight convention).
     """
 
     @staticmethod
-    def forward(ctx, input: "torch.Tensor",
-                weight: "torch.Tensor",
-                bias: Optional["torch.Tensor"] = None) -> "torch.Tensor":
-        # Bug 5 fix: save_for_backward only accepts Tensors.
-        # Store bias existence as a plain Python bool on ctx, then
-        # conditionally include the bias tensor in saved_tensors.
+    def forward(
+        ctx,
+        input:  "torch.Tensor",
+        weight: "torch.Tensor",
+        bias:   Optional["torch.Tensor"],
+    ) -> "torch.Tensor":
+
+        input_f32  = _sim_fp8_e4m3(input)
+        weight_f32 = _sim_fp8_e4m3(weight)
+
         ctx.has_bias = bias is not None
         if bias is not None:
-            ctx.save_for_backward(input, weight, bias)
+            ctx.save_for_backward(input_f32, weight, bias)
         else:
-            ctx.save_for_backward(input, weight)
+            ctx.save_for_backward(input_f32, weight)
 
-        # Quantize → dequantize to simulate FP8 precision loss on device
-        input_fp8  = quantize_e4m3(input)
-        weight_fp8 = quantize_e4m3(weight)
-        input_f32  = dequantize_e4m3(input_fp8)
-        weight_f32 = dequantize_e4m3(weight_fp8)
-
-        output = input_f32.matmul(weight_f32.t())
+        out = input_f32.matmul(weight_f32.t())
         if bias is not None:
-            output = output + bias
-        return output
+            out = out + bias
+        return out
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
         if ctx.has_bias:
-            input, weight, bias = ctx.saved_tensors
+            input_f32, weight, bias = ctx.saved_tensors
         else:
-            input, weight = ctx.saved_tensors
+            input_f32, weight = ctx.saved_tensors
             bias = None
 
-        # Quantize gradient to E5M2 (wider dynamic range for gradients)
-        grad_fp8 = quantize_e5m2(grad_output)
-        grad_f32 = dequantize_e5m2(grad_fp8)
-
+        grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
         grad_input  = grad_f32.matmul(weight)
-        grad_weight = grad_f32.t().matmul(input)
+        grad_weight = grad_f32.t().matmul(input_f32)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias
 
 
+# ---------------------------------------------------------------------------
+# Fp8ScaledLinearFunction — E4M3 with per-tensor amax scaling
+# ---------------------------------------------------------------------------
+
+class Fp8ScaledLinearFunction(torch.autograd.Function):
+    """Autograd-safe FP8 linear with per-tensor amax scaling.
+
+    Before quantizing, multiplies by a scale so the tensor fills the ±448
+    FP8 E4M3 range more completely, then divides after dequantizing.
+    Net math is identical to unscaled but with lower quantization noise
+    (noise is proportional to 1/scale, and scale = 448 / amax).
+
+    The input_scale and weight_scale arguments are plain Python floats —
+    they are not differentiable and do not appear in the autograd graph.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input:        "torch.Tensor",
+        weight:       "torch.Tensor",
+        bias:         Optional["torch.Tensor"],
+        input_scale:  float,
+        weight_scale: float,
+    ) -> "torch.Tensor":
+
+        input_f32  = _sim_fp8_e4m3(input  * input_scale)  * (1.0 / input_scale)
+        weight_f32 = _sim_fp8_e4m3(weight * weight_scale) * (1.0 / weight_scale)
+
+        ctx.has_bias = bias is not None
+        if bias is not None:
+            ctx.save_for_backward(input_f32, weight, bias)
+        else:
+            ctx.save_for_backward(input_f32, weight)
+
+        out = input_f32.matmul(weight_f32.t())
+        if bias is not None:
+            out = out + bias
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: "torch.Tensor"):
+        if ctx.has_bias:
+            input_f32, weight, bias = ctx.saved_tensors
+        else:
+            input_f32, weight = ctx.saved_tensors
+            bias = None
+
+        grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
+        grad_input  = grad_f32.matmul(weight)
+        grad_weight = grad_f32.t().matmul(input_f32)
+        grad_bias   = grad_output.sum(0) if bias is not None else None
+
+        # None for input_scale and weight_scale (not differentiable)
+        return grad_input, grad_weight, grad_bias, None, None
+
+
+# ---------------------------------------------------------------------------
+# Fp8Linear — unscaled nn.Module
+# ---------------------------------------------------------------------------
+
 class Fp8Linear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` using fake-FP8 forward/backward.
 
-    Weights are stored as float32 master weights.  The FP8 quantization is
-    applied at every forward call (simulating training with FP8 hardware).
+    Master weights stored as float32.  E4M3 forward noise, E5M2 backward noise.
+    No per-tensor scaling — use ``Fp8ScaledLinear`` for LLM training where
+    activation magnitudes vary widely across layers.
 
     Args:
-        in_features:  size of each input sample.
-        out_features: size of each output sample.
-        bias:         if True, add a learnable bias.
+        in_features:  input size.
+        out_features: output size.
+        bias:         learnable bias (default True).
+        device:       device for parameters.
+        dtype:        dtype for parameters (default float32).
 
     Shape:
         Input  : ``(*, in_features)``
         Output : ``(*, out_features)``
-
-    Example::
-
-        layer = Fp8Linear(512, 256).cuda()
-        x = torch.randn(32, 512, device="cuda")
-        y = layer(x)          # FP8-quantized forward
-        y.sum().backward()    # FP8-quantized backward
     """
 
-    def __init__(self, in_features: int, out_features: int,
-                 bias: bool = True) -> None:
+    def __init__(
+        self,
+        in_features:  int,
+        out_features: int,
+        bias:         bool = True,
+        device:       Optional[Union[str, "torch.device"]] = None,
+        dtype:        Optional["torch.dtype"] = None,
+    ) -> None:
         super().__init__()
+        factory = {"device": device, "dtype": dtype}
         self.in_features  = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, **factory)
+        )
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features))
+            self.bias = nn.Parameter(torch.zeros(out_features, **factory))
         else:
             self.register_parameter("bias", None)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=0.01)
+        # Match nn.Linear's default init exactly
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
-            nn.init.zeros_(self.bias)
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        # Flatten batch dims, apply FP8 linear, unflatten.
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.in_features)
-        out = Fp8LinearFunction.apply(x_2d, self.weight, self.bias)
+        x_2d = x.reshape(-1, self.in_features).contiguous()
+        out  = Fp8LinearFunction.apply(x_2d, self.weight, self.bias)
         return out.reshape(*orig_shape[:-1], self.out_features)
 
     def extra_repr(self) -> str:
-        return (f"in_features={self.in_features}, "
-                f"out_features={self.out_features}, "
-                f"bias={self.bias is not None}")
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.bias is not None}"
+        )
+
+    @classmethod
+    def from_linear(cls, linear: "nn.Linear") -> "Fp8Linear":
+        """Create an ``Fp8Linear`` by copying weights from an ``nn.Linear``.
+
+        Example::
+
+            fp8_layer = Fp8Linear.from_linear(model.lm_head)
+        """
+        layer = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        with torch.no_grad():
+            layer.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                layer.bias.copy_(linear.bias)
+        return layer
+
+    def to_linear(self) -> "nn.Linear":
+        """Convert back to a standard ``nn.Linear`` (copies weights)."""
+        linear = nn.Linear(
+            self.in_features, self.out_features,
+            bias=self.bias is not None,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        with torch.no_grad():
+            linear.weight.copy_(self.weight)
+            if self.bias is not None:
+                linear.bias.copy_(self.bias)
+        return linear
+
+
+# ---------------------------------------------------------------------------
+# Fp8ScaledLinear — per-tensor amax scaling (recommended for LLM training)
+# ---------------------------------------------------------------------------
+
+class Fp8ScaledLinear(nn.Module):
+    """``Fp8Linear`` with per-tensor delayed amax scaling.
+
+    At each forward call the input and weight amaxes are measured and stored
+    in rolling ``Fp8TensorMeta`` histories.  The derived scale factors are
+    used to fill the ±448 E4M3 range before quantizing, then divided out
+    after dequantizing.  This keeps quantization noise low even when
+    activation magnitudes are much smaller than 448 (common in early training
+    and in the first few layers of an LLM).
+
+    The amax measurement runs inside ``torch.no_grad()`` and does not affect
+    the autograd graph.  Scale values are passed as plain Python floats to
+    ``Fp8ScaledLinearFunction`` so they do not create extra graph nodes.
+
+    Args:
+        in_features:  input size.
+        out_features: output size.
+        bias:         learnable bias (default True).
+        history_len:  rolling window length for amax history (default 16).
+        device:       device for parameters.
+        dtype:        dtype for parameters.
+    """
+
+    def __init__(
+        self,
+        in_features:  int,
+        out_features: int,
+        bias:         bool = True,
+        history_len:  int  = 16,
+        device:       Optional[Union[str, "torch.device"]] = None,
+        dtype:        Optional["torch.dtype"] = None,
+    ) -> None:
+        super().__init__()
+        factory = {"device": device, "dtype": dtype}
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, **factory)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, **factory))
+        else:
+            self.register_parameter("bias", None)
+
+        dev_str = str(device) if device is not None else None
+        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=dev_str)
+        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=dev_str)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features).contiguous()
+
+        with torch.no_grad():
+            self.input_meta.update(x_2d)
+            self.weight_meta.update(self.weight)
+
+        out = Fp8ScaledLinearFunction.apply(
+            x_2d, self.weight, self.bias,
+            float(self.input_meta.scale.item()),
+            float(self.weight_meta.scale.item()),
+        )
+        return out.reshape(*orig_shape[:-1], self.out_features)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"history_len={self.input_meta._history_len}"
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear:      "nn.Linear",
+        history_len: int = 16,
+    ) -> "Fp8ScaledLinear":
+        """Create an ``Fp8ScaledLinear`` from an existing ``nn.Linear``."""
+        layer = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            history_len=history_len,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        with torch.no_grad():
+            layer.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                layer.bias.copy_(linear.bias)
+        return layer
+
+    def to_linear(self) -> "nn.Linear":
+        """Convert back to a standard ``nn.Linear``."""
+        linear = nn.Linear(
+            self.in_features, self.out_features,
+            bias=self.bias is not None,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        with torch.no_grad():
+            linear.weight.copy_(self.weight)
+            if self.bias is not None:
+                linear.bias.copy_(self.bias)
+        return linear
+
+
+# ---------------------------------------------------------------------------
+# convert_to_fp8 — one-call model converter
+# ---------------------------------------------------------------------------
+
+def convert_to_fp8(
+    model:       "nn.Module",
+    scaled:      bool                = True,
+    history_len: int                 = 16,
+    skip_names:  Optional[Set[str]] = None,
+) -> "nn.Module":
+    """Replace all ``nn.Linear`` layers in *model* with FP8 equivalents.
+
+    Walks the module tree recursively and replaces each ``nn.Linear`` with
+    either ``Fp8ScaledLinear`` (recommended, default) or ``Fp8Linear``.
+    Weights are copied; the replacement happens in-place.
+
+    Args:
+        model:       any ``nn.Module`` — mutated in-place.
+        scaled:      if True (default) use ``Fp8ScaledLinear`` with per-tensor
+                     amax scaling.  if False use plain ``Fp8Linear``.
+        history_len: amax history window (only relevant when scaled=True).
+        skip_names:  set of fully-qualified submodule names to leave unchanged.
+                     Useful for weight-tied layers, e.g. ``{"lm_head"}``.
+
+    Returns:
+        The same *model* object (mutated in-place) for convenient chaining.
+
+    Example::
+
+        model = MyGPT(vocab=32000, d_model=512, n_layers=6)
+        convert_to_fp8(model, scaled=True, skip_names={"lm_head"})
+        model.cuda()
+        # Every nn.Linear in the model is now Fp8ScaledLinear except lm_head
+    """
+    if skip_names is None:
+        skip_names = set()
+    _replace_linear(model, "", scaled=scaled,
+                    history_len=history_len, skip_names=skip_names)
+    return model
+
+
+def _replace_linear(
+    module:      "nn.Module",
+    prefix:      str,
+    scaled:      bool,
+    history_len: int,
+    skip_names:  Set[str],
+) -> None:
+    for name, child in list(module.named_children()):
+        full_name = f"{prefix}.{name}".lstrip(".")
+        if full_name in skip_names:
+            continue
+        if isinstance(child, nn.Linear):
+            if scaled:
+                rep = Fp8ScaledLinear.from_linear(child,
+                                                  history_len=history_len)
+            else:
+                rep = Fp8Linear.from_linear(child)
+            setattr(module, name, rep)
+        else:
+            _replace_linear(child, full_name, scaled=scaled,
+                            history_len=history_len, skip_names=skip_names)
 
 
 # ===========================================================================
-# Phase 4 preview: real FP8 GEMM bindings
+# Phase 4 preview: real FP8 GEMM kernel bindings
 # ===========================================================================
 
 def fp8_linear_forward(
-    input: "torch.Tensor",
+    input:  "torch.Tensor",
     weight: "torch.Tensor",
-    bias: Optional["torch.Tensor"] = None,
+    bias:   Optional["torch.Tensor"] = None,
 ) -> "torch.Tensor":
-    """GPU FP8 linear forward using the custom HIP GEMM kernel.
+    """FP8 linear forward via the custom HIP tiled GEMM kernel (Phase 4).
 
-    Unlike ``Fp8LinearFunction``, this calls into the C++ kernel directly
-    without an intermediate Python-level matmul.
-
-    Args:
-        input:  float32 [M, K] contiguous CUDA tensor.
-        weight: float32 [N, K] contiguous CUDA tensor.
-        bias:   float32 [N] contiguous CUDA tensor (optional).
-
-    Returns:
-        float32 [M, N] tensor on the same device.
+    Correctness-first stub — replace with rocBLASLt for production throughput.
     """
-    ext = _load_extension()
-    return ext.fp8_linear_forward(input.contiguous(), weight.contiguous(), bias)
+    return _load_extension().fp8_linear_forward(
+        input.contiguous(), weight.contiguous(), bias
+    )
 
 
 def fp8_linear_backward_input(
     grad_output: "torch.Tensor",
-    weight: "torch.Tensor",
+    weight:      "torch.Tensor",
 ) -> "torch.Tensor":
-    """Compute grad_input = quant(grad_output) @ weight using the HIP kernel.
-
-    Args:
-        grad_output: float32 [M, N].
-        weight:      float32 [N, K].
-
-    Returns:
-        float32 [M, K].
-    """
-    ext = _load_extension()
-    return ext.fp8_linear_backward_input(
+    """grad_input = E5M2(grad_output) @ weight  (HIP kernel, Phase 4)."""
+    return _load_extension().fp8_linear_backward_input(
         grad_output.contiguous(), weight.contiguous()
     )
 
 
 def fp8_linear_backward_weight(
     grad_output: "torch.Tensor",
-    input: "torch.Tensor",
+    input:       "torch.Tensor",
 ) -> "torch.Tensor":
-    """Compute grad_weight = quant(grad_output).T @ input using the HIP kernel.
-
-    Args:
-        grad_output: float32 [M, N].
-        input:       float32 [M, K].
-
-    Returns:
-        float32 [N, K].
-    """
-    ext = _load_extension()
-    return ext.fp8_linear_backward_weight(
+    """grad_weight = E5M2(grad_output).T @ input  (HIP kernel, Phase 4)."""
+    return _load_extension().fp8_linear_backward_weight(
         grad_output.contiguous(), input.contiguous()
     )
 
 
 # ===========================================================================
-# Phase 4 preview: scale / amax tracking scaffold
+# Phase 4 preview: Fp8TensorMeta — delayed-scaling amax tracker
 # ===========================================================================
 
 class Fp8TensorMeta:
-    """Metadata for FP8 scale management.
+    """Per-tensor FP8 scale management with a delayed-scaling strategy.
 
-    Tracks per-tensor scale, inverse-scale, and an amax history buffer
-    compatible with a delayed-scaling strategy (similar to Transformer Engine).
+    Maintains a rolling ``amax_history`` ring buffer.  Scale is derived from
+    the *maximum* observed amax across the window so that a single outlier
+    batch does not cause the scale to spike.
 
     Attributes:
-        scale:         float32 scalar tensor — multiply by this to go F32→FP8.
-        inv_scale:     float32 scalar tensor — multiply FP8 value by this to
-                       recover approximate float32.
-        amax_history:  float32 tensor of shape ``(history_len,)`` — rolling
-                       window of observed absolute maxima.
+        scale:         float32 [1] — multiply tensor by this before quantizing.
+        inv_scale:     float32 [1] — multiply dequantized values by this to
+                       recover the original magnitude.
+        amax_history:  float32 [history_len] — ring buffer of observed amaxes.
     """
 
-    def __init__(self, history_len: int = 16,
-                 device: Optional[str] = None) -> None:
+    _FP8_E4M3_MAX: float = 448.0
+
+    def __init__(
+        self,
+        history_len: int = 16,
+        device:      Optional[str] = None,
+    ) -> None:
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is not available.")
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -330,16 +571,38 @@ class Fp8TensorMeta:
         amax = tensor.abs().max().detach()
         self.amax_history[self._ptr % self._history_len] = amax
         self._ptr += 1
-        # Use the maximum observed amax across history for stability
-        observed_max = self.amax_history.max().clamp(min=1e-12)
-        # FP8 E4M3 max finite value is 448
-        self.scale     = (448.0 / observed_max).float()
+        observed_max   = self.amax_history.max().clamp(min=1e-12)
+        self.scale     = (self._FP8_E4M3_MAX / observed_max).float()
         self.inv_scale = (1.0 / self.scale).float()
 
     def quantize_e4m3(self, x: "torch.Tensor") -> "torch.Tensor":
-        """Scale *x* then quantize to FP8 E4M3."""
-        return quantize_e4m3(x * self.scale)
+        """Scale then quantize to FP8 E4M3."""
+        return quantize_e4m3((x * self.scale).contiguous())
 
     def dequantize_e4m3(self, x: "torch.Tensor") -> "torch.Tensor":
         """Dequantize FP8 E4M3 then apply inverse scale."""
         return dequantize_e4m3(x) * self.inv_scale
+
+    def to(self, device: Union[str, "torch.device"]) -> "Fp8TensorMeta":
+        """Move internal tensors to *device* (returns self for chaining)."""
+        self.scale        = self.scale.to(device)
+        self.inv_scale    = self.inv_scale.to(device)
+        self.amax_history = self.amax_history.to(device)
+        return self
+
+    def state_dict(self) -> Dict[str, "torch.Tensor"]:
+        """Serialisable state for checkpointing."""
+        return {
+            "scale":        self.scale,
+            "inv_scale":    self.inv_scale,
+            "amax_history": self.amax_history,
+            "ptr":          torch.tensor(self._ptr),
+        }
+
+    def load_state_dict(self, state: Dict[str, "torch.Tensor"]) -> None:
+        """Restore state from ``state_dict()``."""
+        self.scale        = state["scale"]
+        self.inv_scale    = state["inv_scale"]
+        self.amax_history = state["amax_history"]
+        self._ptr         = int(state["ptr"].item())
+        self._history_len = len(self.amax_history)
