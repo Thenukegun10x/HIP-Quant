@@ -26,6 +26,7 @@ GGML_TYPE = {
     "IQ4_XS": 23,
     "TQ1_0": 34,
     "TQ2_0": 35,
+    "F8_E4M3": 36,
 }
 
 GGML_TYPE_BLOCK_SIZE = {
@@ -49,6 +50,7 @@ GGML_TYPE_BLOCK_SIZE = {
     23: 256,
     34: 256,
     35: 256,
+    36: 32,
 }
 
 GGML_TYPE_BLOCK_BYTES = {
@@ -72,6 +74,7 @@ GGML_TYPE_BLOCK_BYTES = {
     23: 136,
     34: 54,
     35: 66,
+    36: 32,
 }
 
 _ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
@@ -102,6 +105,15 @@ class HipQuant:
         self._dll.quantize_tensor.argtypes = [
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self._dll.quantize_tensor_fp8_input.restype = ctypes.c_size_t
+        self._dll.quantize_tensor_fp8_input.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8),
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_int64,
             ctypes.c_int64,
@@ -193,6 +205,54 @@ class HipQuant:
         if result != len(dst):
             raise RuntimeError(
                 f"Quantize returned {result} bytes, buffer has {len(dst)}"
+            )
+        return dst
+
+    def quantize_from_fp8(self, arr_fp8, type_num, imatrix=None):
+        """Quantize from FP8 E4M3 input to the given GGML type.
+
+        Accepts FP8 E4M3 encoded data (uint8 array, 1 byte per element).
+        The data is expanded to float32 on the GPU before quantizing,
+        using 4x less host memory and transfer bandwidth than float32.
+
+        Best for low-bit targets (Q4_0 through Q5_K) where quantization
+        noise dominates over FP8 input precision. For Q8_0+ and I-Quants,
+        prefer quantize_numpy() with float32 input.
+
+        Args:
+            arr_fp8: 2-D uint8 numpy array (nrows, n_per_row) of FP8 E4M3 values,
+                     or the output of quantize_numpy(..., GGML_TYPE["F8_E4M3"]).
+            type_num: GGML type number for the output format.
+            imatrix: Optional float32 importance matrix (same logical shape).
+
+        Returns:
+            np.uint8 array of quantized bytes.
+        """
+        arr_fp8 = np.ascontiguousarray(arr_fp8, dtype=np.uint8)
+        if arr_fp8.ndim == 1:
+            arr_fp8 = arr_fp8.reshape(1, -1)
+        nrows, n_per_row = arr_fp8.shape
+        blck = self.blck_size(type_num)
+        if blck <= 0:
+            raise ValueError(f"Unsupported type: {type_num}")
+        if n_per_row % blck != 0:
+            raise ValueError(
+                f"n_per_row ({n_per_row}) must be multiple of block size ({blck})"
+            )
+        out_nbytes = nrows * (self.type_size(type_num) * (n_per_row // blck))
+        dst = np.empty(out_nbytes, dtype=np.uint8)
+        src_ptr = arr_fp8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        dst_ptr = dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        im_ptr = None
+        if imatrix is not None:
+            imatrix = np.ascontiguousarray(imatrix, dtype=np.float32)
+            im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        result = self._dll.quantize_tensor_fp8_input(
+            int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
+        )
+        if result != out_nbytes:
+            raise RuntimeError(
+                f"Quantize (FP8 input) returned {result} bytes, expected {out_nbytes}"
             )
         return dst
 

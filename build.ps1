@@ -2,7 +2,7 @@ param(
     [string]$Output = "hip_quantize.dll"
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 $hipcc = "C:\Program Files\AMD\ROCm\7.1\bin\hipcc.exe"
 
@@ -20,6 +20,8 @@ $arg_list = @(
     "-O3",
     "-ffp-contract=off",
     "-shared",
+    "-Wno-ignored-attributes",
+    "-D_CRT_SECURE_NO_WARNINGS",
     "-I", $src_dir,
     "--offload-arch=gfx1201",
     "-o", "$src_dir\hip_quantize.dll",

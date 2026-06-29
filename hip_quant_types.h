@@ -133,3 +133,10 @@ typedef struct {
     uint8_t qs[QK_K / 4]; // 2 bits per element
     ggml_half d;
 } block_tq2_0;
+
+#define QK_F8 32
+
+typedef struct {
+    uint8_t qs[QK_F8]; // 32 raw FP8 E4M3 values, no scale
+} block_f8_e4m3;
+
