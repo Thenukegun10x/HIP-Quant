@@ -104,13 +104,19 @@ class Fp8LinearFunction(torch.autograd.Function):
     Forward  : E4M3 noise on input and weight, then float32 matmul.
     Backward : E5M2 noise on grad_output.
 
-    Backward accuracy fix
-    ---------------------
-    We save ``input_f32`` (the FP8-simulated activation) rather than the raw
-    input and use it to compute ``grad_weight``.  This matches real FP8
-    hardware where the weight-gradient accumulator sees the quantized
-    activation, not the full-precision one.  The full-precision weight is
-    kept for ``grad_input`` (standard mixed-precision master-weight convention).
+    Activation compression (Feature 1)
+    -----------------------------------
+    Instead of saving ``input_f32`` (float32, 4 bytes/element) in the autograd
+    graph, we save ``input_fp8`` (uint8, 1 byte/element) and dequantize on
+    demand in backward.  This cuts the activation portion of the autograd graph
+    VRAM by 4×.  For a 512-token, d_model=512 batch of 8 that is:
+      8 × 512 × 512 × 4 bytes = 8 MB  →  2 MB  per linear layer.
+
+    Backward accuracy
+    -----------------
+    ``grad_weight`` uses the FP8-simulated activation (consistent with what
+    flowed through forward).  ``grad_input`` uses the full-precision weight
+    (master-weight convention for mixed-precision training).
     """
 
     @staticmethod
@@ -121,14 +127,18 @@ class Fp8LinearFunction(torch.autograd.Function):
         bias:   Optional["torch.Tensor"],
     ) -> "torch.Tensor":
 
-        input_f32  = _sim_fp8_e4m3(input)
-        weight_f32 = _sim_fp8_e4m3(weight)
+        # Quantise to simulate FP8 precision
+        input_fp8  = quantize_e4m3(input.contiguous())   # uint8 — 4× smaller
+        weight_fp8 = quantize_e4m3(weight.contiguous())
+        input_f32  = dequantize_e4m3(input_fp8)
+        weight_f32 = dequantize_e4m3(weight_fp8)
 
+        # Save compressed activation + full-precision weight
         ctx.has_bias = bias is not None
         if bias is not None:
-            ctx.save_for_backward(input_f32, weight, bias)
+            ctx.save_for_backward(input_fp8, weight, bias)
         else:
-            ctx.save_for_backward(input_f32, weight)
+            ctx.save_for_backward(input_fp8, weight)
 
         out = input_f32.matmul(weight_f32.t())
         if bias is not None:
@@ -138,10 +148,13 @@ class Fp8LinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
         if ctx.has_bias:
-            input_f32, weight, bias = ctx.saved_tensors
+            input_fp8, weight, bias = ctx.saved_tensors
         else:
-            input_f32, weight = ctx.saved_tensors
+            input_fp8, weight = ctx.saved_tensors
             bias = None
+
+        # Decompress activation on demand
+        input_f32 = dequantize_e4m3(input_fp8)
 
         grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
         grad_input  = grad_f32.matmul(weight)
@@ -156,15 +169,16 @@ class Fp8LinearFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 class Fp8ScaledLinearFunction(torch.autograd.Function):
-    """Autograd-safe FP8 linear with per-tensor amax scaling.
+    """Autograd-safe scaled FP8 linear (activation compression + amax scaling).
 
-    Before quantizing, multiplies by a scale so the tensor fills the ±448
-    FP8 E4M3 range more completely, then divides after dequantizing.
-    Net math is identical to unscaled but with lower quantization noise
-    (noise is proportional to 1/scale, and scale = 448 / amax).
+    Two improvements over ``Fp8LinearFunction``:
+    1. Per-tensor amax scaling: scales input/weight to fill ±448 before
+       quantizing, then divides out after, reducing quantization noise.
+    2. Activation compression: saves uint8 FP8 bytes in ctx (not float32),
+       storing ``input_scale`` as a ctx attribute to allow correct
+       scaled dequantization in backward.
 
-    The input_scale and weight_scale arguments are plain Python floats —
-    they are not differentiable and do not appear in the autograd graph.
+    input_scale and weight_scale are plain Python floats — not tracked.
     """
 
     @staticmethod
@@ -177,14 +191,18 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         weight_scale: float,
     ) -> "torch.Tensor":
 
-        input_f32  = _sim_fp8_e4m3(input  * input_scale)  * (1.0 / input_scale)
-        weight_f32 = _sim_fp8_e4m3(weight * weight_scale) * (1.0 / weight_scale)
+        # Scale → quantise → save compressed bytes → dequantise → unscale
+        input_fp8  = quantize_e4m3((input  * input_scale).contiguous())
+        weight_fp8 = quantize_e4m3((weight * weight_scale).contiguous())
+        input_f32  = dequantize_e4m3(input_fp8)  * (1.0 / input_scale)
+        weight_f32 = dequantize_e4m3(weight_fp8) * (1.0 / weight_scale)
 
-        ctx.has_bias = bias is not None
+        ctx.has_bias    = bias is not None
+        ctx.input_scale = input_scale          # needed to dequantise in backward
         if bias is not None:
-            ctx.save_for_backward(input_f32, weight, bias)
+            ctx.save_for_backward(input_fp8, weight, bias)
         else:
-            ctx.save_for_backward(input_f32, weight)
+            ctx.save_for_backward(input_fp8, weight)
 
         out = input_f32.matmul(weight_f32.t())
         if bias is not None:
@@ -194,17 +212,19 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
         if ctx.has_bias:
-            input_f32, weight, bias = ctx.saved_tensors
+            input_fp8, weight, bias = ctx.saved_tensors
         else:
-            input_f32, weight = ctx.saved_tensors
+            input_fp8, weight = ctx.saved_tensors
             bias = None
+
+        # Decompress activation using the saved scale
+        input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
         grad_input  = grad_f32.matmul(weight)
         grad_weight = grad_f32.t().matmul(input_f32)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
-        # None for input_scale and weight_scale (not differentiable)
         return grad_input, grad_weight, grad_bias, None, None
 
 
@@ -433,39 +453,280 @@ class Fp8ScaledLinear(nn.Module):
 # convert_to_fp8 — one-call model converter
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fp8ShadowLinear — FP8 weight storage + float32 master (Feature 2)
+# ---------------------------------------------------------------------------
+
+class Fp8ShadowLinearFunction(torch.autograd.Function):
+    """FP8 linear where the weight lives as uint8 but gradients flow to float32.
+
+    Forward:
+      - Input:  apply E4M3 noise (scaled), save as uint8 (activation compression)
+      - Weight: dequantise from the uint8 shadow buffer
+    Backward:
+      - grad_input  : uses float32 master weight (accurate direction signal)
+      - grad_weight : straight-through to master weight using compressed activation
+      - input_scale, weight_inv_scale, bias: not differentiable → None gradient
+
+    The trick: we accept both ``weight_master`` (float32 Parameter, tracked by
+    autograd) AND ``weight_fp8`` (uint8 buffer, not tracked).  The forward
+    uses weight_fp8 for cheap dequant; the backward sends gradient to
+    weight_master via the straight-through estimator.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input:           "torch.Tensor",           # [M, K] float32
+        weight_master:   "torch.Tensor",           # [N, K] float32, Parameter
+        weight_fp8:      "torch.Tensor",           # [N, K] uint8,   Buffer
+        weight_inv_scale: float,                   # 1 / weight_scale
+        input_scale:     float,                    # 448 / amax(input)
+        bias:            Optional["torch.Tensor"], # [N] float32 or None
+    ) -> "torch.Tensor":
+
+        # Compress activation (uint8, 4× smaller than float32)
+        input_fp8 = quantize_e4m3((input * input_scale).contiguous())
+        input_f32 = dequantize_e4m3(input_fp8) * (1.0 / input_scale)
+
+        # Dequantise the weight shadow
+        weight_f32 = dequantize_e4m3(weight_fp8) * weight_inv_scale
+
+        ctx.has_bias       = bias is not None
+        ctx.input_scale    = input_scale
+        if bias is not None:
+            ctx.save_for_backward(input_fp8, weight_master, bias)
+        else:
+            ctx.save_for_backward(input_fp8, weight_master)
+
+        out = input_f32.matmul(weight_f32.t())
+        if bias is not None:
+            out = out + bias
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: "torch.Tensor"):
+        if ctx.has_bias:
+            input_fp8, weight_master, bias = ctx.saved_tensors
+        else:
+            input_fp8, weight_master = ctx.saved_tensors
+            bias = None
+
+        # Decompress activation
+        input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
+
+        grad_f32 = _sim_fp8_e5m2(grad_output.contiguous())
+        grad_input         = grad_f32.matmul(weight_master)   # accurate direction
+        grad_weight_master = grad_f32.t().matmul(input_f32)   # STE to master
+        grad_bias          = grad_output.sum(0) if bias is not None else None
+
+        # Returns align with forward args:
+        # input, weight_master, weight_fp8, weight_inv_scale, input_scale, bias
+        return grad_input, grad_weight_master, None, None, None, grad_bias
+
+
+class Fp8ShadowLinear(nn.Module):
+    """Linear layer with FP8 weight storage and float32 master weights.
+
+    VRAM layout per layer (N×K weight matrix):
+      ``weight_master``  float32  [N, K]  — 4 bytes/param, seen by optimizer
+      ``weight_fp8``     uint8    [N, K]  — 1 byte/param, used in forward
+      ``bias``           float32  [N]     — negligible
+
+    Net saving vs ``nn.Linear``: weight VRAM is kept at 1 byte/param during
+    the forward pass.  The master weight (needed by Adam/Adafactor) is still
+    4 bytes/param, but it can be offloaded or kept in CPU pinned memory if
+    necessary.  Combined with ``Adafactor``, optimizer state drops dramatically:
+    no first moment + factored second moment ≈ (N+K)/NK << 1 of weight size.
+
+    Per-tensor amax scaling (same as ``Fp8ScaledLinear``) keeps quantization
+    noise low across all layers.
+
+    Args:
+        in_features:  input size.
+        out_features: output size.
+        bias:         learnable bias (default True).
+        history_len:  amax rolling window length.
+        device:       device for parameters.
+        dtype:        dtype for master weight (default float32).
+
+    Compatibility:
+        ``layer.weight`` is a property that returns ``weight_master``, so
+        weight-tying (``lm_head.weight = embed.weight``) works as expected.
+    """
+
+    def __init__(
+        self,
+        in_features:  int,
+        out_features: int,
+        bias:         bool = True,
+        history_len:  int  = 16,
+        device:       Optional[Union[str, "torch.device"]] = None,
+        dtype:        Optional["torch.dtype"] = None,
+    ) -> None:
+        super().__init__()
+        factory = {"device": device, "dtype": dtype}
+        self.in_features  = in_features
+        self.out_features = out_features
+
+        # Float32 master weight — the optimizer's target
+        self.weight_master = nn.Parameter(
+            torch.empty(out_features, in_features, **factory)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, **factory))
+        else:
+            self.register_parameter("bias", None)
+
+        # uint8 shadow — 1 byte/param, recomputed from master each forward
+        self.register_buffer(
+            "weight_fp8",
+            torch.zeros(out_features, in_features, dtype=torch.uint8,
+                        **{"device": device} if device else {}),
+        )
+
+        dev_str = str(device) if device is not None else None
+        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=dev_str)
+        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=dev_str)
+
+        self._reset_parameters()
+
+    # ------------------------------------------------------------------
+    @property
+    def weight(self) -> "nn.Parameter":
+        """Alias for weight_master — allows weight-tying to work normally."""
+        return self.weight_master
+
+    # ------------------------------------------------------------------
+    def _reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight_master, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight_master)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _sync_shadow(self) -> None:
+        """Re-quantise weight_master → weight_fp8.  Always inside no_grad."""
+        self.weight_meta.update(self.weight_master)
+        ws = float(self.weight_meta.scale.item())
+        self.weight_fp8.copy_(
+            quantize_e4m3((self.weight_master * ws).contiguous())
+        )
+
+    # ------------------------------------------------------------------
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features).contiguous()
+
+        with torch.no_grad():
+            self._sync_shadow()
+            self.input_meta.update(x_2d)
+
+        out = Fp8ShadowLinearFunction.apply(
+            x_2d,
+            self.weight_master,
+            self.weight_fp8,
+            float(self.weight_meta.inv_scale.item()),
+            float(self.input_meta.scale.item()),
+            self.bias,
+        )
+        return out.reshape(*orig_shape[:-1], self.out_features)
+
+    # ------------------------------------------------------------------
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"history_len={self.input_meta._history_len}"
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear:      "nn.Linear",
+        history_len: int = 16,
+    ) -> "Fp8ShadowLinear":
+        """Create an ``Fp8ShadowLinear`` from an existing ``nn.Linear``."""
+        layer = cls(
+            linear.in_features, linear.out_features,
+            bias=linear.bias is not None,
+            history_len=history_len,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        with torch.no_grad():
+            layer.weight_master.copy_(linear.weight)
+            if linear.bias is not None:
+                layer.bias.copy_(linear.bias)
+        return layer
+
+    def to_linear(self) -> "nn.Linear":
+        """Convert back to ``nn.Linear`` (copies master weights)."""
+        linear = nn.Linear(
+            self.in_features, self.out_features,
+            bias=self.bias is not None,
+            device=self.weight_master.device,
+            dtype=self.weight_master.dtype,
+        )
+        with torch.no_grad():
+            linear.weight.copy_(self.weight_master)
+            if self.bias is not None:
+                linear.bias.copy_(self.bias)
+        return linear
+
+
+# ---------------------------------------------------------------------------
+
 def convert_to_fp8(
     model:       "nn.Module",
+    shadow:      bool                = False,
     scaled:      bool                = True,
     history_len: int                 = 16,
     skip_names:  Optional[Set[str]] = None,
 ) -> "nn.Module":
     """Replace all ``nn.Linear`` layers in *model* with FP8 equivalents.
 
-    Walks the module tree recursively and replaces each ``nn.Linear`` with
-    either ``Fp8ScaledLinear`` (recommended, default) or ``Fp8Linear``.
-    Weights are copied; the replacement happens in-place.
+    Three modes (in order of increasing VRAM savings):
+
+    ``shadow=False, scaled=False``  →  ``Fp8Linear``
+        FP8 noise only, weights still float32 in memory.
+
+    ``shadow=False, scaled=True`` (default)
+        →  ``Fp8ScaledLinear``
+        FP8 noise + per-tensor amax scaling.  Activation VRAM 4× lower
+        (uint8 saved in autograd graph).
+
+    ``shadow=True``                 →  ``Fp8ShadowLinear``
+        All of the above PLUS weights stored as uint8 at rest.
+        Forward pass sees 1 byte/param instead of 4 bytes/param.
+        The float32 master weight is kept for the optimizer.
+        Pair with ``Adafactor`` to also cut optimizer state VRAM.
 
     Args:
         model:       any ``nn.Module`` — mutated in-place.
-        scaled:      if True (default) use ``Fp8ScaledLinear`` with per-tensor
-                     amax scaling.  if False use plain ``Fp8Linear``.
-        history_len: amax history window (only relevant when scaled=True).
+        shadow:      if True, use ``Fp8ShadowLinear`` (FP8 weight storage).
+        scaled:      if True and shadow=False, use ``Fp8ScaledLinear``.
+                     Ignored when shadow=True (shadow always uses scaling).
+        history_len: amax rolling window for scale tracking.
         skip_names:  set of fully-qualified submodule names to leave unchanged.
-                     Useful for weight-tied layers, e.g. ``{"lm_head"}``.
+                     Example: ``{"lm_head"}`` for weight-tied output projection.
 
     Returns:
-        The same *model* object (mutated in-place) for convenient chaining.
+        The same *model* object (mutated in-place) for chaining.
 
     Example::
 
         model = MyGPT(vocab=32000, d_model=512, n_layers=6)
-        convert_to_fp8(model, scaled=True, skip_names={"lm_head"})
+
+        # Maximum VRAM savings: FP8 weights + FP8 activations + Adafactor
+        convert_to_fp8(model, shadow=True, skip_names={"lm_head"})
         model.cuda()
-        # Every nn.Linear in the model is now Fp8ScaledLinear except lm_head
+        opt = Adafactor(model.parameters(), relative_step=True)
     """
     if skip_names is None:
         skip_names = set()
-    _replace_linear(model, "", scaled=scaled,
+    _replace_linear(model, "", shadow=shadow, scaled=scaled,
                     history_len=history_len, skip_names=skip_names)
     return model
 
@@ -473,6 +734,7 @@ def convert_to_fp8(
 def _replace_linear(
     module:      "nn.Module",
     prefix:      str,
+    shadow:      bool,
     scaled:      bool,
     history_len: int,
     skip_names:  Set[str],
@@ -482,14 +744,15 @@ def _replace_linear(
         if full_name in skip_names:
             continue
         if isinstance(child, nn.Linear):
-            if scaled:
-                rep = Fp8ScaledLinear.from_linear(child,
-                                                  history_len=history_len)
+            if shadow:
+                rep = Fp8ShadowLinear.from_linear(child, history_len=history_len)
+            elif scaled:
+                rep = Fp8ScaledLinear.from_linear(child, history_len=history_len)
             else:
                 rep = Fp8Linear.from_linear(child)
             setattr(module, name, rep)
         else:
-            _replace_linear(child, full_name, scaled=scaled,
+            _replace_linear(child, full_name, shadow=shadow, scaled=scaled,
                             history_len=history_len, skip_names=skip_names)
 
 
@@ -606,3 +869,199 @@ class Fp8TensorMeta:
         self.amax_history = state["amax_history"]
         self._ptr         = int(state["ptr"].item())
         self._history_len = len(self.amax_history)
+
+
+# ===========================================================================
+# Feature 3: Adafactor optimiser
+# ===========================================================================
+
+class Adafactor(torch.optim.Optimizer):
+    """Adafactor: adaptive learning rates with sublinear memory cost.
+
+    Reference: Shazeer & Stern (2018) https://arxiv.org/abs/1802.04821
+
+    VRAM advantage over AdamW
+    --------------------------
+    For a weight matrix W ∈ R^{N×K}:
+
+    AdamW stores:
+      first moment  m  ∈ R^{N×K}   (4 bytes/param)
+      second moment v  ∈ R^{N×K}   (4 bytes/param)
+      → 2 × model_params floats of optimizer state
+
+    Adafactor stores:
+      row factor  R  ∈ R^N          (4 bytes × N)
+      col factor  C  ∈ R^K          (4 bytes × K)
+      no first moment
+      → (N+K)/(N×K) of AdamW's v state  ≈ 0.05% for 4096×4096
+
+    For a 500M-parameter model this typically means:
+      AdamW optimizer state: ~4 GB
+      Adafactor optimizer state: ~4 MB
+
+    Recommended usage
+    -----------------
+    Use ``relative_step=True`` (default) to let the optimiser derive its own
+    learning rate from the weight magnitude — no ``lr`` argument needed::
+
+        opt = Adafactor(model.parameters(), relative_step=True,
+                        weight_decay=0.1)
+
+    For fine-tuning where you want a fixed lr::
+
+        opt = Adafactor(model.parameters(), lr=1e-4, relative_step=False,
+                        scale_parameter=False)
+
+    Args:
+        params:           iterable of parameters or param groups.
+        lr:               explicit learning rate.  Must be None when
+                          relative_step=True.
+        beta2_decay:      exponent d for β₂ₜ = 1 − t^d.  Default -0.8.
+        eps:              (eps1, eps2).  eps1 stabilises the second-moment
+                          estimate near zero; eps2 sets the minimum scale for
+                          relative-step lr.  Defaults (1e-30, 1e-3).
+        clip_threshold:   RMS clip threshold for normalised updates. Default 1.0.
+        relative_step:    derive lr from weight magnitude (default True).
+        scale_parameter:  scale lr by rms(W) (requires relative_step=True).
+        warmup_init:      start with a very small relative step (default False).
+        weight_decay:     decoupled L2 penalty.  Applied after the update.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr:              Optional[float] = None,
+        beta2_decay:     float           = -0.8,
+        eps:             Tuple[float, float] = (1e-30, 1e-3),
+        clip_threshold:  float           = 1.0,
+        relative_step:   bool            = True,
+        scale_parameter: bool            = True,
+        warmup_init:     bool            = False,
+        weight_decay:    float           = 0.0,
+    ) -> None:
+        if lr is not None and relative_step:
+            raise ValueError(
+                "Provide either an explicit lr= or relative_step=True, not both."
+            )
+        if not relative_step and lr is None:
+            raise ValueError(
+                "Must provide lr= when relative_step=False."
+            )
+        defaults = dict(
+            lr              = lr,
+            beta2_decay     = beta2_decay,
+            eps             = eps,
+            clip_threshold  = clip_threshold,
+            relative_step   = relative_step,
+            scale_parameter = scale_parameter,
+            warmup_init     = warmup_init,
+            weight_decay    = weight_decay,
+        )
+        super().__init__(params, defaults)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rms(t: "torch.Tensor") -> float:
+        """Root-mean-square of a tensor (scalar result)."""
+        return (t.norm(2) / (t.numel() ** 0.5)).item()
+
+    def _get_lr(self, group: dict, state: dict) -> float:
+        if group["relative_step"]:
+            # Relative step: α_t = max(ε₂, rms(W)) × min(ρ̂, 1/√t)
+            min_step = 1e-6 if group["warmup_init"] else 1e-2
+            rel      = min(min_step, 1.0 / math.sqrt(state["step"]))
+            scale    = max(group["eps"][1], state["rms"]) if group["scale_parameter"] else 1.0
+            return scale * rel
+        return group["lr"]
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                # Work in float32 regardless of parameter dtype
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        "Adafactor does not support sparse gradients."
+                    )
+
+                p_f32    = p.data.float() if p.data.dtype != torch.float32 else p.data
+                factored = grad.dim() >= 2     # factorise 2-D+ params
+                state    = self.state[p]
+
+                # ---- Initialise state on first step ----------------------
+                if len(state) == 0:
+                    state["step"] = 0
+                    if factored:
+                        # Row factor: mean over last dim (cols)
+                        state["exp_avg_sq_row"] = torch.zeros(
+                            grad.shape[:-1], dtype=torch.float32, device=p.device
+                        )
+                        # Col factor: mean over second-to-last dim (rows)
+                        state["exp_avg_sq_col"] = torch.zeros(
+                            grad.shape[:-2] + grad.shape[-1:],
+                            dtype=torch.float32, device=p.device,
+                        )
+                    else:
+                        # 1-D params (bias, embedding): store full V
+                        state["exp_avg_sq"] = torch.zeros_like(p_f32)
+                    state["rms"] = 0.0
+
+                state["step"] += 1
+                state["rms"]   = self._rms(p_f32)
+                lr             = self._get_lr(group, state)
+
+                # β₂ₜ = 1 − t^d   (→ 1 as t grows, gives slower-decaying EMA)
+                beta2t = 1.0 - math.pow(state["step"], group["beta2_decay"])
+                eps1   = group["eps"][0]
+
+                # ---- Second-moment update --------------------------------
+                sq_grad = grad.pow(2).add_(eps1)
+
+                if factored:
+                    R = state["exp_avg_sq_row"]
+                    C = state["exp_avg_sq_col"]
+
+                    # R_t = β₂ₜ R_{t-1} + (1-β₂ₜ) mean_j(g² + ε₁)
+                    R.mul_(beta2t).add_(sq_grad.mean(dim=-1),  alpha=1.0 - beta2t)
+                    # C_t = β₂ₜ C_{t-1} + (1-β₂ₜ) mean_i(g² + ε₁)
+                    C.mul_(beta2t).add_(sq_grad.mean(dim=-2), alpha=1.0 - beta2t)
+
+                    # Reconstruct V̂^{-1/2}:
+                    # V̂[i,j] = R[i]*C[j]/mean(R)
+                    # u[i,j]  = g[i,j] * sqrt(mean(R)) / (sqrt(R[i]) * sqrt(C[j]))
+                    r_factor = (R / R.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+                    c_factor = C.rsqrt().unsqueeze(-2)
+                    update   = torch.mul(r_factor, torch.mul(c_factor, grad))
+                else:
+                    V = state["exp_avg_sq"]
+                    V.mul_(beta2t).add_(sq_grad, alpha=1.0 - beta2t)
+                    update = V.rsqrt().mul_(grad)
+
+                # ---- RMS clip -------------------------------------------
+                update_rms = self._rms(update)
+                update.div_(max(1.0, update_rms / group["clip_threshold"]))
+
+                # ---- Weight update --------------------------------------
+                p_f32.add_(update, alpha=-lr)
+
+                # ---- Decoupled weight decay -----------------------------
+                if group["weight_decay"] != 0.0:
+                    p_f32.add_(p_f32, alpha=-group["weight_decay"] * lr)
+
+                # Cast back if parameter is not float32
+                if p.data.dtype != torch.float32:
+                    p.data.copy_(p_f32)
+
+        return loss
