@@ -148,6 +148,9 @@ class HipQuant:
     def row_size(self, type_num, n_per_row):
         return self._dll.ggml_row_size_for(int(type_num), n_per_row)
 
+    def quantize_reset(self):
+        self._dll.quantize_reset()
+
     def quantize_numpy(self, arr, type_num, imatrix=None):
         """Quantize a float32 numpy array to the given GGML type.
 
