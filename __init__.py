@@ -128,6 +128,8 @@ class HipQuant:
         self._dll.get_device_name.restype = ctypes.c_char_p
         self._dll.get_device_count.restype = ctypes.c_int
         self._dll.get_device_count.argtypes = []
+        self._dll.quantize_reset.restype = None
+        self._dll.quantize_reset.argtypes = []
 
     @property
     def device_count(self):

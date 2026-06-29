@@ -62,6 +62,15 @@ static int8_t *d_iq3s_grid_data = NULL;
 static int *d_iq3s_map_data = NULL;
 static uint16_t *d_iq3s_neighbours_data = NULL;
 
+// Per-thread cached GPU buffers for quantize_tensor.
+// File-scope so quantize_reset() can free them from any thread.
+static thread_local float   *g_d_src       = NULL;
+static thread_local uint8_t *g_d_dst       = NULL;
+static thread_local float   *g_d_imatrix   = NULL;
+static thread_local size_t   g_d_src_cap   = 0;
+static thread_local size_t   g_d_dst_cap   = 0;
+static thread_local size_t   g_d_imatrix_cap = 0;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -370,51 +379,45 @@ __declspec(dllexport) size_t quantize_tensor(
     size_t total_size = row_size * nrows;
     if (total_size == 0) return 0;
 
-    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);    // Use thread_local caching to avoid hipMalloc driver leak and overhead on ROCm Windows
-    static thread_local float *d_src = NULL;
-    static thread_local uint8_t *d_dst = NULL;
-    static thread_local float *d_imatrix = NULL;
-    static thread_local size_t d_src_cap = 0;
-    static thread_local size_t d_dst_cap = 0;
-    static thread_local size_t d_imatrix_cap = 0;
+    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
 
     size_t src_bytes = (size_t)nrows * n_per_row * sizeof(float);
     size_t dst_bytes = total_size;
     size_t imatrix_bytes = imatrix ? src_bytes : 0;
 
-    if (src_bytes > d_src_cap) {
-        if (d_src) hipFree(d_src);
-        hipError_t e = hipMalloc(&d_src, src_bytes);
+    if (src_bytes > g_d_src_cap) {
+        if (g_d_src) hipFree(g_d_src);
+        hipError_t e = hipMalloc(&g_d_src, src_bytes);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_src, %zu) failed: %s\n", src_bytes, hipGetErrorString(e)); return 0; }
-        d_src_cap = src_bytes;
+        g_d_src_cap = src_bytes;
     }
-    if (dst_bytes > d_dst_cap) {
-        if (d_dst) hipFree(d_dst);
-        hipError_t e = hipMalloc(&d_dst, dst_bytes);
+    if (dst_bytes > g_d_dst_cap) {
+        if (g_d_dst) hipFree(g_d_dst);
+        hipError_t e = hipMalloc(&g_d_dst, dst_bytes);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_dst, %zu) failed: %s\n", dst_bytes, hipGetErrorString(e)); return 0; }
-        d_dst_cap = dst_bytes;
+        g_d_dst_cap = dst_bytes;
     }
-    if (imatrix_bytes > d_imatrix_cap) {
-        if (d_imatrix) hipFree(d_imatrix);
-        hipError_t e = hipMalloc(&d_imatrix, imatrix_bytes);
+    if (imatrix_bytes > g_d_imatrix_cap) {
+        if (g_d_imatrix) hipFree(g_d_imatrix);
+        hipError_t e = hipMalloc(&g_d_imatrix, imatrix_bytes);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_imatrix) failed: %s\n", hipGetErrorString(e)); return 0; }
-        d_imatrix_cap = imatrix_bytes;
+        g_d_imatrix_cap = imatrix_bytes;
     }
 
     {
-        hipError_t e = hipMemcpy(d_src, src, src_bytes, hipMemcpyHostToDevice);
+        hipError_t e = hipMemcpy(g_d_src, src, src_bytes, hipMemcpyHostToDevice);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_src) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
     if (imatrix) {
-        hipError_t e = hipMemcpy(d_imatrix, imatrix, imatrix_bytes, hipMemcpyHostToDevice);
+        hipError_t e = hipMemcpy(g_d_imatrix, imatrix, imatrix_bytes, hipMemcpyHostToDevice);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_imatrix) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
     {
-        hipError_t e = hipMemset(d_dst, 0, dst_bytes);
+        hipError_t e = hipMemset(g_d_dst, 0, dst_bytes);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
-    if (!dispatch_quantize_kernel(type, d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
+    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, g_d_imatrix, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
         return 0;
     }
 
@@ -430,7 +433,7 @@ __declspec(dllexport) size_t quantize_tensor(
     }
 
     {
-        hipError_t e = hipMemcpy(dst, d_dst, dst_bytes, hipMemcpyDeviceToHost);
+        hipError_t e = hipMemcpy(dst, g_d_dst, dst_bytes, hipMemcpyDeviceToHost);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(dst) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
@@ -562,6 +565,15 @@ __declspec(dllexport) size_t quantize_tensor_fp8_input(
     if (d_imatrix) hipFree(d_imatrix);
 
     return total_size;
+}
+
+__declspec(dllexport) void quantize_reset() {
+    if (g_d_src)       { hipFree(g_d_src);       g_d_src = NULL; }
+    if (g_d_dst)       { hipFree(g_d_dst);       g_d_dst = NULL; }
+    if (g_d_imatrix)   { hipFree(g_d_imatrix);   g_d_imatrix = NULL; }
+    g_d_src_cap = 0;
+    g_d_dst_cap = 0;
+    g_d_imatrix_cap = 0;
 }
 
 __declspec(dllexport) int get_device_count() {
