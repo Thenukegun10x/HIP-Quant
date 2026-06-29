@@ -7,3 +7,5 @@ recursive-include torch_ext *
 recursive-include tests *
 include torch_api.py
 include setup_torch.py
+exclude _C*.pyd
+exclude torch_ext/pytorch_bindings_hip.cpp

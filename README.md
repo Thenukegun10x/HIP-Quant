@@ -65,7 +65,7 @@ python setup_torch.py build_ext --inplace
 ```powershell
 # Core offline library only
 python -m build
-pip install dist/hip_quant-0.4.1-py3-none-any.whl
+pip install dist/hip_quant-0.4.2-py3-none-any.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"

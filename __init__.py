@@ -2,7 +2,7 @@ import ctypes
 import numpy as np
 import os
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
