@@ -2,6 +2,35 @@ import ctypes
 import numpy as np
 import os
 
+__version__ = "0.4.1"
+
+_TORCH_EXPORTS = {
+    "quantize_e4m3",
+    "quantize_e5m2",
+    "dequantize_e4m3",
+    "dequantize_e5m2",
+    "fp8_linear_forward",
+    "fp8_linear_backward_input",
+    "fp8_linear_backward_weight",
+    "Fp8LinearFunction",
+    "Fp8Linear",
+    "Fp8ScaledLinearFunction",
+    "Fp8ScaledLinear",
+    "Fp8TensorMeta",
+    "convert_to_fp8",
+    "Adafactor",
+}
+
+__all__ = [
+    "GGML_TYPE",
+    "GGML_TYPE_BLOCK_SIZE",
+    "GGML_TYPE_BLOCK_BYTES",
+    "HipQuant",
+    "get_hip_quant",
+    "quantize",
+    *_TORCH_EXPORTS,
+]
+
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Type enum values matching GGML_TYPE_* in ggml.h
@@ -144,6 +173,18 @@ class HipQuant:
         self._dll.get_device_name.restype = ctypes.c_char_p
         self._dll.get_device_count.restype = ctypes.c_int
         self._dll.get_device_count.argtypes = []
+        self._dll.fp8_gemm_test_wmma.restype = ctypes.c_int
+        self._dll.fp8_gemm_test_wmma.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
         self._dll.quantize_reset.restype = None
         self._dll.quantize_reset.argtypes = []
 
@@ -170,6 +211,39 @@ class HipQuant:
 
     def quantize_reset(self):
         self._dll.quantize_reset()
+
+    def fp8_gemm_test_wmma(self, A_fp8, B_fp8, M, N, K, lda=None, ldb=None, ldc=None):
+        """Micro FP8 GEMM via rocWMMA WMMA.
+
+        Takes pre-quantized FP8 E4M3 matrices A (MxK) and B (KxN),
+        computes C = A * B using GPU WMMA instructions, returns float32 C.
+
+        All matrices are row-major. M, N must be multiples of 16.
+
+        Args:
+            A_fp8: uint8 numpy array (M, lda) of FP8 E4M3 values
+            B_fp8: uint8 numpy array (K, ldb) of FP8 E4M3 values
+            M, N, K: matrix dimensions
+            lda, ldb, ldc: leading dimensions (defaults: K, N, N)
+
+        Returns:
+            float32 numpy array (M, N) = A @ B, or None on failure.
+        """
+        if lda is None: lda = K
+        if ldb is None: ldb = N
+        if ldc is None: ldc = N
+        A_fp8 = np.ascontiguousarray(A_fp8, dtype=np.uint8)
+        B_fp8 = np.ascontiguousarray(B_fp8, dtype=np.uint8)
+        C = np.empty((M, ldc), dtype=np.float32)
+        ret = self._dll.fp8_gemm_test_wmma(
+            A_fp8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            B_fp8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            C.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            M, N, K, lda, ldb, ldc,
+        )
+        if ret != 0:
+            return None
+        return C[:, :N]
 
     def quantize_numpy(self, arr, type_num, imatrix=None):
         """Quantize a float32 numpy array to the given GGML type.
@@ -309,3 +383,18 @@ def get_hip_quant(dll_path=None):
 
 def quantize(arr, type_num):
     return get_hip_quant().quantize_numpy(arr, type_num)
+
+
+def __getattr__(name):
+    if name in _TORCH_EXPORTS:
+        try:
+            from . import torch_api
+        except ImportError as exc:
+            raise ImportError(
+                f"hip_quant.{name} requires the PyTorch extension. "
+                "Install ROCm PyTorch and run `python setup_torch.py build_ext --inplace`."
+            ) from exc
+        value = getattr(torch_api, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

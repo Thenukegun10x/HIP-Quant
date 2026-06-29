@@ -2,25 +2,18 @@
 //
 // Phase 4: FP8 Linear forward / backward kernels.
 //
-// Current implementation: correctness-first tiled SGEMM that operates on
-// float32 data obtained by dequantizing FP8 inputs.  This is a real FP8
-// GEMM stub — the quantize/dequantize step happens inside the kernel so
-// the data flowing between blocks is always in FP8 and the accumulation is
-// in float32.  For maximum throughput replace with rocBLASLt or a
-// Composable Kernel FP8 GEMM path once validated.
+// Current forward implementation: one wave computes one 16x16 output tile
+// using gfx12 FP8 WMMA.  Inputs are float32 master tensors; each loaded value
+// is quantized to E4M3 in registers, packed into the WMMA operand layout, and
+// accumulated in float32.
 //
 // Convention:
 //   A   : [M, K]  float32   (activation or grad_output)
 //   B   : [N, K]  float32   (weight, stored row-major so B.T is [K, N])
 //   C   : [M, N]  float32   (output)
 //
-// The "FP8" part: A and B are quantized to E4M3 per element then immediately
-// dequantized back to float32 for the actual multiply-accumulate.  This is
-// the "fake FP8" path from Phase 3/4, which lets training correctness checks
-// pass before a real hardware FP8 GEMM path is plugged in.
-//
-// For Phase 4 real GEMM: swap the inner loop for an FP8 MFMA instruction
-// sequence once rocBLASLt FP8 support is confirmed on the target hardware.
+// Backward uses gfx12 BF8/E5M2 WMMA for both operands.  gfx12 exposes FP8/FP8
+// and BF8/BF8 WMMA variants, not a mixed BF8/FP8 WMMA variant.
 
 #include <hip/hip_runtime.h>
 #include "../hip_quant_util.h"
@@ -29,86 +22,183 @@
 #define TILE_N 16
 #define TILE_K 16
 
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef int   v2i __attribute__((ext_vector_type(2)));
+
 // ---------------------------------------------------------------------------
-// Tiled GEMM: C = A * B^T  (A:[M,K], B:[N,K], C:[M,N])
-// With on-the-fly FP8 E4M3 quantize/dequantize on tiles.
+// WMMA GEMM: C = A * B^T  (A:[M,K], B:[N,K], C:[M,N])
+// With on-the-fly FP8 E4M3 quantization in registers.
 // ---------------------------------------------------------------------------
 __global__
-__launch_bounds__(256, 2)
+__launch_bounds__(32, 1)
 void fp8_gemm_e4m3_kernel(
     const float * __restrict__ A,   // [M, K]
     const float * __restrict__ B,   // [N, K]  (weight, compute A @ B.T)
     float       * __restrict__ C,   // [M, N]
     int M, int N, int K
 ) {
-    // Tile indices
-    int row = blockIdx.y * TILE_M + threadIdx.y;  // output row (M dim)
-    int col = blockIdx.x * TILE_N + threadIdx.x;  // output col (N dim)
+    int m = blockIdx.y * TILE_M;
+    int n = blockIdx.x * TILE_N;
+    if (m >= M || n >= N) return;
 
-    if (row >= M || col >= N) return;
+    int tid = threadIdx.x;
+    if (tid >= 32) return;
 
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        // Quantize to FP8 E4M3 then dequantize — models quantization error
-        float a_fp8 = fp8_e4m3_to_fp32(fp32_to_fp8_e4m3(A[row * K + k]));
-        float b_fp8 = fp8_e4m3_to_fp32(fp32_to_fp8_e4m3(B[col * K + k]));
-        acc += a_fp8 * b_fp8;
+    int lane_wrapped = tid & 15;
+    int lane_group   = tid >> 4;
+
+    v8f acc = (v8f){};
+
+    for (int k = 0; k < K; k += TILE_K) {
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int k_offset = lane_group * 8 + i;
+
+            int a_row = m + lane_wrapped;
+            int a_col = k + k_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < M && a_col < K) ? fp32_to_fp8_e4m3(A[a_row * K + a_col]) : 0;
+
+            int b_row = k + k_offset;
+            int b_col = n + lane_wrapped;
+            ((uint8_t*)b_packed)[i] =
+                (b_row < K && b_col < N) ? fp32_to_fp8_e4m3(B[b_col * K + b_row]) : 0;
+        }
+
+        v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
+        v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
     }
-    C[row * N + col] = acc;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int row = m + lane_group * 8 + i;
+        int col = n + lane_wrapped;
+        if (row < M && col < N) {
+            C[row * N + col] = acc[i];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Backward input gradient: grad_input = grad_output * weight
-// grad_output:[M,N] (E5M2), weight:[N,K] (E4M3), grad_input:[M,K]
+// grad_output:[M,N] (E5M2), weight:[N,K] (E5M2), grad_input:[M,K]
 // Computes:  grad_input[m,k] = sum_n grad_output[m,n] * weight[n,k]
 // ---------------------------------------------------------------------------
 __global__
-__launch_bounds__(256, 2)
+__launch_bounds__(32, 1)
 void fp8_gemm_backward_input_kernel(
     const float * __restrict__ grad_output, // [M, N]
     const float * __restrict__ weight,      // [N, K]
     float       * __restrict__ grad_input,  // [M, K]
     int M, int N, int K
 ) {
-    int row = blockIdx.y * TILE_M + threadIdx.y;  // M dim
-    int col = blockIdx.x * TILE_N + threadIdx.x;  // K dim
+    int m = blockIdx.y * TILE_M;
+    int k_tile = blockIdx.x * TILE_N;
+    if (m >= M || k_tile >= K) return;
 
-    if (row >= M || col >= K) return;
+    int tid = threadIdx.x;
+    if (tid >= 32) return;
 
-    float acc = 0.0f;
-    for (int n = 0; n < N; ++n) {
-        float g = fp8_e5m2_to_fp32(fp32_to_fp8_e5m2(grad_output[row * N + n]));
-        float w = fp8_e4m3_to_fp32(fp32_to_fp8_e4m3(weight[n * K + col]));
-        acc += g * w;
+    int lane_wrapped = tid & 15;
+    int lane_group   = tid >> 4;
+
+    v8f acc = (v8f){};
+
+    for (int n_tile = 0; n_tile < N; n_tile += TILE_K) {
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int n_offset = lane_group * 8 + i;
+
+            int a_row = m + lane_wrapped;
+            int a_col = n_tile + n_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < M && a_col < N) ? fp32_to_fp8_e5m2(grad_output[a_row * N + a_col]) : 0;
+
+            int b_row = n_tile + n_offset;
+            int b_col = k_tile + lane_wrapped;
+            ((uint8_t*)b_packed)[i] =
+                (b_row < N && b_col < K) ? fp32_to_fp8_e5m2(weight[b_row * K + b_col]) : 0;
+        }
+
+        v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
+        v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
     }
-    grad_input[row * K + col] = acc;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int row = m + lane_group * 8 + i;
+        int col = k_tile + lane_wrapped;
+        if (row < M && col < K) {
+            grad_input[row * K + col] = acc[i];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Backward weight gradient: grad_weight = grad_output^T * input
-// grad_output:[M,N] (E5M2), input:[M,K] (E4M3), grad_weight:[N,K]
+// grad_output:[M,N] (E5M2), input:[M,K] (E5M2), grad_weight:[N,K]
 // Computes:  grad_weight[n,k] = sum_m grad_output[m,n] * input[m,k]
 // ---------------------------------------------------------------------------
 __global__
-__launch_bounds__(256, 2)
+__launch_bounds__(32, 1)
 void fp8_gemm_backward_weight_kernel(
     const float * __restrict__ grad_output, // [M, N]
     const float * __restrict__ input,       // [M, K]
     float       * __restrict__ grad_weight, // [N, K]
     int M, int N, int K
 ) {
-    int row = blockIdx.y * TILE_M + threadIdx.y;  // N dim
-    int col = blockIdx.x * TILE_N + threadIdx.x;  // K dim
+    int n = blockIdx.y * TILE_M;
+    int k_tile = blockIdx.x * TILE_N;
+    if (n >= N || k_tile >= K) return;
 
-    if (row >= N || col >= K) return;
+    int tid = threadIdx.x;
+    if (tid >= 32) return;
 
-    float acc = 0.0f;
-    for (int m = 0; m < M; ++m) {
-        float g = fp8_e5m2_to_fp32(fp32_to_fp8_e5m2(grad_output[m * N + row]));
-        float a = fp8_e4m3_to_fp32(fp32_to_fp8_e4m3(input[m * K + col]));
-        acc += g * a;
+    int lane_wrapped = tid & 15;
+    int lane_group   = tid >> 4;
+
+    v8f acc = (v8f){};
+
+    for (int m_tile = 0; m_tile < M; m_tile += TILE_K) {
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int m_offset = lane_group * 8 + i;
+
+            int a_row = n + lane_wrapped;
+            int a_col = m_tile + m_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < N && a_col < M) ? fp32_to_fp8_e5m2(grad_output[a_col * N + a_row]) : 0;
+
+            int b_row = m_tile + m_offset;
+            int b_col = k_tile + lane_wrapped;
+            ((uint8_t*)b_packed)[i] =
+                (b_row < M && b_col < K) ? fp32_to_fp8_e5m2(input[b_row * K + b_col]) : 0;
+        }
+
+        v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
+        v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
     }
-    grad_weight[row * K + col] = acc;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int row = n + lane_group * 8 + i;
+        int col = k_tile + lane_wrapped;
+        if (row < N && col < K) {
+            grad_weight[row * K + col] = acc[i];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +211,7 @@ void launch_fp8_linear_forward(
     int M, int N, int K,
     hipStream_t stream
 ) {
-    dim3 block(TILE_N, TILE_M);
+    dim3 block(32);
     dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
     hipLaunchKernelGGL(fp8_gemm_e4m3_kernel, grid, block, 0, stream,
                        A, B, C, M, N, K);
@@ -132,7 +222,7 @@ void launch_fp8_linear_backward_input(
     int M, int N, int K,
     hipStream_t stream
 ) {
-    dim3 block(TILE_N, TILE_M);
+    dim3 block(32);
     dim3 grid((K + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
     hipLaunchKernelGGL(fp8_gemm_backward_input_kernel, grid, block, 0, stream,
                        grad_output, weight, grad_input, M, N, K);
@@ -143,7 +233,7 @@ void launch_fp8_linear_backward_weight(
     int M, int N, int K,
     hipStream_t stream
 ) {
-    dim3 block(TILE_N, TILE_M);
+    dim3 block(32);
     dim3 grid((K + TILE_N - 1) / TILE_N, (N + TILE_M - 1) / TILE_M);
     hipLaunchKernelGGL(fp8_gemm_backward_weight_kernel, grid, block, 0, stream,
                        grad_output, input, grad_weight, M, N, K);

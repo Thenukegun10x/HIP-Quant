@@ -10,6 +10,7 @@
 //   Each thread processes exactly one element.
 
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "../hip_quant_util.h"
 
 // ---------------------------------------------------------------------------

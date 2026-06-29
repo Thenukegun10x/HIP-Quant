@@ -31,7 +31,10 @@ def build_parser():
         description="Quantize .npy tensors with the HIP-Quant NumPy/DLL backend.",
         epilog=(
             "Note: this CLI is for offline conversion. It is not a PyTorch training "
-            "extension and does not preserve autograd."
+            "extension and does not preserve autograd. Fused ROCm WMMA PyTorch ops "
+            "are exposed as hip_quant.fp8_linear_forward, "
+            "hip_quant.fp8_linear_backward_input, and "
+            "hip_quant.fp8_linear_backward_weight after building _C."
         ),
     )
     parser.add_argument("input", nargs="?", help="input .npy file containing a 1-D or 2-D array")

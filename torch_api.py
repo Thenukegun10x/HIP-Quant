@@ -127,11 +127,12 @@ class Fp8LinearFunction(torch.autograd.Function):
         bias:   Optional["torch.Tensor"],
     ) -> "torch.Tensor":
 
-        # Quantise to simulate FP8 precision
-        input_fp8  = quantize_e4m3(input.contiguous())   # uint8 — 4× smaller
-        weight_fp8 = quantize_e4m3(weight.contiguous())
-        input_f32  = dequantize_e4m3(input_fp8)
-        weight_f32 = dequantize_e4m3(weight_fp8)
+        input_c = input.contiguous()
+        weight_c = weight.contiguous()
+
+        # Save compressed activation for backward; forward GEMM quantizes A/B
+        # in-register and uses gfx12 FP8 WMMA.
+        input_fp8 = quantize_e4m3(input_c)   # uint8 — 4× smaller
 
         # Save compressed activation + full-precision weight
         ctx.has_bias = bias is not None
@@ -140,10 +141,7 @@ class Fp8LinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
-        out = input_f32.matmul(weight_f32.t())
-        if bias is not None:
-            out = out + bias
-        return out
+        return fp8_linear_forward(input_c, weight_c, bias)
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
@@ -156,9 +154,9 @@ class Fp8LinearFunction(torch.autograd.Function):
         # Decompress activation on demand
         input_f32 = dequantize_e4m3(input_fp8)
 
-        grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
-        grad_input  = grad_f32.matmul(weight)
-        grad_weight = grad_f32.t().matmul(input_f32)
+        grad_output_c = grad_output.contiguous()
+        grad_input = fp8_linear_backward_input(grad_output_c, weight)
+        grad_weight = fp8_linear_backward_weight(grad_output_c, input_f32)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias

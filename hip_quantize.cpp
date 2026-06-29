@@ -27,6 +27,7 @@
 #include "kernels/quant_f8_e4m3.cu"
 #include "kernels/quant_f8_e5m2.cu"
 #include "kernels/fp8_expand.cu"
+#include "kernels/fp8_gemm_test.cu"
 #include "hip_quant_iq2xxs_data.h"
 #include "hip_quant_iq2xs_data.h"
 #include "hip_quant_iq1s_data.h"
@@ -601,6 +602,68 @@ __declspec(dllexport) size_t quantize_tensor_fp8_e5m2_input(
     const float* imatrix
 ) {
     return quantize_tensor_fp8_input_impl(type, src_fp8, dst, nrows, n_per_row, imatrix, 37);
+}
+
+// ============================================================
+// fp8_gemm_test — Micro FP8 GEMM via rocWMMA WMMA
+//
+// Takes pre-quantized FP8 E4M3 matrices A (MxK) and B (KxN),
+// computes C = A * B using rocWMMA WMMA fragments on gfx12.
+// Returns float32 C in pre-allocated host buffer.
+//
+// All matrices are row-major. lda >= K, ldb >= N, ldc >= N.
+// M, N must be multiples of 16; K can be any positive int.
+// ============================================================
+
+__declspec(dllexport) int fp8_gemm_test_wmma(
+    const uint8_t* A_fp8,
+    const uint8_t* B_fp8,
+    float* C,
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc
+) {
+    ensure_initialized();
+
+    size_t bytes_A = (size_t)M * lda;
+    size_t bytes_B = (size_t)K * ldb;
+    size_t bytes_C = (size_t)M * ldc * sizeof(float);
+
+    uint8_t *d_A = NULL, *d_B = NULL;
+    float *d_C = NULL;
+
+    hipError_t e;
+
+    e = hipMalloc(&d_A, bytes_A);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMalloc A failed: %s\n", hipGetErrorString(e)); return 1; }
+    e = hipMalloc(&d_B, bytes_B);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMalloc B failed: %s\n", hipGetErrorString(e)); hipFree(d_A); return 1; }
+    e = hipMalloc(&d_C, bytes_C);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMalloc C failed: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); return 1; }
+
+    e = hipMemcpy(d_A, A_fp8, bytes_A, hipMemcpyHostToDevice);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMemcpy A failed: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); hipFree(d_C); return 1; }
+    e = hipMemcpy(d_B, B_fp8, bytes_B, hipMemcpyHostToDevice);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMemcpy B failed: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); hipFree(d_C); return 1; }
+
+    dim3 gridDim((M + 15) / 16, (N + 15) / 16);
+    hipLaunchKernelGGL(fp8_gemm_wmma_kernel, gridDim, 32, 0, 0,
+        d_A, d_B, d_C, M, N, K, lda, ldb, ldc);
+
+    e = hipGetLastError();
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: kernel launch error: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); hipFree(d_C); return 1; }
+
+    e = hipDeviceSynchronize();
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: sync error: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); hipFree(d_C); return 1; }
+
+    e = hipMemcpy(C, d_C, bytes_C, hipMemcpyDeviceToHost);
+    if (e != hipSuccess) { fprintf(stderr, "fp8_gemm: hipMemcpy C failed: %s\n", hipGetErrorString(e)); hipFree(d_A); hipFree(d_B); hipFree(d_C); return 1; }
+
+    hipFree(d_A); hipFree(d_B); hipFree(d_C);
+    return 0;
 }
 
 __declspec(dllexport) void quantize_reset() {

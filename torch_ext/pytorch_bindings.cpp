@@ -19,8 +19,24 @@
 // fp8_linear_kernels.hip so this file only does argument validation and
 // tensor allocation.
 
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <torch/all.h>
+#include <torch/csrc/utils/pybind.h>
+#include <pybind11/pybind11.h>
+#include <stdexcept>
+
+#ifdef TORCH_CHECK
+#undef TORCH_CHECK
+#endif
+#define TORCH_CHECK(cond, ...) \
+    do { if (!(cond)) throw std::runtime_error("hip_quant validation failed: " #__VA_ARGS__); } while (0)
+
+#ifdef _MSC_VER
+// PyTorch 2.9.1+ROCm Windows headers reference this inherited constructor,
+// but the wheel's c10.lib only exports the base c10::Error overload.
+#pragma comment(linker, "/alternatename:__imp_??0ValueError@c10@@QEAA@USourceLocation@1@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z=__imp_??0Error@c10@@QEAA@USourceLocation@1@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z")
+#endif
+
+typedef struct ihipStream_t* hipStream_t;
 
 // Forward declarations for kernel launchers defined in the .hip files.
 extern "C" {
@@ -48,7 +64,7 @@ void launch_fp8_linear_backward_weight(
 // Helper: get current HIP stream from ATen
 // ---------------------------------------------------------------------------
 static hipStream_t current_stream() {
-    return at::cuda::getCurrentCUDAStream().stream();
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

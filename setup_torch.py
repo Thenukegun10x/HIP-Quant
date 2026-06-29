@@ -12,6 +12,67 @@
 # The --offload-arch flag is passed to hipcc to target gfx1201 (RX 9070 XT).
 # Adjust this if you target a different GPU architecture.
 
+import glob
+import os
+from pathlib import Path
+
+
+def _short_path(path):
+    if os.name != "nt":
+        return str(path)
+    path = str(path)
+    if not os.path.exists(path):
+        return path
+    try:
+        import ctypes
+
+        size = ctypes.windll.kernel32.GetShortPathNameW(path, None, 0)
+        if size == 0:
+            return path
+        buf = ctypes.create_unicode_buffer(size)
+        ctypes.windll.kernel32.GetShortPathNameW(path, buf, size)
+        return buf.value or path
+    except Exception:
+        return path
+
+
+def _prepend_path(path):
+    path = _short_path(path)
+    os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+
+
+def _configure_windows_toolchain():
+    if os.name != "nt":
+        return
+
+    rocm_home = Path(os.environ.get("HIP_QUANT_ROCM_HOME", r"C:\Program Files\AMD\ROCm\7.1"))
+    if rocm_home.exists():
+        rocm_home_short = _short_path(rocm_home)
+        os.environ["ROCM_HOME"] = rocm_home_short
+        os.environ["HIP_PATH"] = rocm_home_short
+        os.environ["HIP_CLANG_PATH"] = _short_path(rocm_home / "bin")
+        _prepend_path(rocm_home / "bin")
+
+    if "CC" not in os.environ or "CXX" not in os.environ:
+        candidates = glob.glob(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*"
+            r"\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        )
+        if candidates:
+            cl = Path(sorted(candidates)[-1])
+            cl_short = _short_path(cl)
+            os.environ.setdefault("CC", cl_short)
+            os.environ.setdefault("CXX", cl_short)
+            _prepend_path(cl.parent)
+
+    if os.environ.get("VSCMD_VER"):
+        os.environ.setdefault("DISTUTILS_USE_SDK", "1")
+
+    os.environ.setdefault("MAX_JOBS", "1")
+
+
+_configure_windows_toolchain()
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -40,7 +101,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.4.0",
+    version="0.4.1",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

@@ -65,7 +65,7 @@ python setup_torch.py build_ext --inplace
 ```powershell
 # Core offline library only
 python -m build
-pip install dist/hip_quant-0.4.0-py3-none-any.whl
+pip install dist/hip_quant-0.4.1-py3-none-any.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -157,20 +157,24 @@ from hip_quant.torch_api import Fp8LinearFunction
 out = Fp8LinearFunction.apply(input, weight, bias)  # bias optional
 ```
 
-#### Real FP8 GEMM (Phase 4 HIP kernels)
+#### Fused FP8 Linear (gfx12 WMMA kernels)
 
 ```python
-from hip_quant.torch_api import (
+from hip_quant import (
     fp8_linear_forward,
     fp8_linear_backward_input,
     fp8_linear_backward_weight,
 )
 
-# [M,K] @ [N,K].T = [M,N] — runs custom tiled GEMM kernel
+# [M,K] @ [N,K].T = [M,N]
+# forward: E4M3 x E4M3 WMMA, backward: E5M2/BF8 x E5M2/BF8 WMMA
 out        = fp8_linear_forward(input, weight, bias=None)
 grad_in    = fp8_linear_backward_input(grad_output, weight)
 grad_wt    = fp8_linear_backward_weight(grad_output, input)
 ```
+
+These functions are also used by `Fp8LinearFunction` / `Fp8Linear` after the
+extension is built.
 
 #### Scale / amax tracking (Phase 4 scaffold)
 
