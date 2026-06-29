@@ -95,3 +95,30 @@ typedef struct {
     ggml_half d;
     uint8_t qs[3 * QK_K / 8];
 } block_iq3_xxs;
+
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K / 8];
+} block_iq2_xxs;
+
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K / 8];
+    uint8_t scales[QK_K / 32];
+} block_iq2_xs;
+
+#define IQ3S_N_SCALE (QK_K / 64)
+
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_K / 4];
+    uint8_t qh[QK_K / 32];
+    uint8_t signs[QK_K / 8];
+    uint8_t scales[IQ3S_N_SCALE];
+} block_iq3_s;
+
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_K / 8];
+    uint16_t qh[QK_K / 32];
+} block_iq1_s;

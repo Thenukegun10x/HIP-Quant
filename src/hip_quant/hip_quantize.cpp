@@ -15,10 +15,18 @@
 #include "kernels/quant_q4_K.cu"
 #include "kernels/quant_q5_K.cu"
 #include "kernels/quant_q6_K.cu"
+#include "kernels/quant_iq2_xxs.cu"
+#include "kernels/quant_iq2_xs.cu"
+#include "kernels/quant_iq1_s.cu"
 #include "kernels/quant_iq4_nl.cu"
 #include "kernels/quant_iq4_xs.cu"
 #include "kernels/quant_iq3_xxs.cu"
+#include "kernels/quant_iq3_s.cu"
+#include "hip_quant_iq2xxs_data.h"
+#include "hip_quant_iq2xs_data.h"
+#include "hip_quant_iq1s_data.h"
 #include "hip_quant_iq3xxs_data.h"
+#include "hip_quant_iq3s_data.h"
 
 #define QK_K 256
 #define QK8_0 32
@@ -31,8 +39,23 @@
 
 static bool hip_initialized = false;
 static bool iq3xxs_tables_loaded = false;
+static bool iq2xxs_tables_loaded = false;
+static bool iq2xs_tables_loaded = false;
+static bool iq1s_tables_loaded = false;
+static bool iq3s_tables_loaded = false;
 static int device_id = 0;
 static hipDeviceProp_t props;
+static int *d_iq2xxs_map_data = NULL;
+static uint16_t *d_iq2xxs_neighbours_data = NULL;
+static int8_t *d_iq2xs_grid_data = NULL;
+static int *d_iq2xs_map_data = NULL;
+static uint16_t *d_iq2xs_neighbours_data = NULL;
+static int8_t *d_iq1s_grid_data = NULL;
+static int *d_iq1s_map_data = NULL;
+static uint16_t *d_iq1s_neighbours_data = NULL;
+static int8_t *d_iq3s_grid_data = NULL;
+static int *d_iq3s_map_data = NULL;
+static uint16_t *d_iq3s_neighbours_data = NULL;
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,8 +74,12 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 12: return sizeof(block_q4_K) * (n_per_row / QK_K);
         case 13: return sizeof(block_q5_K) * (n_per_row / QK_K);
         case 14: return sizeof(block_q6_K) * (n_per_row / QK_K);
+        case 16: return sizeof(block_iq2_xxs) * (n_per_row / QK_K);
+        case 17: return sizeof(block_iq2_xs) * (n_per_row / QK_K);
         case 18: return sizeof(block_iq3_xxs) * (n_per_row / QK_K);
+        case 19: return sizeof(block_iq1_s) * (n_per_row / QK_K);
         case 20: return sizeof(block_iq4_nl) * (n_per_row / QK4_NL);
+        case 21: return sizeof(block_iq3_s) * (n_per_row / QK_K);
         case 23: return sizeof(block_iq4_xs) * (n_per_row / QK_K);
         default: return 0;
     }
@@ -62,7 +89,7 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:
             return (int)(n_per_row / 32);
-        case 10: case 11: case 12: case 13: case 14: case 18:
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21:
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
         case 23: return (int)(n_per_row / QK_K);
@@ -83,8 +110,12 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
         case 12: return sizeof(block_q4_K);
         case 13: return sizeof(block_q5_K);
         case 14: return sizeof(block_q6_K);
+        case 16: return sizeof(block_iq2_xxs);
+        case 17: return sizeof(block_iq2_xs);
         case 18: return sizeof(block_iq3_xxs);
+        case 19: return sizeof(block_iq1_s);
         case 20: return sizeof(block_iq4_nl);
+        case 21: return sizeof(block_iq3_s);
         case 23: return sizeof(block_iq4_xs);
         default: return 0;
     }
@@ -93,7 +124,7 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
 __declspec(dllexport) int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
-        case 10: case 11: case 12: case 13: case 14: case 18: return 256;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
         default: return 0;
@@ -157,7 +188,43 @@ __declspec(dllexport) size_t quantize_tensor(
     if (!iq3xxs_tables_loaded) {
         hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_grid), h_iq3xxs_grid, sizeof(h_iq3xxs_grid));
         hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_map), h_iq3xxs_map, sizeof(h_iq3xxs_map));
+        hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_neighbours), h_iq3xxs_neighbours, sizeof(h_iq3xxs_neighbours));
         iq3xxs_tables_loaded = true;
+    }
+    if (!iq2xxs_tables_loaded) {
+        hipMemcpyToSymbol(HIP_SYMBOL(d_iq2xxs_grid), h_iq2xxs_grid, sizeof(h_iq2xxs_grid));
+        hipMalloc(&d_iq2xxs_map_data, sizeof(h_iq2xxs_map));
+        hipMalloc(&d_iq2xxs_neighbours_data, sizeof(h_iq2xxs_neighbours));
+        hipMemcpy(d_iq2xxs_map_data, h_iq2xxs_map, sizeof(h_iq2xxs_map), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq2xxs_neighbours_data, h_iq2xxs_neighbours, sizeof(h_iq2xxs_neighbours), hipMemcpyHostToDevice);
+        iq2xxs_tables_loaded = true;
+    }
+    if (!iq2xs_tables_loaded) {
+        hipMalloc(&d_iq2xs_grid_data, sizeof(h_iq2xs_grid));
+        hipMalloc(&d_iq2xs_map_data, sizeof(h_iq2xs_map));
+        hipMalloc(&d_iq2xs_neighbours_data, sizeof(h_iq2xs_neighbours));
+        hipMemcpy(d_iq2xs_grid_data, h_iq2xs_grid, sizeof(h_iq2xs_grid), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq2xs_map_data, h_iq2xs_map, sizeof(h_iq2xs_map), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq2xs_neighbours_data, h_iq2xs_neighbours, sizeof(h_iq2xs_neighbours), hipMemcpyHostToDevice);
+        iq2xs_tables_loaded = true;
+    }
+    if (!iq1s_tables_loaded) {
+        hipMalloc(&d_iq1s_grid_data, sizeof(h_iq1s_grid));
+        hipMalloc(&d_iq1s_map_data, sizeof(h_iq1s_map));
+        hipMalloc(&d_iq1s_neighbours_data, sizeof(h_iq1s_neighbours));
+        hipMemcpy(d_iq1s_grid_data, h_iq1s_grid, sizeof(h_iq1s_grid), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq1s_map_data, h_iq1s_map, sizeof(h_iq1s_map), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq1s_neighbours_data, h_iq1s_neighbours, sizeof(h_iq1s_neighbours), hipMemcpyHostToDevice);
+        iq1s_tables_loaded = true;
+    }
+    if (!iq3s_tables_loaded) {
+        hipMalloc(&d_iq3s_grid_data, sizeof(h_iq3s_grid));
+        hipMalloc(&d_iq3s_map_data, sizeof(h_iq3s_map));
+        hipMalloc(&d_iq3s_neighbours_data, sizeof(h_iq3s_neighbours));
+        hipMemcpy(d_iq3s_grid_data, h_iq3s_grid, sizeof(h_iq3s_grid), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq3s_map_data, h_iq3s_map, sizeof(h_iq3s_map), hipMemcpyHostToDevice);
+        hipMemcpy(d_iq3s_neighbours_data, h_iq3s_neighbours, sizeof(h_iq3s_neighbours), hipMemcpyHostToDevice);
+        iq3s_tables_loaded = true;
     }
 
     size_t row_size = get_row_size(type, n_per_row);
@@ -263,14 +330,34 @@ __declspec(dllexport) size_t quantize_tensor(
                 d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row);
             break;
         }
+        case 16: {
+            hipLaunchKernelGGL(quantize_iq2_xxs_kernel, gridDim, 1, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq2xxs_map_data, d_iq2xxs_neighbours_data, (int)nrows, (int)n_per_row);
+            break;
+        }
+        case 17: {
+            hipLaunchKernelGGL(quantize_iq2_xs_kernel, gridDim, 1, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq2xs_grid_data, d_iq2xs_map_data, d_iq2xs_neighbours_data, (int)nrows, (int)n_per_row);
+            break;
+        }
         case 18: {
-            hipLaunchKernelGGL(quantize_iq3_xxs_kernel, gridDim, 256, 0, 0,
+            hipLaunchKernelGGL(quantize_iq3_xxs_kernel, gridDim, 1, 0, 0,
                 d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row);
+            break;
+        }
+        case 19: {
+            hipLaunchKernelGGL(quantize_iq1_s_kernel, gridDim, 1, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq1s_grid_data, d_iq1s_map_data, d_iq1s_neighbours_data, (int)nrows, (int)n_per_row);
             break;
         }
         case 20: {
             hipLaunchKernelGGL(quantize_iq4_nl_kernel, gridDim, QK4_NL, 0, 0,
                 d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row);
+            break;
+        }
+        case 21: {
+            hipLaunchKernelGGL(quantize_iq3_s_kernel, gridDim, 1, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq3s_grid_data, d_iq3s_map_data, d_iq3s_neighbours_data, (int)nrows, (int)n_per_row);
             break;
         }
         case 23: {

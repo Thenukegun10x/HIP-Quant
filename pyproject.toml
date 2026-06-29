@@ -8,5 +8,5 @@ version = "0.1.0"
 description = "HIP/ROCm GPU quantization kernels for GGML types"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
+    "numpy>=1.23",
 ]
