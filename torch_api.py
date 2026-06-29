@@ -189,23 +189,22 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         weight_scale: float,
     ) -> "torch.Tensor":
 
-        # Scale → quantise → save compressed bytes → dequantise → unscale
-        input_fp8  = quantize_e4m3((input  * input_scale).contiguous())
-        weight_fp8 = quantize_e4m3((weight * weight_scale).contiguous())
-        input_f32  = dequantize_e4m3(input_fp8)  * (1.0 / input_scale)
-        weight_f32 = dequantize_e4m3(weight_fp8) * (1.0 / weight_scale)
+        input_c = input.contiguous()
+        weight_c = weight.contiguous()
+
+        # Save compressed scaled activation for backward. Forward itself uses
+        # scaled in-register E4M3 quantization and gfx12 FP8 WMMA.
+        input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
 
         ctx.has_bias    = bias is not None
         ctx.input_scale = input_scale          # needed to dequantise in backward
+        ctx.weight_scale = weight_scale
         if bias is not None:
             ctx.save_for_backward(input_fp8, weight, bias)
         else:
             ctx.save_for_backward(input_fp8, weight)
 
-        out = input_f32.matmul(weight_f32.t())
-        if bias is not None:
-            out = out + bias
-        return out
+        return fp8_linear_forward_scaled(input_c, weight_c, bias, input_scale, weight_scale)
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
@@ -218,9 +217,11 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         # Decompress activation using the saved scale
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
-        grad_f32    = _sim_fp8_e5m2(grad_output.contiguous())
-        grad_input  = grad_f32.matmul(weight)
-        grad_weight = grad_f32.t().matmul(input_f32)
+        grad_output_c = grad_output.contiguous()
+        grad_input = fp8_linear_backward_input_scaled(
+            grad_output_c, weight, ctx.weight_scale
+        )
+        grad_weight = fp8_linear_backward_weight(grad_output_c, input_f32)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias, None, None
@@ -483,24 +484,23 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         bias:            Optional["torch.Tensor"], # [N] float32 or None
     ) -> "torch.Tensor":
 
-        # Compress activation (uint8, 4× smaller than float32)
-        input_fp8 = quantize_e4m3((input * input_scale).contiguous())
-        input_f32 = dequantize_e4m3(input_fp8) * (1.0 / input_scale)
+        input_c = input.contiguous()
 
-        # Dequantise the weight shadow
-        weight_f32 = dequantize_e4m3(weight_fp8) * weight_inv_scale
+        # Compress activation for backward. Forward consumes this scale and the
+        # pre-quantized E4M3 weight shadow inside a gfx12 FP8 WMMA kernel.
+        input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
 
         ctx.has_bias       = bias is not None
         ctx.input_scale    = input_scale
+        ctx.weight_scale   = 1.0 / weight_inv_scale
         if bias is not None:
             ctx.save_for_backward(input_fp8, weight_master, bias)
         else:
             ctx.save_for_backward(input_fp8, weight_master)
 
-        out = input_f32.matmul(weight_f32.t())
-        if bias is not None:
-            out = out + bias
-        return out
+        return fp8_linear_forward_fp8_weight(
+            input_c, weight_fp8, weight_inv_scale, input_scale, bias
+        )
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
@@ -513,9 +513,13 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         # Decompress activation
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
-        grad_f32 = _sim_fp8_e5m2(grad_output.contiguous())
-        grad_input         = grad_f32.matmul(weight_master)   # accurate direction
-        grad_weight_master = grad_f32.t().matmul(input_f32)   # STE to master
+        grad_output_c = grad_output.contiguous()
+        grad_input = fp8_linear_backward_input_scaled(
+            grad_output_c, weight_master, ctx.weight_scale
+        )
+        grad_weight_master = fp8_linear_backward_weight(
+            grad_output_c, input_f32
+        )
         grad_bias          = grad_output.sum(0) if bias is not None else None
 
         # Returns align with forward args:
@@ -772,6 +776,33 @@ def fp8_linear_forward(
     )
 
 
+def fp8_linear_forward_scaled(
+    input:        "torch.Tensor",
+    weight:       "torch.Tensor",
+    bias:         Optional["torch.Tensor"] = None,
+    input_scale:  float = 1.0,
+    weight_scale: float = 1.0,
+) -> "torch.Tensor":
+    """Scaled FP8 linear forward via gfx12 E4M3 WMMA."""
+    return _load_extension().fp8_linear_forward_scaled(
+        input.contiguous(), weight.contiguous(), bias, float(input_scale), float(weight_scale)
+    )
+
+
+def fp8_linear_forward_fp8_weight(
+    input:            "torch.Tensor",
+    weight_fp8:       "torch.Tensor",
+    weight_inv_scale: float,
+    input_scale:      float,
+    bias:             Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Scaled FP8 linear forward using a pre-quantized E4M3 weight buffer."""
+    return _load_extension().fp8_linear_forward_fp8_weight(
+        input.contiguous(), weight_fp8.contiguous(),
+        float(weight_inv_scale), float(input_scale), bias
+    )
+
+
 def fp8_linear_backward_input(
     grad_output: "torch.Tensor",
     weight:      "torch.Tensor",
@@ -782,6 +813,17 @@ def fp8_linear_backward_input(
     )
 
 
+def fp8_linear_backward_input_scaled(
+    grad_output:  "torch.Tensor",
+    weight:       "torch.Tensor",
+    weight_scale: float,
+) -> "torch.Tensor":
+    """Scaled grad_input via gfx12 BF8/E5M2 WMMA."""
+    return _load_extension().fp8_linear_backward_input_scaled(
+        grad_output.contiguous(), weight.contiguous(), float(weight_scale)
+    )
+
+
 def fp8_linear_backward_weight(
     grad_output: "torch.Tensor",
     input:       "torch.Tensor",
@@ -789,6 +831,17 @@ def fp8_linear_backward_weight(
     """grad_weight = E5M2(grad_output).T @ input  (HIP kernel, Phase 4)."""
     return _load_extension().fp8_linear_backward_weight(
         grad_output.contiguous(), input.contiguous()
+    )
+
+
+def fp8_linear_backward_weight_scaled(
+    grad_output: "torch.Tensor",
+    input:       "torch.Tensor",
+    input_scale: float,
+) -> "torch.Tensor":
+    """Scaled grad_weight via gfx12 BF8/E5M2 WMMA."""
+    return _load_extension().fp8_linear_backward_weight_scaled(
+        grad_output.contiguous(), input.contiguous(), float(input_scale)
     )
 
 

@@ -2,7 +2,7 @@ import ctypes
 import numpy as np
 import os
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -10,12 +10,18 @@ _TORCH_EXPORTS = {
     "dequantize_e4m3",
     "dequantize_e5m2",
     "fp8_linear_forward",
+    "fp8_linear_forward_scaled",
+    "fp8_linear_forward_fp8_weight",
     "fp8_linear_backward_input",
+    "fp8_linear_backward_input_scaled",
     "fp8_linear_backward_weight",
+    "fp8_linear_backward_weight_scaled",
     "Fp8LinearFunction",
     "Fp8Linear",
     "Fp8ScaledLinearFunction",
     "Fp8ScaledLinear",
+    "Fp8ShadowLinearFunction",
+    "Fp8ShadowLinear",
     "Fp8TensorMeta",
     "convert_to_fp8",
     "Adafactor",

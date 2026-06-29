@@ -65,7 +65,7 @@ python setup_torch.py build_ext --inplace
 ```powershell
 # Core offline library only
 python -m build
-pip install dist/hip_quant-0.4.2-py3-none-any.whl
+pip install dist/hip_quant-0.4.3-py3-none-any.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -162,8 +162,12 @@ out = Fp8LinearFunction.apply(input, weight, bias)  # bias optional
 ```python
 from hip_quant import (
     fp8_linear_forward,
+    fp8_linear_forward_scaled,
+    fp8_linear_forward_fp8_weight,
     fp8_linear_backward_input,
+    fp8_linear_backward_input_scaled,
     fp8_linear_backward_weight,
+    fp8_linear_backward_weight_scaled,
 )
 
 # [M,K] @ [N,K].T = [M,N]
@@ -171,10 +175,15 @@ from hip_quant import (
 out        = fp8_linear_forward(input, weight, bias=None)
 grad_in    = fp8_linear_backward_input(grad_output, weight)
 grad_wt    = fp8_linear_backward_weight(grad_output, input)
+
+# Scaled path used by Fp8ScaledLinear and Fp8ShadowLinear
+out_scaled = fp8_linear_forward_scaled(input, weight, bias, input_scale, weight_scale)
+grad_in_s  = fp8_linear_backward_input_scaled(grad_output, weight, weight_scale)
+grad_wt_s  = fp8_linear_backward_weight_scaled(grad_output, input, input_scale)
 ```
 
-These functions are also used by `Fp8LinearFunction` / `Fp8Linear` after the
-extension is built.
+These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
+`Fp8ShadowLinear` after the extension is built.
 
 #### Scale / amax tracking (Phase 4 scaffold)
 
