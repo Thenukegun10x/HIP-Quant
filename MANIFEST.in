@@ -1,3 +1,5 @@
-include README.md
-recursive-include src/hip_quant *.py *.h *.cpp *.ps1
-recursive-include src/hip_quant/kernels *.cu
+include hip_quantize.dll
+include *.h
+include *.cpp
+include build.ps1
+recursive-include kernels *
