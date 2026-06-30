@@ -20,6 +20,7 @@ The NumPy/ctypes API in ``hip_quant.__init__`` is *not* touched.
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, Optional, Set, Tuple, Union
 
 # ---------------------------------------------------------------------------
@@ -33,6 +34,57 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 _C = None
+_WMMA_GUARD_CACHE: Dict[int, Tuple[str, str]] = {}
+
+
+def _parse_rocm_version(value: Optional[str]) -> Tuple[int, int]:
+    if not value:
+        return (0, 0)
+    parts = []
+    for part in str(value).replace("-", ".").split("."):
+        if not part.isdigit():
+            break
+        parts.append(int(part))
+        if len(parts) == 2:
+            break
+    while len(parts) < 2:
+        parts.append(0)
+    return (parts[0], parts[1])
+
+
+def _require_gfx12_fp8_wmma(tensor: "torch.Tensor") -> None:
+    if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
+        raise RuntimeError("hip_quant FP8/BF8 WMMA kernels are disabled by HIP_QUANT_DISABLE_WMMA.")
+    if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() not in ("1", "true", "yes", "on"):
+        raise RuntimeError(
+            "hip_quant FP8/BF8 WMMA kernels are disabled by default because unstable kernels can hang or reset the GPU. "
+            "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems."
+        )
+    if not _TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is not installed. Install torch with ROCm support first.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("hip_quant FP8/BF8 WMMA kernels require a ROCm/HIP GPU.")
+
+    device = tensor.device.index if tensor.device.index is not None else torch.cuda.current_device()
+    cached = _WMMA_GUARD_CACHE.get(device)
+    if cached is None:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "") or "unknown"
+        rocm_version = getattr(torch.version, "hip", None)
+        cached = (arch, str(rocm_version or "unknown"))
+        _WMMA_GUARD_CACHE[device] = cached
+    arch, rocm_version = cached
+
+    if not arch.startswith("gfx12"):
+        raise RuntimeError(
+            f"hip_quant FP8/BF8 WMMA linear kernels use gfx12/RDNA4 w32 intrinsics; current device arch is {arch}. "
+            "CDNA may support FP8/BF16 through MFMA/rocBLASLt paths, but not this RDNA4-specific kernel."
+        )
+    if _parse_rocm_version(rocm_version) < (7, 2):
+        raise RuntimeError(
+            f"hip_quant FP8/BF8 WMMA linear kernels require ROCm 7.2+; current torch.version.hip is {rocm_version}. "
+            "ROCm 7.1 and older have a gfx12 FP8 WMMA bug that can hang or zero GPU memory."
+        )
 
 
 def _load_extension() -> object:
@@ -771,6 +823,7 @@ def fp8_linear_forward(
 
     Correctness-first stub — replace with rocBLASLt for production throughput.
     """
+    _require_gfx12_fp8_wmma(input)
     return _load_extension().fp8_linear_forward(
         input.contiguous(), weight.contiguous(), bias
     )
@@ -784,6 +837,7 @@ def fp8_linear_forward_scaled(
     weight_scale: float = 1.0,
 ) -> "torch.Tensor":
     """Scaled FP8 linear forward via gfx12 E4M3 WMMA."""
+    _require_gfx12_fp8_wmma(input)
     return _load_extension().fp8_linear_forward_scaled(
         input.contiguous(), weight.contiguous(), bias, float(input_scale), float(weight_scale)
     )
@@ -797,6 +851,7 @@ def fp8_linear_forward_fp8_weight(
     bias:             Optional["torch.Tensor"] = None,
 ) -> "torch.Tensor":
     """Scaled FP8 linear forward using a pre-quantized E4M3 weight buffer."""
+    _require_gfx12_fp8_wmma(input)
     return _load_extension().fp8_linear_forward_fp8_weight(
         input.contiguous(), weight_fp8.contiguous(),
         float(weight_inv_scale), float(input_scale), bias
@@ -808,6 +863,7 @@ def fp8_linear_backward_input(
     weight:      "torch.Tensor",
 ) -> "torch.Tensor":
     """grad_input = E5M2(grad_output) @ weight  (HIP kernel, Phase 4)."""
+    _require_gfx12_fp8_wmma(grad_output)
     return _load_extension().fp8_linear_backward_input(
         grad_output.contiguous(), weight.contiguous()
     )
@@ -819,6 +875,7 @@ def fp8_linear_backward_input_scaled(
     weight_scale: float,
 ) -> "torch.Tensor":
     """Scaled grad_input via gfx12 BF8/E5M2 WMMA."""
+    _require_gfx12_fp8_wmma(grad_output)
     return _load_extension().fp8_linear_backward_input_scaled(
         grad_output.contiguous(), weight.contiguous(), float(weight_scale)
     )
@@ -829,6 +886,7 @@ def fp8_linear_backward_weight(
     input:       "torch.Tensor",
 ) -> "torch.Tensor":
     """grad_weight = E5M2(grad_output).T @ input  (HIP kernel, Phase 4)."""
+    _require_gfx12_fp8_wmma(grad_output)
     return _load_extension().fp8_linear_backward_weight(
         grad_output.contiguous(), input.contiguous()
     )
@@ -840,6 +898,7 @@ def fp8_linear_backward_weight_scaled(
     input_scale: float,
 ) -> "torch.Tensor":
     """Scaled grad_weight via gfx12 BF8/E5M2 WMMA."""
+    _require_gfx12_fp8_wmma(grad_output)
     return _load_extension().fp8_linear_backward_weight_scaled(
         grad_output.contiguous(), input.contiguous(), float(input_scale)
     )

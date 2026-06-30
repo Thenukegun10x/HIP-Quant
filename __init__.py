@@ -1,8 +1,9 @@
 import ctypes
 import numpy as np
 import os
+import sys
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -121,19 +122,69 @@ GGML_TYPE_BLOCK_BYTES = {
     37: 32,
 }
 
-_ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
+if os.name == "nt":
+    _ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
+else:
+    _rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
+    _ROCM_BIN = os.path.join(_rocm_home, "bin")
+
+_DLL_DIR_HANDLES = []
+
+def _runtime_dll_dirs():
+    if os.name != "nt":
+        return [_ROCM_BIN]
+
+    dirs = []
+    rocm_bin = os.environ.get("HIP_QUANT_ROCM_BIN")
+    if rocm_bin:
+        dirs.append(rocm_bin)
+    for env_name in ("HIP_QUANT_ROCM_HOME", "ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        rocm_home = os.environ.get(env_name)
+        if rocm_home:
+            dirs.append(os.path.join(rocm_home, "bin"))
+
+    dirs.extend([
+        os.path.join(sys.prefix, "Lib", "site-packages", "_rocm_sdk_core", "bin"),
+        os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib"),
+        os.path.join(sys.prefix, "Scripts"),
+        _ROCM_BIN,
+    ])
+    return dirs
+
+def _add_runtime_dll_dirs():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    seen = set()
+    for path in _runtime_dll_dirs():
+        path = os.path.normpath(path)
+        if path in seen or not os.path.isdir(path):
+            continue
+        seen.add(path)
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(path))
+
+def _shared_library_candidates():
+    env_dll = os.environ.get("HIP_QUANT_DLL") or os.environ.get("HIP_QUANT_DLL_PATH")
+    if env_dll:
+        yield env_dll
+
+    win_names = ["hip_quantize_rocm721.dll", "hip_quantize.dll"]
+    if os.environ.get("HIP_QUANT_DLL_VARIANT", "").lower() in ("7.1", "71", "rocm71", "legacy"):
+        win_names.reverse()
+    names = win_names if os.name == "nt" else ["libhip_quantize.so"]
+    roots = [
+        _PKG_DIR,
+        os.path.join(_PKG_DIR, ".."),
+        os.path.join(_PKG_DIR, "..", "..", "src"),
+    ]
+    for root in roots:
+        for name in names:
+            yield os.path.join(root, name)
 
 class HipQuant:
     def __init__(self, dll_path=None):
-        # Ensure ROCm 7.1 runtime is searched before PyTorch's ROCm 7.2 venv
-        if os.path.isdir(_ROCM_BIN):
-            os.add_dll_directory(_ROCM_BIN)
+        _add_runtime_dll_dirs()
         if dll_path is None:
-            candidates = [
-                os.path.join(_PKG_DIR, "hip_quantize.dll"),
-                os.path.join(_PKG_DIR, "..", "hip_quantize.dll"),
-                os.path.join(_PKG_DIR, "..", "..", "src", "hip_quantize.dll"),
-            ]
+            candidates = list(_shared_library_candidates())
             for p in candidates:
                 p = os.path.normpath(p)
                 if os.path.isfile(p):
@@ -141,7 +192,7 @@ class HipQuant:
                     break
             if dll_path is None:
                 raise FileNotFoundError(
-                    f"hip_quantize.dll not found. Tried: {candidates}"
+                    f"hip_quantize shared library not found. Tried: {candidates}"
                 )
         self._dll_path = dll_path
         self._dll = ctypes.CDLL(dll_path)
@@ -185,6 +236,18 @@ class HipQuant:
         self._dll.get_device_name.restype = ctypes.c_char_p
         self._dll.get_device_count.restype = ctypes.c_int
         self._dll.get_device_count.argtypes = []
+        try:
+            self._get_arch_name = self._dll.get_arch_name
+            self._get_arch_name.restype = ctypes.c_int
+            self._get_arch_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        except AttributeError:
+            self._get_arch_name = None
+        try:
+            self._get_hip_runtime_version = self._dll.get_hip_runtime_version
+            self._get_hip_runtime_version.restype = ctypes.c_int
+            self._get_hip_runtime_version.argtypes = []
+        except AttributeError:
+            self._get_hip_runtime_version = None
         self._dll.fp8_gemm_test_wmma.restype = ctypes.c_int
         self._dll.fp8_gemm_test_wmma.argtypes = [
             ctypes.POINTER(ctypes.c_uint8),
@@ -211,6 +274,20 @@ class HipQuant:
     @property
     def device_name(self):
         return self._dll.get_device_name().decode("utf-8")
+
+    @property
+    def gcn_arch(self):
+        if self._get_arch_name is None:
+            return ""
+        buf = ctypes.create_string_buffer(256)
+        self._get_arch_name(buf, 256)
+        return buf.value.decode("utf-8", errors="replace").strip()
+
+    @property
+    def hip_runtime_version(self):
+        if self._get_hip_runtime_version is None:
+            return 0
+        return int(self._get_hip_runtime_version())
 
     def type_size(self, type_num):
         return self._dll.ggml_type_size_for(int(type_num))
@@ -244,6 +321,25 @@ class HipQuant:
         if lda is None: lda = K
         if ldb is None: ldb = N
         if ldc is None: ldc = N
+        if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
+            raise RuntimeError("FP8 WMMA is disabled by HIP_QUANT_DISABLE_WMMA.")
+        if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() not in ("1", "true", "yes", "on"):
+            raise RuntimeError(
+                "FP8 WMMA is disabled by default because unstable kernels can hang or reset the GPU. "
+                "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems."
+            )
+        arch = self.gcn_arch
+        if not arch.startswith("gfx12"):
+            raise RuntimeError(
+                f"FP8 WMMA test requires the gfx12/RDNA4 w32 intrinsic path; current device arch is {arch or 'unknown'}. "
+                "CDNA may support FP8/BF16 through MFMA/rocBLASLt paths, but not this RDNA4-specific kernel."
+            )
+        runtime_version = self.hip_runtime_version
+        if runtime_version and runtime_version < 70200000:
+            raise RuntimeError(
+                f"FP8 WMMA test is disabled on ROCm/HIP runtime {runtime_version}. "
+                "Use the packaged ROCm 7.2.1 DLL/runtime; ROCm 7.1 and older can hang or zero GPU memory."
+            )
         A_fp8 = np.ascontiguousarray(A_fp8, dtype=np.uint8)
         B_fp8 = np.ascontiguousarray(B_fp8, dtype=np.uint8)
         C = np.empty((M, ldc), dtype=np.float32)
@@ -369,7 +465,7 @@ class HipQuant:
             )
         elif source_format in ("E5M2", "F8_E5M2", GGML_TYPE["F8_E5M2"]):
             if self._quantize_tensor_fp8_e5m2_input is None:
-                raise RuntimeError("Loaded hip_quantize.dll does not support E5M2 FP8 input")
+                raise RuntimeError("Loaded hip_quantize library does not support E5M2 FP8 input")
             result = self._quantize_tensor_fp8_e5m2_input(
                 int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
             )

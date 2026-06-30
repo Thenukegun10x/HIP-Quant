@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 
-def build(arch="gfx1201", rocm_bin=None, verbose=False):
+def build(arch="all", rocm_bin=None, verbose=False):
     pkg_dir = Path(__file__).resolve().parent
     script = pkg_dir / "build.ps1"
     if not script.is_file():
@@ -25,7 +25,8 @@ def build(arch="gfx1201", rocm_bin=None, verbose=False):
 
     env = os.environ.copy()
     env["HIP_QUANT_ROCM_BIN"] = str(rocm_bin)
-    env["HIP_QUANT_ARCH"] = arch
+    if arch:
+        env["HIP_QUANT_ARCH"] = arch
 
     cmd = [powershell, "-ExecutionPolicy", "Bypass", "-File", str(script)]
     if verbose:
@@ -40,7 +41,7 @@ def build(arch="gfx1201", rocm_bin=None, verbose=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Build hip_quantize.dll with hipcc.")
-    parser.add_argument("--arch", default=os.environ.get("HIP_QUANT_ARCH", "gfx1201"), help="HIP offload arch, e.g. gfx1201")
+    parser.add_argument("--arch", default=os.environ.get("HIP_QUANT_ARCH", "all"), help="HIP offload arch, comma list, or all")
     parser.add_argument("--rocm-bin", default=os.environ.get("HIP_QUANT_ROCM_BIN"), help="Path to ROCm bin directory")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)

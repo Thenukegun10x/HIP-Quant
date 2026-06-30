@@ -3,6 +3,8 @@ __pycache__/
 *$py.class
 *.so
 *.dll
+!hip_quantize.dll
+!hip_quantize_rocm721.dll
 *.lib
 *.exp
 build/

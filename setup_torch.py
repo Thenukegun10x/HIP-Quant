@@ -89,6 +89,7 @@ ext = CUDAExtension(
         # Device (hipcc) flags; nvcc key is used by PyTorch even on ROCm
         "nvcc": [
             "-O3",
+            "-mno-wavefrontsize64",
             "--offload-arch=gfx1200",
             "--offload-arch=gfx1201",
             # Allow device code to include project headers via relative paths
@@ -101,7 +102,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.4.5",
+    version="0.4.6",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

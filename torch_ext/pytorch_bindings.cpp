@@ -21,7 +21,10 @@
 
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
+#include <hip/hip_runtime.h>
 #include <pybind11/pybind11.h>
+#include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 #ifdef TORCH_CHECK
@@ -35,8 +38,6 @@
 // but the wheel's c10.lib only exports the base c10::Error overload.
 #pragma comment(linker, "/alternatename:__imp_??0ValueError@c10@@QEAA@USourceLocation@1@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z=__imp_??0Error@c10@@QEAA@USourceLocation@1@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z")
 #endif
-
-typedef struct ihipStream_t* hipStream_t;
 
 // Forward declarations for kernel launchers defined in the .hip files.
 extern "C" {
@@ -127,6 +128,41 @@ static inline void check_grid_dim(int64_t dim, int tile, const char* axis) {
                 "fp8_linear: grid dimension on ", axis, " (", blocks,
                 " blocks) exceeds HW limit of 65535. "
                 "Reduce the corresponding tensor dimension or increase TILE size.");
+}
+
+static inline void check_gfx12_fp8_wmma_runtime(const char* op_name) {
+    const char* disable_wmma = std::getenv("HIP_QUANT_DISABLE_WMMA");
+    TORCH_CHECK(!(disable_wmma != nullptr && (
+                    std::strcmp(disable_wmma, "1") == 0 || std::strcmp(disable_wmma, "true") == 0 ||
+                    std::strcmp(disable_wmma, "yes") == 0 || std::strcmp(disable_wmma, "on") == 0)),
+                op_name, ": disabled by HIP_QUANT_DISABLE_WMMA");
+
+    const char* enable_wmma = std::getenv("HIP_QUANT_ENABLE_GFX12_WMMA");
+    TORCH_CHECK(enable_wmma != nullptr && (
+                    std::strcmp(enable_wmma, "1") == 0 || std::strcmp(enable_wmma, "true") == 0 ||
+                    std::strcmp(enable_wmma, "yes") == 0 || std::strcmp(enable_wmma, "on") == 0),
+                op_name,
+                ": disabled by default because unstable FP8/BF8 WMMA kernels can hang or reset the GPU. "
+                "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems.");
+
+    int device = 0;
+    hipError_t err = hipGetDevice(&device);
+    TORCH_CHECK(err == hipSuccess, op_name, ": hipGetDevice failed");
+
+    hipDeviceProp_t props;
+    err = hipGetDeviceProperties(&props, device);
+    TORCH_CHECK(err == hipSuccess, op_name, ": hipGetDeviceProperties failed");
+    TORCH_CHECK(strstr(props.gcnArchName, "gfx12") != nullptr,
+                op_name, ": hip_quant FP8/BF8 WMMA kernels use gfx12/RDNA4 w32 intrinsics; current arch is ",
+                props.gcnArchName,
+                ". CDNA may support FP8/BF16 through MFMA/rocBLASLt paths, but not this RDNA4-specific kernel.");
+
+    int runtime_version = 0;
+    hipRuntimeGetVersion(&runtime_version);
+    TORCH_CHECK(runtime_version == 0 || runtime_version >= 70200000,
+                op_name, ": ROCm/HIP 7.2+ is required for gfx12 FP8 WMMA; current runtime is ",
+                runtime_version,
+                ". ROCm 7.1 and older can hang or zero GPU memory.");
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +288,7 @@ torch::Tensor fp8_linear_forward(
     // Hazard B: both tensors must be on the same device
     TORCH_CHECK(input.device() == weight.device(),
                 "fp8_linear_forward: input and weight must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_forward");
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward(
@@ -309,6 +346,7 @@ torch::Tensor fp8_linear_forward_scaled(
     check_grid_dim(N, 16, "N (cols)");
     TORCH_CHECK(input.device() == weight.device(),
                 "fp8_linear_forward_scaled: input and weight must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_forward_scaled");
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward_scaled(
@@ -362,6 +400,7 @@ torch::Tensor fp8_linear_forward_fp8_weight(
     check_grid_dim(N, 16, "N (cols)");
     TORCH_CHECK(input.device() == weight_fp8.device(),
                 "fp8_linear_forward_fp8_weight: input and weight_fp8 must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_forward_fp8_weight");
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward_fp8_weight(
@@ -418,6 +457,7 @@ torch::Tensor fp8_linear_backward_input(
     // Hazard B: grad_output and weight must be on the same device
     TORCH_CHECK(grad_output.device() == weight.device(),
                 "fp8_linear_backward_input: grad_output and weight must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_backward_input");
 
     auto grad_input = torch::zeros({M, K}, grad_output.options());
     launch_fp8_linear_backward_input(
@@ -457,6 +497,7 @@ torch::Tensor fp8_linear_backward_input_scaled(
     check_grid_dim(K, 16, "K (cols)");
     TORCH_CHECK(grad_output.device() == weight.device(),
                 "fp8_linear_backward_input_scaled: grad_output and weight must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_backward_input_scaled");
 
     auto grad_input = torch::zeros({M, K}, grad_output.options());
     launch_fp8_linear_backward_input_scaled(
@@ -501,6 +542,7 @@ torch::Tensor fp8_linear_backward_weight(
     // Hazard B: grad_output and input must be on the same device
     TORCH_CHECK(grad_output.device() == input.device(),
                 "fp8_linear_backward_weight: grad_output and input must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_backward_weight");
 
     auto grad_weight = torch::zeros({N, K}, grad_output.options());
     launch_fp8_linear_backward_weight(
@@ -540,6 +582,7 @@ torch::Tensor fp8_linear_backward_weight_scaled(
     check_grid_dim(K, 16, "K (cols)");
     TORCH_CHECK(grad_output.device() == input.device(),
                 "fp8_linear_backward_weight_scaled: grad_output and input must be on the same device");
+    check_gfx12_fp8_wmma_runtime("fp8_linear_backward_weight_scaled");
 
     auto grad_weight = torch::zeros({N, K}, grad_output.options());
     launch_fp8_linear_backward_weight_scaled(

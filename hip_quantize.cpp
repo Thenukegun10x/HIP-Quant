@@ -4,6 +4,12 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(_MSC_VER)
+#define HIP_QUANT_EXPORT __declspec(dllexport)
+#else
+#define HIP_QUANT_EXPORT __attribute__((visibility("default")))
+#endif
+
 #include "kernels/quant_q4_0.cu"
 #include "kernels/quant_q4_1.cu"
 #include "kernels/quant_q5_0.cu"
@@ -187,7 +193,7 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     }
 }
 
-__declspec(dllexport) size_t ggml_type_size_for(int type) {
+HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
     switch (type) {
         case 2:  return sizeof(block_q4_0);
         case 3:  return sizeof(block_q4_1);
@@ -215,7 +221,7 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
     }
 }
 
-__declspec(dllexport) int ggml_blck_size_for(int type) {
+HIP_QUANT_EXPORT int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
         case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: return 256;
@@ -226,13 +232,13 @@ __declspec(dllexport) int ggml_blck_size_for(int type) {
     }
 }
 
-__declspec(dllexport) size_t ggml_row_size_for(int type, int64_t n_per_row) {
+HIP_QUANT_EXPORT size_t ggml_row_size_for(int type, int64_t n_per_row) {
     int blck = ggml_blck_size_for(type);
     if (blck == 0) return 0;
     return (n_per_row / blck) * ggml_type_size_for(type);
 }
 
-__declspec(dllexport) const char* get_device_name() {
+HIP_QUANT_EXPORT const char* get_device_name() {
     static char name[256];
     ensure_initialized();
     strncpy(name, props.name, 255);
@@ -370,7 +376,7 @@ static int dispatch_quantize_kernel(
 // quantize_tensor — standard F32 input path
 // ============================================================
 
-__declspec(dllexport) size_t quantize_tensor(
+HIP_QUANT_EXPORT size_t quantize_tensor(
     int type,
     const float* src,
     uint8_t* dst,
@@ -582,7 +588,7 @@ static size_t quantize_tensor_fp8_input_impl(
     return total_size;
 }
 
-__declspec(dllexport) size_t quantize_tensor_fp8_input(
+HIP_QUANT_EXPORT size_t quantize_tensor_fp8_input(
     int type,
     const uint8_t* src_fp8,
     uint8_t* dst,
@@ -593,7 +599,7 @@ __declspec(dllexport) size_t quantize_tensor_fp8_input(
     return quantize_tensor_fp8_input_impl(type, src_fp8, dst, nrows, n_per_row, imatrix, 36);
 }
 
-__declspec(dllexport) size_t quantize_tensor_fp8_e5m2_input(
+HIP_QUANT_EXPORT size_t quantize_tensor_fp8_e5m2_input(
     int type,
     const uint8_t* src_fp8,
     uint8_t* dst,
@@ -615,7 +621,7 @@ __declspec(dllexport) size_t quantize_tensor_fp8_e5m2_input(
 // M, N must be multiples of 16; K can be any positive int.
 // ============================================================
 
-__declspec(dllexport) int fp8_gemm_test_wmma(
+HIP_QUANT_EXPORT int fp8_gemm_test_wmma(
     const uint8_t* A_fp8,
     const uint8_t* B_fp8,
     float* C,
@@ -628,9 +634,34 @@ __declspec(dllexport) int fp8_gemm_test_wmma(
 ) {
     ensure_initialized();
 
+    const char *disable_wmma = getenv("HIP_QUANT_DISABLE_WMMA");
+    if (disable_wmma != NULL && (
+        strcmp(disable_wmma, "1") == 0 || strcmp(disable_wmma, "true") == 0 ||
+        strcmp(disable_wmma, "yes") == 0 || strcmp(disable_wmma, "on") == 0
+    )) {
+        fprintf(stderr, "fp8_gemm: disabled by HIP_QUANT_DISABLE_WMMA\n");
+        return 4;
+    }
+
+    const char *enable_wmma = getenv("HIP_QUANT_ENABLE_GFX12_WMMA");
+    if (enable_wmma == NULL || !(
+        strcmp(enable_wmma, "1") == 0 || strcmp(enable_wmma, "true") == 0 ||
+        strcmp(enable_wmma, "yes") == 0 || strcmp(enable_wmma, "on") == 0
+    )) {
+        fprintf(stderr, "fp8_gemm: disabled by default; set HIP_QUANT_ENABLE_GFX12_WMMA=1 for controlled testing\n");
+        return 4;
+    }
+
     if (strstr(props.gcnArchName, "gfx12") == NULL) {
-        fprintf(stderr, "fp8_gemm: WMMA test kernel requires gfx12/RDNA4; current arch is %s\n", props.gcnArchName);
+        fprintf(stderr, "fp8_gemm: this FP8 WMMA kernel uses gfx12/RDNA4 w32 intrinsics; current arch is %s\n", props.gcnArchName);
         return 2;
+    }
+
+    int runtime_version = 0;
+    hipRuntimeGetVersion(&runtime_version);
+    if (runtime_version > 0 && runtime_version < 70200000) {
+        fprintf(stderr, "fp8_gemm: gfx12 FP8 WMMA requires ROCm/HIP 7.2+; current runtime is %d\n", runtime_version);
+        return 3;
     }
 
     size_t bytes_A = (size_t)M * lda;
@@ -671,7 +702,7 @@ __declspec(dllexport) int fp8_gemm_test_wmma(
     return 0;
 }
 
-__declspec(dllexport) void quantize_reset() {
+HIP_QUANT_EXPORT void quantize_reset() {
     if (g_d_src)       { hipFree(g_d_src);       g_d_src = NULL; }
     if (g_d_dst)       { hipFree(g_d_dst);       g_d_dst = NULL; }
     if (g_d_imatrix)   { hipFree(g_d_imatrix);   g_d_imatrix = NULL; }
@@ -680,7 +711,7 @@ __declspec(dllexport) void quantize_reset() {
     g_d_imatrix_cap = 0;
 }
 
-__declspec(dllexport) int get_device_count() {
+HIP_QUANT_EXPORT int get_device_count() {
     int count = 0;
     hipGetDeviceCount(&count);
     return count;
@@ -690,7 +721,7 @@ __declspec(dllexport) int get_device_count() {
 // Device property queries for compatibility checker
 // ============================================================
 
-__declspec(dllexport) int get_device_prop(
+HIP_QUANT_EXPORT int get_device_prop(
     char *name_buf, int name_buf_size,
     int *major, int *minor,
     int *cu_count,
@@ -712,14 +743,20 @@ __declspec(dllexport) int get_device_prop(
     return 0;
 }
 
-__declspec(dllexport) int get_arch_name(char *buf, int buf_size) {
+HIP_QUANT_EXPORT int get_arch_name(char *buf, int buf_size) {
     ensure_initialized();
     strncpy(buf, props.gcnArchName, (size_t)(buf_size - 1));
     buf[buf_size - 1] = '\0';
     return 0;
 }
 
-__declspec(dllexport) int get_device_memory(size_t *free_bytes, size_t *total_bytes) {
+HIP_QUANT_EXPORT int get_hip_runtime_version() {
+    int runtime_version = 0;
+    hipRuntimeGetVersion(&runtime_version);
+    return runtime_version;
+}
+
+HIP_QUANT_EXPORT int get_device_memory(size_t *free_bytes, size_t *total_bytes) {
     ensure_initialized();
     hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
     if (e != hipSuccess) {
@@ -730,13 +767,12 @@ __declspec(dllexport) int get_device_memory(size_t *free_bytes, size_t *total_by
     return 0;
 }
 
-__declspec(dllexport) int device_has_wmma() {
+HIP_QUANT_EXPORT int device_has_wmma() {
     ensure_initialized();
     const char *arch = props.gcnArchName;
-    // gfx12xx (RDNA4) has WMMA via __builtin_amdgcn_wmma
-    // CDNA3 (gfx942) has MFMA, not the same WMMA intrinsic
-    // gfx11xx (RDNA3) does not have WMMA
-    // gfx103x (RDNA2) does not have WMMA
+    // This reports support for the FP8/BF8 gfx12 w32 intrinsics used by
+    // fp8_gemm_wmma_kernel, not general matrix-core or rocWMMA capability.
+    // CDNA has MFMA/FP8 paths, but not this RDNA4-specific builtin path.
     return (strstr(arch, "gfx12") != NULL) ? 1 : 0;
 }
 

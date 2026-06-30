@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "0.4.5"
-description = "HIP/ROCm 7.1 Quantization library for AMD GPUs"
+version = "0.4.6"
+description = "HIP/ROCm quantization library for AMD GPUs"
 readme = "README.md"
 authors = [
   { name="Your Name", email="your.email@example.com" }
@@ -32,9 +32,12 @@ packages = ["hip_quant"]
 [tool.setuptools.package-data]
 "hip_quant" = [
     "hip_quantize.dll",
+    "hip_quantize_rocm721.dll",
+    "libhip_quantize.so",
     "*.h",
     "*.cpp",
     "build.ps1",
+    "build.sh",
     "kernels/*.cu",
     "torch_ext/*.hip",
     "torch_ext/pytorch_bindings.cpp",

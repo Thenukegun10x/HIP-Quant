@@ -43,7 +43,7 @@ def build_parser():
     parser.add_argument("--type", "-t", default="Q4_K", help="quantization type name or ID, e.g. Q4_K, F8_E4M3, F8_E5M2, or 12")
     parser.add_argument("--fp8-source", choices=("E4M3", "E5M2"), help="treat input as uint8 FP8 bytes and expand on GPU before quantizing")
     parser.add_argument("--imatrix", help="optional .npy importance matrix")
-    parser.add_argument("--dll", help="path to hip_quantize.dll")
+    parser.add_argument("--dll", help="path to hip_quantize shared library (.dll or .so)")
     parser.add_argument("--info", action="store_true", help="print DLL/device information")
     parser.add_argument("--compat", action="store_true", help="print CDNA/RDNA compatibility report")
     parser.add_argument("--emulate", choices=("auto", "cpu", "gpu"), default=None, help="set emulation mode for CDNA testing")

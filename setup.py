@@ -4,6 +4,20 @@ from pathlib import Path
 
 from setuptools import setup
 
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:
+    _bdist_wheel = None
+
+
+if _bdist_wheel is not None:
+    class bdist_wheel(_bdist_wheel):
+        def finalize_options(self):
+            super().finalize_options()
+            self.root_is_pure = False
+else:
+    bdist_wheel = None
+
 
 def _short_path(path):
     if os.name != "nt":
@@ -60,8 +74,12 @@ def _configure_windows_toolchain():
 
 
 def _torch_extension_config():
+    base_cmdclass = {}
+    if bdist_wheel is not None:
+        base_cmdclass["bdist_wheel"] = bdist_wheel
+
     if os.environ.get("HIP_QUANT_BUILD_TORCH_EXT") != "1":
-        return {}, {}
+        return [], base_cmdclass
 
     _configure_windows_toolchain()
 
@@ -76,11 +94,18 @@ def _torch_extension_config():
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--offload-arch=gfx1200", "--offload-arch=gfx1201", "-I."],
+            "nvcc": [
+                "-O3",
+                "-mno-wavefrontsize64",
+                "--offload-arch=gfx1200",
+                "--offload-arch=gfx1201",
+                "-I.",
+            ],
         },
         include_dirs=["."],
     )
-    return [ext], {"build_ext": BuildExtension}
+    base_cmdclass["build_ext"] = BuildExtension
+    return [ext], base_cmdclass
 
 
 ext_modules, cmdclass = _torch_extension_config()

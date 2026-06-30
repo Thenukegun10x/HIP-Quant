@@ -1,9 +1,46 @@
 import ctypes
 import os
+import sys
 from dataclasses import dataclass, field
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
+if os.name == "nt":
+    _ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
+else:
+    _rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
+    _ROCM_BIN = os.path.join(_rocm_home, "bin")
+
+_DLL_DIR_HANDLES = []
+
+def _runtime_dll_dirs():
+    if os.name != "nt":
+        return [_ROCM_BIN]
+    dirs = []
+    rocm_bin = os.environ.get("HIP_QUANT_ROCM_BIN")
+    if rocm_bin:
+        dirs.append(rocm_bin)
+    for env_name in ("HIP_QUANT_ROCM_HOME", "ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        rocm_home = os.environ.get(env_name)
+        if rocm_home:
+            dirs.append(os.path.join(rocm_home, "bin"))
+    dirs.extend([
+        os.path.join(sys.prefix, "Lib", "site-packages", "_rocm_sdk_core", "bin"),
+        os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib"),
+        os.path.join(sys.prefix, "Scripts"),
+        _ROCM_BIN,
+    ])
+    return dirs
+
+def _add_runtime_dll_dirs():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    seen = set()
+    for path in _runtime_dll_dirs():
+        path = os.path.normpath(path)
+        if path in seen or not os.path.isdir(path):
+            continue
+        seen.add(path)
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(path))
 
 # Architecture family classifications
 ARCH_FAMILIES = {
@@ -55,6 +92,7 @@ class DeviceProperties:
     warp_size: int = 0
     max_threads_per_block: int = 0
     has_wmma: bool = False
+    hip_runtime_version: int = 0
     device_count: int = 0
     dll_loaded: bool = False
     _dll_base: str = ""
@@ -98,11 +136,15 @@ class DeviceProperties:
 def _resolve_dll(dll_path=None):
     if dll_path is not None:
         return dll_path
-    candidates = [
-        os.path.join(_PKG_DIR, "hip_quantize.dll"),
-        os.path.join(_PKG_DIR, "..", "hip_quantize.dll"),
-        os.path.join(_PKG_DIR, "..", "..", "src", "hip_quantize.dll"),
-    ]
+    env_dll = os.environ.get("HIP_QUANT_DLL") or os.environ.get("HIP_QUANT_DLL_PATH")
+    win_names = ["hip_quantize_rocm721.dll", "hip_quantize.dll"]
+    if os.environ.get("HIP_QUANT_DLL_VARIANT", "").lower() in ("7.1", "71", "rocm71", "legacy"):
+        win_names.reverse()
+    names = win_names if os.name == "nt" else ["libhip_quantize.so"]
+    candidates = [env_dll] if env_dll else []
+    for root in (_PKG_DIR, os.path.join(_PKG_DIR, ".."), os.path.join(_PKG_DIR, "..", "..", "src")):
+        for name in names:
+            candidates.append(os.path.join(root, name))
     for p in candidates:
         p = os.path.normpath(p)
         if os.path.isfile(p):
@@ -111,23 +153,22 @@ def _resolve_dll(dll_path=None):
 
 
 def probe_device(dll_path=None) -> DeviceProperties:
-    """Probe GPU device via the DLL and return a DeviceProperties dataclass.
+    """Probe GPU device via the shared library and return a DeviceProperties dataclass.
     
-    Safe to call even if no DLL is found or no GPU is present — 
+    Safe to call even if no library is found or no GPU is present — 
     returns best-effort data with dll_loaded=False if anything fails.
     """
     dp = DeviceProperties()
     dll_path = _resolve_dll(dll_path)
     if dll_path is None or not os.path.isfile(dll_path):
-        dp.info.append("No hip_quantize.dll found")
+        dp.info.append("No hip_quantize shared library found")
         return dp
 
     try:
-        if os.path.isdir(_ROCM_BIN):
-            os.add_dll_directory(_ROCM_BIN)
+        _add_runtime_dll_dirs()
         dll = ctypes.CDLL(dll_path)
     except Exception as e:
-        dp.info.append(f"Failed to load DLL: {e}")
+        dp.info.append(f"Failed to load shared library: {e}")
         return dp
 
     dp.dll_loaded = True
@@ -221,6 +262,18 @@ def probe_device(dll_path=None) -> DeviceProperties:
     except Exception:
         pass
 
+    try:
+        dll.get_hip_runtime_version.restype = ctypes.c_int
+        dll.get_hip_runtime_version.argtypes = []
+        dp.hip_runtime_version = int(dll.get_hip_runtime_version())
+        if dp.hip_runtime_version and dp.hip_runtime_version < 70200000 and dp.has_wmma:
+            dp.has_wmma = False
+            dp.info.append(
+                f"ROCm/HIP runtime {dp.hip_runtime_version} detected; this package's gfx12 FP8/BF8 WMMA kernels are disabled because ROCm 7.1 and older can hang or zero GPU memory."
+            )
+    except Exception:
+        pass
+
     return dp
 
 
@@ -228,7 +281,7 @@ def report(dev: DeviceProperties) -> str:
     """Return a formatted report string from DeviceProperties."""
     lines = []
     if not dev.dll_loaded:
-        lines.append("hip_quantize.dll not loaded — GPU not available")
+        lines.append("hip_quantize shared library not loaded — GPU not available")
         for msg in dev.info:
             lines.append(f"  {msg}")
         return "\n".join(lines)
@@ -247,8 +300,10 @@ def report(dev: DeviceProperties) -> str:
     lines.append(f"  Shared mem/block  : {dev.shared_mem_per_block:,} bytes")
     lines.append(f"  Warp size         : {dev.warp_size}")
     lines.append(f"  Max threads/block : {dev.max_threads_per_block}")
-    lines.append(f"  WMMA support      : {'YES' if dev.has_wmma else 'NO (gfx12 required)'}")
-    lines.append(f"  DLL               : {dev._dll_base}")
+    if dev.hip_runtime_version:
+        lines.append(f"  HIP runtime       : {dev.hip_runtime_version}")
+    lines.append(f"  gfx12 FP8 WMMA    : {'YES' if dev.has_wmma else 'NO (requires gfx12 + ROCm 7.2+)'}")
+    lines.append(f"  Library           : {dev._dll_base}")
     lines.append(f"{'='*56}")
 
     # Feature compatibility
@@ -257,9 +312,9 @@ def report(dev: DeviceProperties) -> str:
     if dev.gcn_arch:
         lines.append(f"    All quantization types     : {'PORTABLE' if dev.gcn_arch else 'N/A'}")
         lines.append(f"    FP8 expand (E4M3/E5M2)     : {'PORTABLE' if dev.gcn_arch else 'N/A'}")
-        lines.append(f"    FP8 GEMM WMMA (gfx12 only) : {'AVAILABLE' if dev.has_wmma else 'NOT AVAILABLE on ' + dev.arch_family}")
+        lines.append(f"    FP8/BF8 WMMA gfx12 path   : {'AVAILABLE' if dev.has_wmma else 'NOT AVAILABLE for this device/runtime'}")
         if dev.is_cdna:
-            lines.append("    CDNA-specific note          : WMMA not supported — use MFMA-based kernels for GEMM")
+            lines.append("    CDNA-specific note          : CDNA can use FP8/BF16 MFMA/rocBLASLt-style paths, not this RDNA4 gfx12 WMMA builtin")
 
     for msg in dev.info:
         lines.append(f"  [{msg}]")

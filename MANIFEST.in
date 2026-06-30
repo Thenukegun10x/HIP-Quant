@@ -1,7 +1,10 @@
 include hip_quantize.dll
+include hip_quantize_rocm721.dll
+include libhip_quantize.so
 include *.h
 include *.cpp
 include build.ps1
+include build.sh
 recursive-include kernels *
 recursive-include torch_ext *
 recursive-include tests *

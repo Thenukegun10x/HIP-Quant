@@ -2,7 +2,7 @@
   <h1>🚀 hip-quant</h1>
   <p><b>Blazing Fast On-Device Tensor Quantization for AMD GPUs</b></p>
   <p>
-    <img alt="ROCm 7.1" src="https://img.shields.io/badge/ROCm-7.1-ED1C24?logo=amd"/>
+    <img alt="ROCm 7.2.1" src="https://img.shields.io/badge/ROCm-7.2.1-ED1C24?logo=amd"/>
     <img alt="RDNA4" src="https://img.shields.io/badge/RDNA4-gfx1200%20%7C%20gfx1201-blue"/>
     <img alt="CDNA" src="https://img.shields.io/badge/CDNA-gfx90a%20%7C%20gfx942-purple"/>
     <img alt="BF16 FP16" src="https://img.shields.io/badge/PyTorch-BF16%20%7C%20FP16-green"/>
@@ -17,22 +17,32 @@ It ships **two independent APIs** that can be used together or separately:
 
 | API | Purpose | Requires |
 |---|---|---|
-| **NumPy / ctypes** (offline) | Offline GGUF-format quantization via `hip_quantize.dll` | ROCm 7.1, numpy |
+| **NumPy / ctypes** (offline) | Offline GGUF-format quantization via packaged DLL | ROCm runtime, numpy |
 | **PyTorch extension** (training) | GPU-resident FP8 training ops with full autograd | PyTorch 2.x + ROCm, built `_C` extension |
 
 ## Hardware Status
 
 Runtime validation is currently on RDNA4. The PyTorch FP8 WMMA kernels target `gfx1200` and `gfx1201`; `gfx1200` is treated as the cut-down `gfx1201` die with the same relevant FP8 WMMA capabilities.
 
-CDNA support is included for the offline NumPy/DLL quantization path and compatibility tooling. `.\build.ps1 -CDNA` cross-compiles the portable quantization kernels for `gfx90a` and `gfx942` on the local ROCm 7.1 Windows toolchain. Device reports still classify `gfx940` and `gfx941` correctly when encountered, but this Windows `hipcc` does not accept them as offload targets. The gfx12 WMMA FP8 GEMM test is intentionally disabled on CDNA; CDNA GEMM needs an MFMA path.
+CDNA support is included for the offline NumPy/DLL quantization path and compatibility tooling. The default DLL build now emits one all-target DLL for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`. The gfx12 WMMA FP8 GEMM test is intentionally disabled on CDNA; CDNA can support FP8/BF16 through MFMA/rocBLASLt-style paths, but not this RDNA4-specific gfx12 WMMA builtin path.
 
-### ⚠️ ROCm 7.1 WMMA Driver Crash (Windows gfx12)
+### ⚠️ gfx12 FP8 WMMA Safety (Windows RDNA4)
 
 The PyTorch FP8 training API (`Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`) uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` for the fused GEMM forward/backward pass. On **ROCm 7.1 with Windows gfx1201**, these WMMA intrinsics can trigger a GPU TDR (driver timeout) that corrupts GPU memory and may restart the PC.
 
 **Root cause:** The ROCm 7.1 HIP runtime has a stability issue with `gfx12` WMMA instructions on RDNA4. The kernel launch succeeds but the GPU can hang asynchronously, causing subsequent `tensor.item()` calls to read back corrupted memory — typically manifesting as a `ZeroDivisionError` at `torch_api.py:495` (`1.0 / weight_inv_scale` with a zeroed GPU value).
 
-**Fix:** Use the PyTorch venv's **ROCm 7.2.1+** runtime, which ships with `torch 2.9.1+rocm7.2.1`. The system-installed ROCm 7.1 (`C:\Program Files\AMD\ROCm\7.1\bin`) is shadowed at runtime by the venv's ROCm 7.2 DLLs, and WMMA is stable on 7.2.
+**Fix:** Wheels now package a ROCm 7.2.1-built DLL named `hip_quantize_rocm721.dll` next to the legacy `hip_quantize.dll`. On Windows, `HipQuant()` prefers `hip_quantize_rocm721.dll` when present and searches the active Python environment's ROCm/PyTorch DLL directories before the system ROCm 7.1 path. The legacy DLL can still be forced with `HIP_QUANT_DLL_VARIANT=legacy`.
+
+**Default safety policy:** gfx12 FP8/BF8 WMMA kernels are disabled by default because bad driver/compiler combinations can hang or reset the GPU. Enable them only for controlled testing:
+```powershell
+$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
+```
+
+Force-disable WMMA regardless of runtime/device:
+```powershell
+$env:HIP_QUANT_DISABLE_WMMA = "1"
+```
 
 Validated local test system:
 - GPU: AMD Radeon RX 9070 XT, `gfx1201`, 16 GB VRAM
@@ -41,9 +51,9 @@ Validated local test system:
 - OS/toolchain: Windows, Visual Studio 2022 Build Tools, ROCm installed at `C:\Program Files\AMD\ROCm\7.1`
 - PyTorch venv: `C:\venvs\medusa_rocm\Scripts\python.exe`
 - PyTorch: `2.9.1+rocm7.2.1`, HIP runtime: `7.2.53211-158bd99533`
-- FP8 training verified stable: 10-step `Fp8ScaledLinear` loop, WMMA stress test (20x 256×256×256), full forward+backward on all module types
+- FP8 WMMA microtest verified with the packaged ROCm 7.2.1 DLL: 50 bounded launches through `fp8_gemm_test_wmma`
 
-> **Note:** The offline NumPy/DLL quantization path (`hip_quantize.dll`) does **not** use WMMA and is unaffected. It works with both ROCm 7.1 and 7.2.
+> **Note:** The offline NumPy/DLL quantization path does **not** use WMMA and is unaffected. It works with both ROCm 7.1 and 7.2 runtimes. The packaged ROCm 7.2.1 DLL is preferred on Windows to avoid ROCm 7.1 gfx12 WMMA hazards when optional FP8 GEMM tests are enabled.
 
 ---
 
@@ -74,16 +84,18 @@ Both use OCP standard semantics with round-to-nearest-even. Math is validated ag
 ## 🛠️ Build
 
 ### Offline DLL (NumPy API)
-Requires `hipcc` at `C:\Program Files\AMD\ROCm\7.1\bin\hipcc.exe`:
+Default build emits one DLL for CDNA, RDNA3, and RDNA4 targets. By default it uses `C:\Program Files\AMD\ROCm\7.1\bin\hipcc.exe`; pass `-RocmBin` to use a ROCm/PyTorch venv toolchain:
 ```powershell
 .\build.ps1
 
-# Include CDNA portable quantization targets as well as RDNA4
-.\build.ps1 -CDNA
+# Build the packaged ROCm 7.2.1 DLL from a PyTorch ROCm venv
+.\build.ps1 -Output hip_quantize_rocm721.dll -RocmBin "C:\venvs\medusa_rocm\Scripts"
 
 # Custom target set
 .\build.ps1 -Arch "gfx942,gfx1200,gfx1201"
 ```
+
+The build script adds `-mno-wavefrontsize64` so gfx12 `w32` WMMA code is compiled as Wave32.
 
 ### PyTorch Extension (`_C`)
 Requires PyTorch with ROCm support (`torch 2.x+rocm`):
@@ -98,22 +110,28 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m build --wheel --no-isolation
 ```
 
-Without `HIP_QUANT_BUILD_TORCH_EXT=1`, `python -m build` intentionally creates a
-source-only `py3-none-any` wheel that still requires the local extension build.
+Without `HIP_QUANT_BUILD_TORCH_EXT=1`, `python -m build` creates a Windows wheel
+that packages the ctypes DLLs but does not include `_C.pyd`. The PyTorch
+extension can still be built locally with `setup_torch.py build_ext --inplace`.
 
 ---
 
 ## 📦 Installation
 
 ```powershell
-# Binary wheel with fused PyTorch kernels
-$env:HIP_QUANT_BUILD_TORCH_EXT = "1"
-& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build --wheel --no-isolation
-pip install dist/hip_quant-0.4.5-cp312-cp312-win_amd64.whl
+# Binary wheel with packaged ROCm 7.2.1 ctypes DLL
+pip install dist/hip_quant-0.4.6-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
 ```
+
+On Windows, DLL resolution order is:
+- `HIP_QUANT_DLL` or `HIP_QUANT_DLL_PATH`, if set
+- `hip_quantize_rocm721.dll`
+- `hip_quantize.dll`
+
+Runtime DLL directories include `HIP_QUANT_ROCM_BIN`, `HIP_QUANT_ROCM_HOME`, `ROCM_HOME`, `ROCM_PATH`, `HIP_PATH`, the active venv's `_rocm_sdk_core\bin`, `torch\lib`, `Scripts`, then the system ROCm 7.1 path.
 
 ---
 
@@ -209,6 +227,12 @@ out = Fp8LinearFunction.apply(input, weight, bias)  # bias optional
 
 #### Fused FP8 Linear (gfx12 WMMA kernels)
 
+These kernels are disabled by default. Enable only after validating your ROCm
+runtime and GPU stability:
+```powershell
+$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
+```
+
 ```python
 from hip_quant import (
     fp8_linear_forward,
@@ -234,6 +258,9 @@ grad_wt_s  = fp8_linear_backward_weight_scaled(grad_output, input, input_scale)
 
 These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
 `Fp8ShadowLinear` after the extension is built.
+
+RDNA3 (`gfx11`) and CDNA devices are rejected for this specific builtin path.
+CDNA FP8/BF16 GEMM should use an MFMA/rocBLASLt implementation instead.
 
 #### Scale / amax tracking (Phase 4 scaffold)
 
@@ -295,6 +322,51 @@ python tests/test_pipeline.py -v
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m hip_quant --compat
 ```
 
+#### Optional gfx12 FP8 WMMA Stress Test
+
+Only run this on a stable ROCm 7.2+ gfx12 system. It can still reset the GPU on
+bad driver/runtime combinations.
+```powershell
+$env:PYTHONPATH = "C:\path\to\src"
+$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" test_fp8_gemm.py
+```
+
+The release DLL was locally checked with 50 bounded `fp8_gemm_test_wmma`
+launches on `gfx1201` and HIP runtime `70253211`.
+
+---
+
+## 📤 Release / PyPI Upload
+
+Build the distributables:
+```powershell
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build
+```
+
+Check the artifacts:
+```powershell
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
+  "dist\hip_quant-0.4.6-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.4.6.tar.gz"
+```
+
+Upload to PyPI:
+```powershell
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
+  "dist\hip_quant-0.4.6-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.4.6.tar.gz"
+```
+
+Do not upload stale universal wheels such as `hip_quant-0.4.6-py3-none-any.whl`.
+The Windows wheel is intentionally platform-tagged because it contains DLLs.
+
+Suggested release order:
+- Build and run `twine check`
+- Upload to TestPyPI or PyPI
+- Install the uploaded package in a clean venv and verify `HipQuant().dll_path` resolves to `hip_quantize_rocm721.dll`
+- Commit/tag the exact source and DLL used for the PyPI upload
+
 ---
 
 ## 🗂️ Project Structure
@@ -324,7 +396,7 @@ hip_quant/
 ## 📋 Architecture Notes
 
 - **RDNA4 PyTorch target** — FP8 WMMA extension kernels are compiled with `--offload-arch=gfx1200` and `--offload-arch=gfx1201`
-- **CDNA offline target** — `build.ps1 -CDNA` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, `gfx1200`, and `gfx1201`
+- **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
 - **No CPU transfers** — the PyTorch extension operates exclusively on device pointers obtained from `tensor.data_ptr()` and uses `at::cuda::getCurrentCUDAStream()`
