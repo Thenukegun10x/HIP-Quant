@@ -75,9 +75,8 @@ __device__ inline float bf16_to_fp32(uint16_t h) {
 // Bias: 7, max finite: ±448, no infinities
 // NaN: only S.1111.111 (0x7F / 0xFF)
 
-// float32 → FP8 E4M3 (round-to-nearest-even, saturate to max finite)
-__device__ inline uint8_t fp32_to_fp8_e4m3(float f) {
-    uint32_t u = __float_as_int(f);
+// float32 bits → FP8 E4M3 (round-to-nearest-even, saturate to max finite)
+__device__ inline uint8_t fp32_bits_to_fp8_e4m3(uint32_t u) {
     uint32_t sign = u >> 31;
     uint32_t abs_u = u & 0x7FFFFFFF;
 
@@ -136,6 +135,16 @@ __device__ inline uint8_t fp32_to_fp8_e4m3(float f) {
     return (uint8_t)((sign << 7) | (exp << 3) | fp8_mant);
 }
 
+// float32 → FP8 E4M3 (round-to-nearest-even, saturate to max finite)
+__device__ inline uint8_t fp32_to_fp8_e4m3(float f) {
+    return fp32_bits_to_fp8_e4m3(__float_as_int(f));
+}
+
+// bfloat16 → FP8 E4M3 without first materializing a float value.
+__device__ inline uint8_t bf16_to_fp8_e4m3(uint16_t h) {
+    return fp32_bits_to_fp8_e4m3((uint32_t)h << 16);
+}
+
 // FP8 E4M3 → float32
 __device__ inline float fp8_e4m3_to_fp32(uint8_t h) {
     uint32_t sign = (h >> 7) & 1;
@@ -169,9 +178,8 @@ __device__ inline float fp8_e4m3_to_fp32(uint8_t h) {
 // Bias: 15, max finite: +/-57344, infinities supported
 // Inf: S.11111.00, NaN: S.11111.xx where xx != 00
 
-// float32 -> FP8 E5M2 (round-to-nearest-even, overflow to infinity)
-__device__ inline uint8_t fp32_to_fp8_e5m2(float f) {
-    uint32_t u = __float_as_int(f);
+// float32 bits -> FP8 E5M2 (round-to-nearest-even, overflow to infinity)
+__device__ inline uint8_t fp32_bits_to_fp8_e5m2(uint32_t u) {
     uint32_t sign = u >> 31;
     uint32_t abs_u = u & 0x7FFFFFFF;
 
@@ -228,6 +236,16 @@ __device__ inline uint8_t fp32_to_fp8_e5m2(float f) {
     }
 
     return (uint8_t)((sign << 7) | (exp << 2) | fp8_mant);
+}
+
+// float32 -> FP8 E5M2 (round-to-nearest-even, overflow to infinity)
+__device__ inline uint8_t fp32_to_fp8_e5m2(float f) {
+    return fp32_bits_to_fp8_e5m2(__float_as_int(f));
+}
+
+// bfloat16 -> FP8 E5M2 without first materializing a float value.
+__device__ inline uint8_t bf16_to_fp8_e5m2(uint16_t h) {
+    return fp32_bits_to_fp8_e5m2((uint32_t)h << 16);
 }
 
 // FP8 E5M2 -> float32

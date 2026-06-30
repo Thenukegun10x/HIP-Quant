@@ -120,7 +120,7 @@ extension can still be built locally with `setup_torch.py build_ext --inplace`.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL
-pip install dist/hip_quant-0.4.6-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-0.4.8-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -259,6 +259,39 @@ grad_wt_s  = fp8_linear_backward_weight_scaled(grad_output, input, input_scale)
 These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
 `Fp8ShadowLinear` after the extension is built.
 
+#### gfx1201 FP8/BF16 Microbenchmark
+
+Measured on the validated local RX 9070 XT `gfx1201` system with PyTorch
+`2.9.1+rocm7.2.1` and `HIP_QUANT_ENABLE_GFX12_WMMA=1`:
+
+```powershell
+$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" tests\torch\bench_fp8.py
+```
+
+```text
+Elementwise FP8 ops, shape=(4096, 4096), dtype=bf16
+quantize_e4m3:   0.243 ms
+quantize_e5m2:   0.205 ms
+dequantize_e4m3: 0.218 ms
+dequantize_e5m2: 0.206 ms
+Fp8ShadowLinear, batch=32, in=4096, out=4096, dtype=bf16
+forward:          2.553 ms
+forward+backward: 5.622 ms
+total wall time: 0.86 s
+```
+
+The benchmark is available at `tests/torch/bench_fp8.py`. Without
+`HIP_QUANT_ENABLE_GFX12_WMMA=1`, it reports only the elementwise FP8 timings and
+skips WMMA linear kernels.
+
+The 0.4.8 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
+improvement: it reuses pre-quantized FP8 activations/gradients, skips redundant
+output zeroing, fuses bias stores, vectorizes elementwise FP8 kernels, and caches
+offline FP8 temporary buffers. Persistent VRAM savings are still mainly provided
+by `Fp8ShadowLinear` FP8 weight shadows and activation compression; this release
+reduces transient allocations and extra memory passes around those features.
+
 RDNA3 (`gfx11`) and CDNA devices are rejected for this specific builtin path.
 CDNA FP8/BF16 GEMM should use an MFMA/rocBLASLt implementation instead.
 
@@ -341,24 +374,25 @@ launches on `gfx1201` and HIP runtime `70253211`.
 
 Build the distributables:
 ```powershell
-& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build
+$env:HIP_QUANT_BUILD_TORCH_EXT = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build --no-isolation
 ```
 
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-0.4.6-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.4.6.tar.gz"
+  "dist\hip_quant-0.4.8-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.4.8.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-0.4.6-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.4.6.tar.gz"
+  "dist\hip_quant-0.4.8-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.4.8.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-0.4.6-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-0.4.8-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:
@@ -399,6 +433,6 @@ hip_quant/
 - **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
-- **No CPU transfers** — the PyTorch extension operates exclusively on device pointers obtained from `tensor.data_ptr()` and uses `at::cuda::getCurrentCUDAStream()`
+- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`; scalar scale metadata is passed through legacy float launcher arguments. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
 - **Phase 4 GEMM** is a correctness-first tiled stub. Replace the inner loop with a `rocBLASLt` FP8 GEMM path for production throughput once validated on your ROCm stack
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly

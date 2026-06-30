@@ -73,9 +73,11 @@ static uint16_t *d_iq3s_neighbours_data = NULL;
 // Per-thread cached GPU buffers for quantize_tensor.
 // File-scope so quantize_reset() can free them from any thread.
 static thread_local float   *g_d_src       = NULL;
+static thread_local uint8_t *g_d_src_fp8   = NULL;
 static thread_local uint8_t *g_d_dst       = NULL;
 static thread_local float   *g_d_imatrix   = NULL;
 static thread_local size_t   g_d_src_cap   = 0;
+static thread_local size_t   g_d_src_fp8_cap = 0;
 static thread_local size_t   g_d_dst_cap   = 0;
 static thread_local size_t   g_d_imatrix_cap = 0;
 
@@ -357,12 +359,16 @@ static int dispatch_quantize_kernel(
             break;
         }
         case 36: {
-            hipLaunchKernelGGL(quantize_f8_e4m3_kernel, gridDim, 32, 0, 0,
+            int64_t total = (int64_t)nrows * n_per_row;
+            dim3 flatGrid((unsigned int)((total + 255) / 256));
+            hipLaunchKernelGGL(quantize_f8_e4m3_kernel, flatGrid, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
             break;
         }
         case 37: {
-            hipLaunchKernelGGL(quantize_f8_e5m2_kernel, gridDim, 32, 0, 0,
+            int64_t total = (int64_t)nrows * n_per_row;
+            dim3 flatGrid((unsigned int)((total + 255) / 256));
+            hipLaunchKernelGGL(quantize_f8_e5m2_kernel, flatGrid, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
             break;
         }
@@ -459,8 +465,8 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
 // quantize_tensor_fp8_input_impl — FP8 input path
 //
 // Accepts FP8 source data (1 byte per element) instead of float32
-// (4 bytes). The data is uploaded to the GPU and expanded to float32
-// on-device before quantizing to the target type.
+// (4 bytes). Matching FP8 output types are copied directly; other targets
+// upload to GPU and expand to float32 on-device before quantizing.
 //
 // Benefits:
 //   - Host memory: 4x less than F32, 2x less than BF16
@@ -494,96 +500,93 @@ static size_t quantize_tensor_fp8_input_impl(
     int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
     int64_t total_elements = nrows * n_per_row;
 
+    if (type == src_fp8_type && (type == 36 || type == 37)) {
+        memcpy(dst, src_fp8, (size_t)total_elements);
+        return total_size;
+    }
+
     // === Phase 1: Upload FP8 source (1 byte per element) ===
-    uint8_t *d_src_fp8 = NULL;
-    {
-        hipError_t e = hipMalloc(&d_src_fp8, (size_t)total_elements);
+    size_t src_fp8_bytes = (size_t)total_elements;
+    if (src_fp8_bytes > g_d_src_fp8_cap) {
+        if (g_d_src_fp8) hipFree(g_d_src_fp8);
+        hipError_t e = hipMalloc(&g_d_src_fp8, src_fp8_bytes);
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_src_fp8) failed: %s\n", hipGetErrorString(e)); return 0; }
+        g_d_src_fp8_cap = src_fp8_bytes;
     }
     {
-        hipError_t e = hipMemcpy(d_src_fp8, src_fp8, (size_t)total_elements, hipMemcpyHostToDevice);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_src_fp8) failed: %s\n", hipGetErrorString(e)); hipFree(d_src_fp8); return 0; }
+        hipError_t e = hipMemcpy(g_d_src_fp8, src_fp8, src_fp8_bytes, hipMemcpyHostToDevice);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_src_fp8) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
     // === Phase 2: Expand FP8 -> F32 on device ===
-    float *d_src = NULL;
     size_t src_f32_bytes = (size_t)total_elements * sizeof(float);
-    {
-        hipError_t e = hipMalloc(&d_src, src_f32_bytes);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_src f32) failed: %s\n", hipGetErrorString(e)); hipFree(d_src_fp8); return 0; }
+    if (src_f32_bytes > g_d_src_cap) {
+        if (g_d_src) hipFree(g_d_src);
+        hipError_t e = hipMalloc(&g_d_src, src_f32_bytes);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_src f32) failed: %s\n", hipGetErrorString(e)); return 0; }
+        g_d_src_cap = src_f32_bytes;
     }
     {
         int threads = 256;
         int blocks = (int)((total_elements + threads - 1) / threads);
         if (src_fp8_type == 37) {
             hipLaunchKernelGGL(fp8_e5m2_to_f32_expand_kernel, dim3(blocks), dim3(threads), 0, 0,
-                d_src_fp8, d_src, total_elements);
+                g_d_src_fp8, g_d_src, total_elements);
         } else {
             hipLaunchKernelGGL(fp8_to_f32_expand_kernel, dim3(blocks), dim3(threads), 0, 0,
-                d_src_fp8, d_src, total_elements);
+                g_d_src_fp8, g_d_src, total_elements);
         }
         hipError_t e = hipGetLastError();
         if (e != hipSuccess) {
             fprintf(stderr, "hip_quantize: fp8_expand kernel error: %s\n", hipGetErrorString(e));
-            hipFree(d_src_fp8); hipFree(d_src);
             return 0;
         }
     }
 
-    // Free FP8 buffer immediately to reduce peak VRAM
-    hipFree(d_src_fp8);
-    d_src_fp8 = NULL;
-
     // === Phase 3: Allocate output + imatrix, dispatch quantize kernel ===
-    uint8_t *d_dst = NULL;
-    float *d_imatrix = NULL;
     size_t dst_bytes = total_size;
 
-    {
-        hipError_t e = hipMalloc(&d_dst, dst_bytes);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_dst) failed: %s\n", hipGetErrorString(e)); hipFree(d_src); return 0; }
+    if (dst_bytes > g_d_dst_cap) {
+        if (g_d_dst) hipFree(g_d_dst);
+        hipError_t e = hipMalloc(&g_d_dst, dst_bytes);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_dst) failed: %s\n", hipGetErrorString(e)); return 0; }
+        g_d_dst_cap = dst_bytes;
     }
     if (imatrix) {
         size_t imatrix_bytes = (size_t)total_elements * sizeof(float);
-        hipError_t e = hipMalloc(&d_imatrix, imatrix_bytes);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_imatrix) failed: %s\n", hipGetErrorString(e)); hipFree(d_src); hipFree(d_dst); return 0; }
-        e = hipMemcpy(d_imatrix, imatrix, imatrix_bytes, hipMemcpyHostToDevice);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_imatrix) failed: %s\n", hipGetErrorString(e)); hipFree(d_src); hipFree(d_dst); hipFree(d_imatrix); return 0; }
+        if (imatrix_bytes > g_d_imatrix_cap) {
+            if (g_d_imatrix) hipFree(g_d_imatrix);
+            hipError_t e = hipMalloc(&g_d_imatrix, imatrix_bytes);
+            if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(d_imatrix) failed: %s\n", hipGetErrorString(e)); return 0; }
+            g_d_imatrix_cap = imatrix_bytes;
+        }
+        hipError_t e = hipMemcpy(g_d_imatrix, imatrix, imatrix_bytes, hipMemcpyHostToDevice);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(d_imatrix) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
     {
-        hipError_t e = hipMemset(d_dst, 0, dst_bytes);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); hipFree(d_src); hipFree(d_dst); if (d_imatrix) hipFree(d_imatrix); return 0; }
+        hipError_t e = hipMemset(g_d_dst, 0, dst_bytes);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
-    if (!dispatch_quantize_kernel(type, d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
-        hipFree(d_src);
-        hipFree(d_dst);
-        if (d_imatrix) hipFree(d_imatrix);
+    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
         return 0;
     }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "hip_quantize: kernel launch error: %s (code %d)\n", hipGetErrorString(err), (int)err);
-        hipFree(d_src);
-        hipFree(d_dst);
-        if (d_imatrix) hipFree(d_imatrix);
         return 0;
     }
 
     {
         hipError_t e = hipDeviceSynchronize();
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipDeviceSynchronize failed: %s\n", hipGetErrorString(e)); hipFree(d_src); hipFree(d_dst); if (d_imatrix) hipFree(d_imatrix); return 0; }
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipDeviceSynchronize failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
     {
-        hipError_t e = hipMemcpy(dst, d_dst, dst_bytes, hipMemcpyDeviceToHost);
-        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(dst) failed: %s\n", hipGetErrorString(e)); hipFree(d_src); hipFree(d_dst); if (d_imatrix) hipFree(d_imatrix); return 0; }
+        hipError_t e = hipMemcpy(dst, g_d_dst, dst_bytes, hipMemcpyDeviceToHost);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(dst) failed: %s\n", hipGetErrorString(e)); return 0; }
     }
-
-    hipFree(d_src);
-    hipFree(d_dst);
-    if (d_imatrix) hipFree(d_imatrix);
 
     return total_size;
 }
@@ -704,9 +707,11 @@ HIP_QUANT_EXPORT int fp8_gemm_test_wmma(
 
 HIP_QUANT_EXPORT void quantize_reset() {
     if (g_d_src)       { hipFree(g_d_src);       g_d_src = NULL; }
+    if (g_d_src_fp8)   { hipFree(g_d_src_fp8);   g_d_src_fp8 = NULL; }
     if (g_d_dst)       { hipFree(g_d_dst);       g_d_dst = NULL; }
     if (g_d_imatrix)   { hipFree(g_d_imatrix);   g_d_imatrix = NULL; }
     g_d_src_cap = 0;
+    g_d_src_fp8_cap = 0;
     g_d_dst_cap = 0;
     g_d_imatrix_cap = 0;
 }

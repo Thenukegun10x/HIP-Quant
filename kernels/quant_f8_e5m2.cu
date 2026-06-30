@@ -7,7 +7,7 @@
 // than mantissa precision.
 
 extern "C" __global__
-__launch_bounds__(32, 8)
+__launch_bounds__(256, 4)
 void quantize_f8_e5m2_kernel(
     const float * __restrict__ src,
     uint8_t * __restrict__ dst,
@@ -15,15 +15,9 @@ void quantize_f8_e5m2_kernel(
     int nrows,
     int n_per_row
 ) {
-    int row = blockIdx.x;
-    int blk = blockIdx.y;
-    int tid = threadIdx.x;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)nrows * n_per_row;
+    if (idx >= total) return;
 
-    int base = row * n_per_row + blk * 32 + tid;
-    if (base >= (row + 1) * n_per_row) return;
-
-    float val = src[base];
-
-    block_f8_e5m2 *blk_out = (block_f8_e5m2*)(dst + (row * (n_per_row / 32) + blk) * sizeof(block_f8_e5m2));
-    blk_out->qs[tid] = fp32_to_fp8_e5m2(val);
+    dst[idx] = fp32_to_fp8_e5m2(src[idx]);
 }

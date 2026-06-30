@@ -37,6 +37,11 @@ _C = None
 _WMMA_GUARD_CACHE: Dict[int, Tuple[str, str]] = {}
 
 
+def _scale_to_float(scale: "torch.Tensor") -> float:
+    """Single sync point for legacy scalar-scale FP8 GEMM launchers."""
+    return float(scale.item())
+
+
 def _parse_rocm_version(value: Optional[str]) -> Tuple[int, int]:
     if not value:
         return (0, 0)
@@ -193,7 +198,7 @@ class Fp8LinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
-        return fp8_linear_forward(input_c, weight_c, bias)
+        return fp8_linear_forward_fp8_input(input_fp8, weight_c, input_c, 1.0, 1.0, bias)
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
@@ -207,8 +212,13 @@ class Fp8LinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8)
 
         grad_output_c = grad_output.contiguous()
-        grad_input = fp8_linear_backward_input(grad_output_c, weight)
-        grad_weight = fp8_linear_backward_weight(grad_output_c, input_f32)
+        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        grad_input = fp8_linear_backward_input_fp8_grad(
+            grad_output_fp8, grad_output_c, weight, 1.0
+        )
+        grad_weight = fp8_linear_backward_weight_fp8_grad(
+            grad_output_fp8, grad_output_c, input_f32, 1.0
+        )
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias
@@ -256,7 +266,9 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
-        return fp8_linear_forward_scaled(input_c, weight_c, bias, input_scale, weight_scale)
+        return fp8_linear_forward_fp8_input(
+            input_fp8, weight_c, input_c, input_scale, weight_scale, bias
+        )
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):
@@ -270,10 +282,13 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
-        grad_input = fp8_linear_backward_input_scaled(
-            grad_output_c, weight, ctx.weight_scale
+        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        grad_input = fp8_linear_backward_input_fp8_grad(
+            grad_output_fp8, grad_output_c, weight, ctx.weight_scale
         )
-        grad_weight = fp8_linear_backward_weight(grad_output_c, input_f32)
+        grad_weight = fp8_linear_backward_weight_fp8_grad(
+            grad_output_fp8, grad_output_c, input_f32, 1.0
+        )
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias, None, None
@@ -451,8 +466,8 @@ class Fp8ScaledLinear(nn.Module):
 
         out = Fp8ScaledLinearFunction.apply(
             x_2d, self.weight, self.bias,
-            float(self.input_meta.scale.item()),
-            float(self.weight_meta.scale.item()),
+            _scale_to_float(self.input_meta.scale),
+            _scale_to_float(self.weight_meta.scale),
         )
         return out.reshape(*orig_shape[:-1], self.out_features)
 
@@ -550,8 +565,8 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight_master)
 
-        return fp8_linear_forward_fp8_weight(
-            input_c, weight_fp8, weight_inv_scale, input_scale, bias
+        return fp8_linear_forward_fp8_input_weight(
+            input_fp8, weight_fp8, input_c, weight_inv_scale, input_scale, bias
         )
 
     @staticmethod
@@ -566,11 +581,12 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
-        grad_input = fp8_linear_backward_input_scaled(
-            grad_output_c, weight_master, ctx.weight_scale
+        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        grad_input = fp8_linear_backward_input_fp8_grad(
+            grad_output_fp8, grad_output_c, weight_master, ctx.weight_scale
         )
-        grad_weight_master = fp8_linear_backward_weight(
-            grad_output_c, input_f32
+        grad_weight_master = fp8_linear_backward_weight_fp8_grad(
+            grad_output_fp8, grad_output_c, input_f32, 1.0
         )
         grad_bias          = grad_output.sum(0) if bias is not None else None
 
@@ -662,9 +678,8 @@ class Fp8ShadowLinear(nn.Module):
     def _sync_shadow(self) -> None:
         """Re-quantise weight_master → weight_fp8.  Always inside no_grad."""
         self.weight_meta.update(self.weight_master)
-        ws = float(self.weight_meta.scale.item())
         self.weight_fp8.copy_(
-            quantize_e4m3((self.weight_master * ws).contiguous())
+            quantize_e4m3((self.weight_master * self.weight_meta.scale).contiguous())
         )
 
     # ------------------------------------------------------------------
@@ -680,8 +695,8 @@ class Fp8ShadowLinear(nn.Module):
             x_2d,
             self.weight_master,
             self.weight_fp8,
-            float(self.weight_meta.inv_scale.item()),
-            float(self.input_meta.scale.item()),
+            _scale_to_float(self.weight_meta.inv_scale),
+            _scale_to_float(self.input_meta.scale),
             self.bias,
         )
         return out.reshape(*orig_shape[:-1], self.out_features)
@@ -858,6 +873,38 @@ def fp8_linear_forward_fp8_weight(
     )
 
 
+def fp8_linear_forward_fp8_input(
+    input_fp8:           "torch.Tensor",
+    weight:              "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    input_scale:         float,
+    weight_scale:        float,
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Scaled FP8 linear forward using pre-quantized E4M3 input."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_forward_fp8_input(
+        input_fp8.contiguous(), weight.contiguous(), output_dtype_source,
+        float(input_scale), float(weight_scale), bias
+    )
+
+
+def fp8_linear_forward_fp8_input_weight(
+    input_fp8:           "torch.Tensor",
+    weight_fp8:          "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    weight_inv_scale:    float,
+    input_scale:         float,
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Scaled FP8 linear forward using pre-quantized E4M3 input and weight."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_forward_fp8_input_weight(
+        input_fp8.contiguous(), weight_fp8.contiguous(), output_dtype_source,
+        float(weight_inv_scale), float(input_scale), bias
+    )
+
+
 def fp8_linear_backward_input(
     grad_output: "torch.Tensor",
     weight:      "torch.Tensor",
@@ -901,6 +948,34 @@ def fp8_linear_backward_weight_scaled(
     _require_gfx12_fp8_wmma(grad_output)
     return _load_extension().fp8_linear_backward_weight_scaled(
         grad_output.contiguous(), input.contiguous(), float(input_scale)
+    )
+
+
+def fp8_linear_backward_input_fp8_grad(
+    grad_output_fp8:          "torch.Tensor",
+    grad_output_dtype_source: "torch.Tensor",
+    weight:                   "torch.Tensor",
+    weight_scale:             float = 1.0,
+) -> "torch.Tensor":
+    """grad_input using pre-quantized E5M2 grad_output."""
+    _require_gfx12_fp8_wmma(grad_output_dtype_source)
+    return _load_extension().fp8_linear_backward_input_fp8_grad(
+        grad_output_fp8.contiguous(), grad_output_dtype_source,
+        weight.contiguous(), float(weight_scale)
+    )
+
+
+def fp8_linear_backward_weight_fp8_grad(
+    grad_output_fp8:          "torch.Tensor",
+    grad_output_dtype_source: "torch.Tensor",
+    input:                    "torch.Tensor",
+    input_scale:              float = 1.0,
+) -> "torch.Tensor":
+    """grad_weight using pre-quantized E5M2 grad_output."""
+    _require_gfx12_fp8_wmma(grad_output_dtype_source)
+    return _load_extension().fp8_linear_backward_weight_fp8_grad(
+        grad_output_fp8.contiguous(), grad_output_dtype_source,
+        input.contiguous(), float(input_scale)
     )
 
 

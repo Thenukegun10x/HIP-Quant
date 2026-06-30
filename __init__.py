@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -13,10 +13,14 @@ _TORCH_EXPORTS = {
     "fp8_linear_forward",
     "fp8_linear_forward_scaled",
     "fp8_linear_forward_fp8_weight",
+    "fp8_linear_forward_fp8_input",
+    "fp8_linear_forward_fp8_input_weight",
     "fp8_linear_backward_input",
     "fp8_linear_backward_input_scaled",
     "fp8_linear_backward_weight",
     "fp8_linear_backward_weight_scaled",
+    "fp8_linear_backward_input_fp8_grad",
+    "fp8_linear_backward_weight_fp8_grad",
     "Fp8LinearFunction",
     "Fp8Linear",
     "Fp8ScaledLinearFunction",
