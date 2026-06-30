@@ -26,13 +26,24 @@ Runtime validation is currently on RDNA4. The PyTorch FP8 WMMA kernels target `g
 
 CDNA support is included for the offline NumPy/DLL quantization path and compatibility tooling. `.\build.ps1 -CDNA` cross-compiles the portable quantization kernels for `gfx90a` and `gfx942` on the local ROCm 7.1 Windows toolchain. Device reports still classify `gfx940` and `gfx941` correctly when encountered, but this Windows `hipcc` does not accept them as offload targets. The gfx12 WMMA FP8 GEMM test is intentionally disabled on CDNA; CDNA GEMM needs an MFMA path.
 
+### ⚠️ ROCm 7.1 WMMA Driver Crash (Windows gfx12)
+
+The PyTorch FP8 training API (`Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`) uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` for the fused GEMM forward/backward pass. On **ROCm 7.1 with Windows gfx1201**, these WMMA intrinsics can trigger a GPU TDR (driver timeout) that corrupts GPU memory and may restart the PC.
+
+**Root cause:** The ROCm 7.1 HIP runtime has a stability issue with `gfx12` WMMA instructions on RDNA4. The kernel launch succeeds but the GPU can hang asynchronously, causing subsequent `tensor.item()` calls to read back corrupted memory — typically manifesting as a `ZeroDivisionError` at `torch_api.py:495` (`1.0 / weight_inv_scale` with a zeroed GPU value).
+
+**Fix:** Use the PyTorch venv's **ROCm 7.2.1+** runtime, which ships with `torch 2.9.1+rocm7.2.1`. The system-installed ROCm 7.1 (`C:\Program Files\AMD\ROCm\7.1\bin`) is shadowed at runtime by the venv's ROCm 7.2 DLLs, and WMMA is stable on 7.2.
+
 Validated local test system:
 - GPU: AMD Radeon RX 9070 XT, `gfx1201`, 16 GB VRAM
 - CPU: AMD Ryzen 7 7800X3D, 8 cores / 16 threads
 - RAM: 32 GB system memory
 - OS/toolchain: Windows, Visual Studio 2022 Build Tools, ROCm installed at `C:\Program Files\AMD\ROCm\7.1`
 - PyTorch venv: `C:\venvs\medusa_rocm\Scripts\python.exe`
-- PyTorch: `2.9.1+rocm7.2.1`, HIP runtime reported by PyTorch: `7.2.53211-158bd99533`
+- PyTorch: `2.9.1+rocm7.2.1`, HIP runtime: `7.2.53211-158bd99533`
+- FP8 training verified stable: 10-step `Fp8ScaledLinear` loop, WMMA stress test (20x 256×256×256), full forward+backward on all module types
+
+> **Note:** The offline NumPy/DLL quantization path (`hip_quantize.dll`) does **not** use WMMA and is unaffected. It works with both ROCm 7.1 and 7.2.
 
 ---
 
