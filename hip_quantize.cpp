@@ -628,6 +628,11 @@ __declspec(dllexport) int fp8_gemm_test_wmma(
 ) {
     ensure_initialized();
 
+    if (strstr(props.gcnArchName, "gfx12") == NULL) {
+        fprintf(stderr, "fp8_gemm: WMMA test kernel requires gfx12/RDNA4; current arch is %s\n", props.gcnArchName);
+        return 2;
+    }
+
     size_t bytes_A = (size_t)M * lda;
     size_t bytes_B = (size_t)K * ldb;
     size_t bytes_C = (size_t)M * ldc * sizeof(float);
@@ -679,6 +684,60 @@ __declspec(dllexport) int get_device_count() {
     int count = 0;
     hipGetDeviceCount(&count);
     return count;
+}
+
+// ============================================================
+// Device property queries for compatibility checker
+// ============================================================
+
+__declspec(dllexport) int get_device_prop(
+    char *name_buf, int name_buf_size,
+    int *major, int *minor,
+    int *cu_count,
+    size_t *total_mem,
+    size_t *shared_mem_per_block,
+    int *warp_size,
+    int *max_threads_per_block
+) {
+    ensure_initialized();
+    strncpy(name_buf, props.name, (size_t)(name_buf_size - 1));
+    name_buf[name_buf_size - 1] = '\0';
+    *major = props.major;
+    *minor = props.minor;
+    *cu_count = props.multiProcessorCount;
+    *total_mem = props.totalGlobalMem;
+    *shared_mem_per_block = props.sharedMemPerBlock;
+    *warp_size = props.warpSize;
+    *max_threads_per_block = props.maxThreadsPerBlock;
+    return 0;
+}
+
+__declspec(dllexport) int get_arch_name(char *buf, int buf_size) {
+    ensure_initialized();
+    strncpy(buf, props.gcnArchName, (size_t)(buf_size - 1));
+    buf[buf_size - 1] = '\0';
+    return 0;
+}
+
+__declspec(dllexport) int get_device_memory(size_t *free_bytes, size_t *total_bytes) {
+    ensure_initialized();
+    hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
+    if (e != hipSuccess) {
+        *free_bytes = 0;
+        *total_bytes = 0;
+        return 1;
+    }
+    return 0;
+}
+
+__declspec(dllexport) int device_has_wmma() {
+    ensure_initialized();
+    const char *arch = props.gcnArchName;
+    // gfx12xx (RDNA4) has WMMA via __builtin_amdgcn_wmma
+    // CDNA3 (gfx942) has MFMA, not the same WMMA intrinsic
+    // gfx11xx (RDNA3) does not have WMMA
+    // gfx103x (RDNA2) does not have WMMA
+    return (strstr(arch, "gfx12") != NULL) ? 1 : 0;
 }
 
 #ifdef __cplusplus

@@ -1,19 +1,8 @@
-# setup_torch.py
-#
-# Build script for the hip_quant PyTorch C++ extension.
-#
-# Usage:
-#   python setup_torch.py build_ext --inplace
-#
-# On ROCm PyTorch, CUDAExtension is the correct class to use even though
-# HIP/ROCm is the actual backend.  PyTorch's build system maps it to hipcc
-# automatically when a ROCm-enabled PyTorch is detected.
-#
-# The --offload-arch flags target RDNA4 gfx1200/gfx1201 ASICs.
-
 import glob
 import os
 from pathlib import Path
+
+from setuptools import setup
 
 
 def _short_path(path):
@@ -70,39 +59,34 @@ def _configure_windows_toolchain():
     os.environ.setdefault("MAX_JOBS", "1")
 
 
-_configure_windows_toolchain()
+def _torch_extension_config():
+    if os.environ.get("HIP_QUANT_BUILD_TORCH_EXT") != "1":
+        return {}, {}
 
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+    _configure_windows_toolchain()
 
-ext = CUDAExtension(
-    # The extension will be importable as  hip_quant._C
-    name="hip_quant._C",
-    sources=[
-        "torch_ext/pytorch_bindings.cpp",
-        "torch_ext/fp8_quant_kernels.hip",
-        "torch_ext/fp8_linear_kernels.hip",
-    ],
-    extra_compile_args={
-        # Host (clang++ / g++) flags
-        "cxx": ["-O3"],
-        # Device (hipcc) flags; nvcc key is used by PyTorch even on ROCm
-        "nvcc": [
-            "-O3",
-            "--offload-arch=gfx1200",
-            "--offload-arch=gfx1201",
-            # Allow device code to include project headers via relative paths
-            "-I.",
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    ext = CUDAExtension(
+        name="hip_quant._C",
+        sources=[
+            "torch_ext/pytorch_bindings.cpp",
+            "torch_ext/fp8_quant_kernels.hip",
+            "torch_ext/fp8_linear_kernels.hip",
         ],
-    },
-    # Ensure headers shipped with the package are visible to hipcc
-    include_dirs=["."],
-)
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--offload-arch=gfx1200", "--offload-arch=gfx1201", "-I."],
+        },
+        include_dirs=["."],
+    )
+    return [ext], {"build_ext": BuildExtension}
+
+
+ext_modules, cmdclass = _torch_extension_config()
 
 setup(
-    name="hip_quant_torch",
-    version="0.4.5",
-    description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
-    ext_modules=[ext],
-    cmdclass={"build_ext": BuildExtension},
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
+    zip_safe=False,
 )

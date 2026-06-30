@@ -61,12 +61,12 @@ def _load_extension() -> object:
 # ===========================================================================
 
 def quantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
-    """Quantize a float32 GPU tensor to FP8 E4M3 (returned as uint8)."""
+    """Quantize a float32/float16/bfloat16 GPU tensor to FP8 E4M3 uint8."""
     return _load_extension().quantize_e4m3(x.contiguous())
 
 
 def quantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
-    """Quantize a float32 GPU tensor to FP8 E5M2 (returned as uint8)."""
+    """Quantize a float32/float16/bfloat16 GPU tensor to FP8 E5M2 uint8."""
     return _load_extension().quantize_e5m2(x.contiguous())
 
 
@@ -453,21 +453,21 @@ class Fp8ScaledLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Fp8ShadowLinear — FP8 weight storage + float32 master (Feature 2)
+# Fp8ShadowLinear — FP8 weight storage + floating-point master (Feature 2)
 # ---------------------------------------------------------------------------
 
 class Fp8ShadowLinearFunction(torch.autograd.Function):
-    """FP8 linear where the weight lives as uint8 but gradients flow to float32.
+    """FP8 linear where the weight lives as uint8 but gradients flow to the master dtype.
 
     Forward:
       - Input:  apply E4M3 noise (scaled), save as uint8 (activation compression)
       - Weight: dequantise from the uint8 shadow buffer
     Backward:
-      - grad_input  : uses float32 master weight (accurate direction signal)
+      - grad_input  : uses the master weight (accurate direction signal)
       - grad_weight : straight-through to master weight using compressed activation
       - input_scale, weight_inv_scale, bias: not differentiable → None gradient
 
-    The trick: we accept both ``weight_master`` (float32 Parameter, tracked by
+    The trick: we accept both ``weight_master`` (Parameter, tracked by
     autograd) AND ``weight_fp8`` (uint8 buffer, not tracked).  The forward
     uses weight_fp8 for cheap dequant; the backward sends gradient to
     weight_master via the straight-through estimator.
@@ -476,12 +476,12 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        input:           "torch.Tensor",           # [M, K] float32
-        weight_master:   "torch.Tensor",           # [N, K] float32, Parameter
+        input:           "torch.Tensor",           # [M, K] float32/float16/bfloat16
+        weight_master:   "torch.Tensor",           # [N, K] master Parameter
         weight_fp8:      "torch.Tensor",           # [N, K] uint8,   Buffer
         weight_inv_scale: float,                   # 1 / weight_scale
         input_scale:     float,                    # 448 / amax(input)
-        bias:            Optional["torch.Tensor"], # [N] float32 or None
+        bias:            Optional["torch.Tensor"], # [N] or None
     ) -> "torch.Tensor":
 
         input_c = input.contiguous()
@@ -528,17 +528,17 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
 
 
 class Fp8ShadowLinear(nn.Module):
-    """Linear layer with FP8 weight storage and float32 master weights.
+    """Linear layer with FP8 weight storage and float32/float16/bfloat16 master weights.
 
     VRAM layout per layer (N×K weight matrix):
-      ``weight_master``  float32  [N, K]  — 4 bytes/param, seen by optimizer
+      ``weight_master``  fp32/fp16/bf16 [N, K] — seen by optimizer
       ``weight_fp8``     uint8    [N, K]  — 1 byte/param, used in forward
-      ``bias``           float32  [N]     — negligible
+      ``bias``           master dtype [N] — negligible
 
     Net saving vs ``nn.Linear``: weight VRAM is kept at 1 byte/param during
-    the forward pass.  The master weight (needed by Adam/Adafactor) is still
-    4 bytes/param, but it can be offloaded or kept in CPU pinned memory if
-    necessary.  Combined with ``Adafactor``, optimizer state drops dramatically:
+    the forward pass.  The master weight is still kept for optimizer updates,
+    but can now be fp16/bf16 to cut persistent parameter and gradient VRAM.
+    Combined with ``Adafactor``, optimizer state drops dramatically:
     no first moment + factored second moment ≈ (N+K)/NK << 1 of weight size.
 
     Per-tensor amax scaling (same as ``Fp8ScaledLinear``) keeps quantization
@@ -550,7 +550,7 @@ class Fp8ShadowLinear(nn.Module):
         bias:         learnable bias (default True).
         history_len:  amax rolling window length.
         device:       device for parameters.
-        dtype:        dtype for master weight (default float32).
+        dtype:        dtype for master weight (float32, float16, or bfloat16).
 
     Compatibility:
         ``layer.weight`` is a property that returns ``weight_master``, so
@@ -571,7 +571,7 @@ class Fp8ShadowLinear(nn.Module):
         self.in_features  = in_features
         self.out_features = out_features
 
-        # Float32 master weight — the optimizer's target
+        # Master weight — the optimizer's target
         self.weight_master = nn.Parameter(
             torch.empty(out_features, in_features, **factory)
         )

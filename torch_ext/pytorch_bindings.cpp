@@ -40,45 +40,68 @@ typedef struct ihipStream_t* hipStream_t;
 
 // Forward declarations for kernel launchers defined in the .hip files.
 extern "C" {
-void launch_quant_e4m3(const float* src, uint8_t* dst, int64_t numel,
-                       hipStream_t stream);
-void launch_quant_e5m2(const float* src, uint8_t* dst, int64_t numel,
-                       hipStream_t stream);
+void launch_quant_e4m3(const void* src, uint8_t* dst, int64_t numel,
+                       int dtype, hipStream_t stream);
+void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
+                       int dtype, hipStream_t stream);
 void launch_dequant_e4m3(const uint8_t* src, float* dst, int64_t numel,
                          hipStream_t stream);
 void launch_dequant_e5m2(const uint8_t* src, float* dst, int64_t numel,
                          hipStream_t stream);
 
 void launch_fp8_linear_forward(
-    const float* A, const float* B, float* C,
-    int M, int N, int K, hipStream_t stream);
+    const void* A, const void* B, void* C,
+    int M, int N, int K, int a_dtype, int b_dtype, int c_dtype,
+    hipStream_t stream);
 void launch_fp8_linear_forward_scaled(
-    const float* A, const float* B, float* C,
+    const void* A, const void* B, void* C,
     int M, int N, int K, float input_scale, float weight_scale,
+    int a_dtype, int b_dtype, int c_dtype,
     hipStream_t stream);
 void launch_fp8_linear_forward_fp8_weight(
-    const float* A, const uint8_t* B_fp8, float* C,
+    const void* A, const uint8_t* B_fp8, void* C,
     int M, int N, int K, float input_scale, float weight_inv_scale,
+    int a_dtype, int c_dtype,
     hipStream_t stream);
 void launch_fp8_linear_backward_input(
-    const float* grad_output, const float* weight, float* grad_input,
-    int M, int N, int K, hipStream_t stream);
+    const void* grad_output, const void* weight, void* grad_input,
+    int M, int N, int K, int grad_output_dtype, int weight_dtype,
+    int grad_input_dtype, hipStream_t stream);
 void launch_fp8_linear_backward_input_scaled(
-    const float* grad_output, const float* weight, float* grad_input,
-    int M, int N, int K, float weight_scale, hipStream_t stream);
+    const void* grad_output, const void* weight, void* grad_input,
+    int M, int N, int K, float weight_scale, int grad_output_dtype,
+    int weight_dtype, int grad_input_dtype, hipStream_t stream);
 void launch_fp8_linear_backward_weight(
-    const float* grad_output, const float* input, float* grad_weight,
-    int M, int N, int K, hipStream_t stream);
+    const void* grad_output, const void* input, void* grad_weight,
+    int M, int N, int K, int grad_output_dtype, int input_dtype,
+    int grad_weight_dtype, hipStream_t stream);
 void launch_fp8_linear_backward_weight_scaled(
-    const float* grad_output, const float* input, float* grad_weight,
-    int M, int N, int K, float input_scale, hipStream_t stream);
+    const void* grad_output, const void* input, void* grad_weight,
+    int M, int N, int K, float input_scale, int grad_output_dtype,
+    int input_dtype, int grad_weight_dtype, hipStream_t stream);
 } // extern "C"
+
+constexpr int HIP_QUANT_DTYPE_F32  = 0;
+constexpr int HIP_QUANT_DTYPE_F16  = 1;
+constexpr int HIP_QUANT_DTYPE_BF16 = 2;
 
 // ---------------------------------------------------------------------------
 // Helper: get current HIP stream from ATen
 // ---------------------------------------------------------------------------
 static hipStream_t current_stream() {
     return nullptr;
+}
+
+static inline int float_dtype_code(c10::ScalarType dtype, const char* name) {
+    if (dtype == torch::kFloat32) return HIP_QUANT_DTYPE_F32;
+    if (dtype == torch::kFloat16) return HIP_QUANT_DTYPE_F16;
+    if (dtype == torch::kBFloat16) return HIP_QUANT_DTYPE_BF16;
+    TORCH_CHECK(false, name, " must be float32, float16, or bfloat16");
+    return HIP_QUANT_DTYPE_F32;
+}
+
+static inline int float_dtype_code(const torch::Tensor& tensor, const char* name) {
+    return float_dtype_code(tensor.scalar_type(), name);
 }
 
 // ---------------------------------------------------------------------------
@@ -112,16 +135,16 @@ static inline void check_grid_dim(int64_t dim, int tile, const char* axis) {
 torch::Tensor quantize_e4m3(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(),       "quantize_e4m3: input must be a HIP/CUDA tensor");
     TORCH_CHECK(input.is_contiguous(), "quantize_e4m3: input must be contiguous");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32,
-                "quantize_e4m3: input must be float32");
+    int input_dtype = float_dtype_code(input, "quantize_e4m3: input");
 
     auto output = torch::empty(input.sizes(),
                                input.options().dtype(torch::kUInt8));
     int64_t numel = input.numel();
     launch_quant_e4m3(
-        input.data_ptr<float>(),
+        input.data_ptr(),
         output.data_ptr<uint8_t>(),
         numel,
+        input_dtype,
         current_stream()
     );
     return output;
@@ -133,16 +156,16 @@ torch::Tensor quantize_e4m3(torch::Tensor input) {
 torch::Tensor quantize_e5m2(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(),       "quantize_e5m2: input must be a HIP/CUDA tensor");
     TORCH_CHECK(input.is_contiguous(), "quantize_e5m2: input must be contiguous");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32,
-                "quantize_e5m2: input must be float32");
+    int input_dtype = float_dtype_code(input, "quantize_e5m2: input");
 
     auto output = torch::empty(input.sizes(),
                                input.options().dtype(torch::kUInt8));
     int64_t numel = input.numel();
     launch_quant_e5m2(
-        input.data_ptr<float>(),
+        input.data_ptr(),
         output.data_ptr<uint8_t>(),
         numel,
+        input_dtype,
         current_stream()
     );
     return output;
@@ -206,10 +229,8 @@ torch::Tensor fp8_linear_forward(
                 "fp8_linear_forward: input must be a contiguous CUDA tensor");
     TORCH_CHECK(weight.is_cuda() && weight.is_contiguous(),
                 "fp8_linear_forward: weight must be a contiguous CUDA tensor");
-    TORCH_CHECK(input.scalar_type()  == torch::kFloat32,
-                "fp8_linear_forward: input must be float32");
-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32,
-                "fp8_linear_forward: weight must be float32");
+    int input_dtype = float_dtype_code(input, "fp8_linear_forward: input");
+    int weight_dtype = float_dtype_code(weight, "fp8_linear_forward: weight");
     TORCH_CHECK(input.dim()  == 2, "fp8_linear_forward: input must be 2-D");
     TORCH_CHECK(weight.dim() == 2, "fp8_linear_forward: weight must be 2-D");
 
@@ -234,10 +255,10 @@ torch::Tensor fp8_linear_forward(
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward(
-        input.data_ptr<float>(),
-        weight.data_ptr<float>(),
-        output.data_ptr<float>(),
-        iM, iN, iK,
+        input.data_ptr(),
+        weight.data_ptr(),
+        output.data_ptr(),
+        iM, iN, iK, input_dtype, weight_dtype, input_dtype,
         current_stream()
     );
 
@@ -248,8 +269,7 @@ torch::Tensor fp8_linear_forward(
         TORCH_CHECK(b.size(0) == N,
                     "fp8_linear_forward: bias size mismatch");
         // Bug 4: validate bias dtype; mismatched dtype causes silent upcasting
-        TORCH_CHECK(b.scalar_type() == torch::kFloat32,
-                    "fp8_linear_forward: bias must be float32");
+        (void)float_dtype_code(b, "fp8_linear_forward: bias");
         TORCH_CHECK(b.device() == output.device(),
                     "fp8_linear_forward: bias must be on the same device as input");
         output.add_(b.unsqueeze(0));
@@ -269,10 +289,8 @@ torch::Tensor fp8_linear_forward_scaled(
                 "fp8_linear_forward_scaled: input must be a contiguous CUDA tensor");
     TORCH_CHECK(weight.is_cuda() && weight.is_contiguous(),
                 "fp8_linear_forward_scaled: weight must be a contiguous CUDA tensor");
-    TORCH_CHECK(input.scalar_type()  == torch::kFloat32,
-                "fp8_linear_forward_scaled: input must be float32");
-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32,
-                "fp8_linear_forward_scaled: weight must be float32");
+    int input_dtype = float_dtype_code(input, "fp8_linear_forward_scaled: input");
+    int weight_dtype = float_dtype_code(weight, "fp8_linear_forward_scaled: weight");
     TORCH_CHECK(input.dim()  == 2, "fp8_linear_forward_scaled: input must be 2-D");
     TORCH_CHECK(weight.dim() == 2, "fp8_linear_forward_scaled: weight must be 2-D");
     TORCH_CHECK(input_scale > 0.0 && weight_scale > 0.0,
@@ -294,15 +312,15 @@ torch::Tensor fp8_linear_forward_scaled(
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward_scaled(
-        input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(),
-        iM, iN, iK, (float)input_scale, (float)weight_scale, current_stream());
+        input.data_ptr(), weight.data_ptr(), output.data_ptr(),
+        iM, iN, iK, (float)input_scale, (float)weight_scale,
+        input_dtype, weight_dtype, input_dtype, current_stream());
 
     if (bias.has_value()) {
         auto b = bias.value();
         TORCH_CHECK(b.is_cuda() && b.is_contiguous(),
                     "fp8_linear_forward_scaled: bias must be a contiguous CUDA tensor");
-        TORCH_CHECK(b.scalar_type() == torch::kFloat32,
-                    "fp8_linear_forward_scaled: bias must be float32");
+        (void)float_dtype_code(b, "fp8_linear_forward_scaled: bias");
         TORCH_CHECK(b.size(0) == N,
                     "fp8_linear_forward_scaled: bias size mismatch");
         TORCH_CHECK(b.device() == output.device(),
@@ -323,8 +341,7 @@ torch::Tensor fp8_linear_forward_fp8_weight(
                 "fp8_linear_forward_fp8_weight: input must be a contiguous CUDA tensor");
     TORCH_CHECK(weight_fp8.is_cuda() && weight_fp8.is_contiguous(),
                 "fp8_linear_forward_fp8_weight: weight_fp8 must be a contiguous CUDA tensor");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32,
-                "fp8_linear_forward_fp8_weight: input must be float32");
+    int input_dtype = float_dtype_code(input, "fp8_linear_forward_fp8_weight: input");
     TORCH_CHECK(weight_fp8.scalar_type() == torch::kUInt8,
                 "fp8_linear_forward_fp8_weight: weight_fp8 must be uint8");
     TORCH_CHECK(input.dim() == 2, "fp8_linear_forward_fp8_weight: input must be 2-D");
@@ -348,15 +365,15 @@ torch::Tensor fp8_linear_forward_fp8_weight(
 
     auto output = torch::zeros({M, N}, input.options());
     launch_fp8_linear_forward_fp8_weight(
-        input.data_ptr<float>(), weight_fp8.data_ptr<uint8_t>(), output.data_ptr<float>(),
-        iM, iN, iK, (float)input_scale, (float)weight_inv_scale, current_stream());
+        input.data_ptr(), weight_fp8.data_ptr<uint8_t>(), output.data_ptr(),
+        iM, iN, iK, (float)input_scale, (float)weight_inv_scale,
+        input_dtype, input_dtype, current_stream());
 
     if (bias.has_value()) {
         auto b = bias.value();
         TORCH_CHECK(b.is_cuda() && b.is_contiguous(),
                     "fp8_linear_forward_fp8_weight: bias must be a contiguous CUDA tensor");
-        TORCH_CHECK(b.scalar_type() == torch::kFloat32,
-                    "fp8_linear_forward_fp8_weight: bias must be float32");
+        (void)float_dtype_code(b, "fp8_linear_forward_fp8_weight: bias");
         TORCH_CHECK(b.size(0) == N,
                     "fp8_linear_forward_fp8_weight: bias size mismatch");
         TORCH_CHECK(b.device() == output.device(),
@@ -380,10 +397,8 @@ torch::Tensor fp8_linear_backward_input(
                 "fp8_linear_backward_input: grad_output must be contiguous CUDA");
     TORCH_CHECK(weight.is_cuda()      && weight.is_contiguous(),
                 "fp8_linear_backward_input: weight must be contiguous CUDA");
-    TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32,
-                "fp8_linear_backward_input: grad_output must be float32");
-    TORCH_CHECK(weight.scalar_type()      == torch::kFloat32,
-                "fp8_linear_backward_input: weight must be float32");
+    int grad_output_dtype = float_dtype_code(grad_output, "fp8_linear_backward_input: grad_output");
+    int weight_dtype = float_dtype_code(weight, "fp8_linear_backward_input: weight");
 
     int64_t M = grad_output.size(0);
     int64_t N = grad_output.size(1);
@@ -406,10 +421,10 @@ torch::Tensor fp8_linear_backward_input(
 
     auto grad_input = torch::zeros({M, K}, grad_output.options());
     launch_fp8_linear_backward_input(
-        grad_output.data_ptr<float>(),
-        weight.data_ptr<float>(),
-        grad_input.data_ptr<float>(),
-        iM, iN, iK,
+        grad_output.data_ptr(),
+        weight.data_ptr(),
+        grad_input.data_ptr(),
+        iM, iN, iK, grad_output_dtype, weight_dtype, grad_output_dtype,
         current_stream()
     );
     return grad_input;
@@ -424,10 +439,8 @@ torch::Tensor fp8_linear_backward_input_scaled(
                 "fp8_linear_backward_input_scaled: grad_output must be contiguous CUDA");
     TORCH_CHECK(weight.is_cuda()      && weight.is_contiguous(),
                 "fp8_linear_backward_input_scaled: weight must be contiguous CUDA");
-    TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32,
-                "fp8_linear_backward_input_scaled: grad_output must be float32");
-    TORCH_CHECK(weight.scalar_type()      == torch::kFloat32,
-                "fp8_linear_backward_input_scaled: weight must be float32");
+    int grad_output_dtype = float_dtype_code(grad_output, "fp8_linear_backward_input_scaled: grad_output");
+    int weight_dtype = float_dtype_code(weight, "fp8_linear_backward_input_scaled: weight");
     TORCH_CHECK(weight_scale > 0.0,
                 "fp8_linear_backward_input_scaled: weight_scale must be positive");
 
@@ -447,8 +460,9 @@ torch::Tensor fp8_linear_backward_input_scaled(
 
     auto grad_input = torch::zeros({M, K}, grad_output.options());
     launch_fp8_linear_backward_input_scaled(
-        grad_output.data_ptr<float>(), weight.data_ptr<float>(), grad_input.data_ptr<float>(),
-        iM, iN, iK, (float)weight_scale, current_stream());
+        grad_output.data_ptr(), weight.data_ptr(), grad_input.data_ptr(),
+        iM, iN, iK, (float)weight_scale, grad_output_dtype, weight_dtype,
+        grad_output_dtype, current_stream());
     return grad_input;
 }
 
@@ -466,10 +480,8 @@ torch::Tensor fp8_linear_backward_weight(
                 "fp8_linear_backward_weight: grad_output must be contiguous CUDA");
     TORCH_CHECK(input.is_cuda()       && input.is_contiguous(),
                 "fp8_linear_backward_weight: input must be contiguous CUDA");
-    TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32,
-                "fp8_linear_backward_weight: grad_output must be float32");
-    TORCH_CHECK(input.scalar_type()       == torch::kFloat32,
-                "fp8_linear_backward_weight: input must be float32");
+    int grad_output_dtype = float_dtype_code(grad_output, "fp8_linear_backward_weight: grad_output");
+    int input_dtype = float_dtype_code(input, "fp8_linear_backward_weight: input");
 
     int64_t M = grad_output.size(0);
     int64_t N = grad_output.size(1);
@@ -492,10 +504,10 @@ torch::Tensor fp8_linear_backward_weight(
 
     auto grad_weight = torch::zeros({N, K}, grad_output.options());
     launch_fp8_linear_backward_weight(
-        grad_output.data_ptr<float>(),
-        input.data_ptr<float>(),
-        grad_weight.data_ptr<float>(),
-        iM, iN, iK,
+        grad_output.data_ptr(),
+        input.data_ptr(),
+        grad_weight.data_ptr(),
+        iM, iN, iK, grad_output_dtype, input_dtype, grad_output_dtype,
         current_stream()
     );
     return grad_weight;
@@ -510,10 +522,8 @@ torch::Tensor fp8_linear_backward_weight_scaled(
                 "fp8_linear_backward_weight_scaled: grad_output must be contiguous CUDA");
     TORCH_CHECK(input.is_cuda()       && input.is_contiguous(),
                 "fp8_linear_backward_weight_scaled: input must be contiguous CUDA");
-    TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32,
-                "fp8_linear_backward_weight_scaled: grad_output must be float32");
-    TORCH_CHECK(input.scalar_type()       == torch::kFloat32,
-                "fp8_linear_backward_weight_scaled: input must be float32");
+    int grad_output_dtype = float_dtype_code(grad_output, "fp8_linear_backward_weight_scaled: grad_output");
+    int input_dtype = float_dtype_code(input, "fp8_linear_backward_weight_scaled: input");
     TORCH_CHECK(input_scale > 0.0,
                 "fp8_linear_backward_weight_scaled: input_scale must be positive");
 
@@ -533,8 +543,9 @@ torch::Tensor fp8_linear_backward_weight_scaled(
 
     auto grad_weight = torch::zeros({N, K}, grad_output.options());
     launch_fp8_linear_backward_weight_scaled(
-        grad_output.data_ptr<float>(), input.data_ptr<float>(), grad_weight.data_ptr<float>(),
-        iM, iN, iK, (float)input_scale, current_stream());
+        grad_output.data_ptr(), input.data_ptr(), grad_weight.data_ptr(),
+        iM, iN, iK, (float)input_scale, grad_output_dtype, input_dtype,
+        grad_output_dtype, current_stream());
     return grad_weight;
 }
 

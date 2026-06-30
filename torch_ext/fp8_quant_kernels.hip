@@ -13,19 +13,34 @@
 #include <assert.h>
 #include "../hip_quant_util.h"
 
+#define HIP_QUANT_DTYPE_F32  0
+#define HIP_QUANT_DTYPE_F16  1
+#define HIP_QUANT_DTYPE_BF16 2
+
+static __device__ inline float load_float_input(const void* src, int dtype, int64_t idx) {
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        return fp16_to_fp32(((const uint16_t*)src)[idx]);
+    }
+    if (dtype == HIP_QUANT_DTYPE_BF16) {
+        return bf16_to_fp32(((const uint16_t*)src)[idx]);
+    }
+    return ((const float*)src)[idx];
+}
+
 // ---------------------------------------------------------------------------
 // Quantize: float32 → FP8 E4M3
 // ---------------------------------------------------------------------------
 __global__
 __launch_bounds__(256, 4)
 void quant_e4m3_kernel(
-    const float * __restrict__ src,
+    const void  * __restrict__ src,
     uint8_t      * __restrict__ dst,
-    int64_t       numel
+    int64_t       numel,
+    int           dtype
 ) {
     int64_t idx = (int64_t)blockIdx.x * 256 + threadIdx.x;
     if (idx >= numel) return;
-    dst[idx] = fp32_to_fp8_e4m3(src[idx]);
+    dst[idx] = fp32_to_fp8_e4m3(load_float_input(src, dtype, idx));
 }
 
 // ---------------------------------------------------------------------------
@@ -34,13 +49,14 @@ void quant_e4m3_kernel(
 __global__
 __launch_bounds__(256, 4)
 void quant_e5m2_kernel(
-    const float * __restrict__ src,
+    const void  * __restrict__ src,
     uint8_t      * __restrict__ dst,
-    int64_t       numel
+    int64_t       numel,
+    int           dtype
 ) {
     int64_t idx = (int64_t)blockIdx.x * 256 + threadIdx.x;
     if (idx >= numel) return;
-    dst[idx] = fp32_to_fp8_e5m2(src[idx]);
+    dst[idx] = fp32_to_fp8_e5m2(load_float_input(src, dtype, idx));
 }
 
 // ---------------------------------------------------------------------------
@@ -96,20 +112,20 @@ static inline uint32_t safe_blocks(int64_t numel) {
 
 extern "C" {
 
-void launch_quant_e4m3(const float* src, uint8_t* dst, int64_t numel,
-                       hipStream_t stream) {
+void launch_quant_e4m3(const void* src, uint8_t* dst, int64_t numel,
+                       int dtype, hipStream_t stream) {
     if (numel == 0) return;  // Hazard A: launching dim3(0) is UB in HIP
     hipLaunchKernelGGL(quant_e4m3_kernel,
                        dim3(safe_blocks(numel)), dim3(256), 0, stream,
-                       src, dst, numel);
+                       src, dst, numel, dtype);
 }
 
-void launch_quant_e5m2(const float* src, uint8_t* dst, int64_t numel,
-                       hipStream_t stream) {
+void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
+                       int dtype, hipStream_t stream) {
     if (numel == 0) return;
     hipLaunchKernelGGL(quant_e5m2_kernel,
                        dim3(safe_blocks(numel)), dim3(256), 0, stream,
-                       src, dst, numel);
+                       src, dst, numel, dtype);
 }
 
 void launch_dequant_e4m3(const uint8_t* src, float* dst, int64_t numel,

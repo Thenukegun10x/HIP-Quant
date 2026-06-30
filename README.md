@@ -3,13 +3,15 @@
   <p><b>Blazing Fast On-Device Tensor Quantization for AMD GPUs</b></p>
   <p>
     <img alt="ROCm 7.1" src="https://img.shields.io/badge/ROCm-7.1-ED1C24?logo=amd"/>
-    <img alt="gfx1201" src="https://img.shields.io/badge/arch-gfx1201-blue"/>
+    <img alt="RDNA4" src="https://img.shields.io/badge/RDNA4-gfx1200%20%7C%20gfx1201-blue"/>
+    <img alt="CDNA" src="https://img.shields.io/badge/CDNA-gfx90a%20%7C%20gfx942-purple"/>
+    <img alt="BF16 FP16" src="https://img.shields.io/badge/PyTorch-BF16%20%7C%20FP16-green"/>
     <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white"/>
     <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.9%2BROCm-EE4C2C?logo=pytorch"/>
   </p>
 </div>
 
-`hip-quant` is a standalone Python library and highly optimized HIP C++ backend that quantizes `float32` tensors directly on AMD GPUs — no CPU round-trips.
+`hip-quant` is a standalone Python library and highly optimized HIP C++ backend that quantizes tensors directly on AMD GPUs with no CPU round-trips. The offline GGUF path consumes `float32`; the PyTorch FP8 training extension accepts `float32`, `float16`, and `bfloat16` tensors.
 
 It ships **two independent APIs** that can be used together or separately:
 
@@ -17,6 +19,20 @@ It ships **two independent APIs** that can be used together or separately:
 |---|---|---|
 | **NumPy / ctypes** (offline) | Offline GGUF-format quantization via `hip_quantize.dll` | ROCm 7.1, numpy |
 | **PyTorch extension** (training) | GPU-resident FP8 training ops with full autograd | PyTorch 2.x + ROCm, built `_C` extension |
+
+## Hardware Status
+
+Runtime validation is currently on RDNA4. The PyTorch FP8 WMMA kernels target `gfx1200` and `gfx1201`; `gfx1200` is treated as the cut-down `gfx1201` die with the same relevant FP8 WMMA capabilities.
+
+CDNA support is included for the offline NumPy/DLL quantization path and compatibility tooling. `.\build.ps1 -CDNA` cross-compiles the portable quantization kernels for `gfx90a` and `gfx942` on the local ROCm 7.1 Windows toolchain. Device reports still classify `gfx940` and `gfx941` correctly when encountered, but this Windows `hipcc` does not accept them as offload targets. The gfx12 WMMA FP8 GEMM test is intentionally disabled on CDNA; CDNA GEMM needs an MFMA path.
+
+Validated local test system:
+- GPU: AMD Radeon RX 9070 XT, `gfx1201`, 16 GB VRAM
+- CPU: AMD Ryzen 7 7800X3D, 8 cores / 16 threads
+- RAM: 32 GB system memory
+- OS/toolchain: Windows, Visual Studio 2022 Build Tools, ROCm installed at `C:\Program Files\AMD\ROCm\7.1`
+- PyTorch venv: `C:\venvs\medusa_rocm\Scripts\python.exe`
+- PyTorch: `2.9.1+rocm7.2.1`, HIP runtime reported by PyTorch: `7.2.53211-158bd99533`
 
 ---
 
@@ -50,22 +66,39 @@ Both use OCP standard semantics with round-to-nearest-even. Math is validated ag
 Requires `hipcc` at `C:\Program Files\AMD\ROCm\7.1\bin\hipcc.exe`:
 ```powershell
 .\build.ps1
+
+# Include CDNA portable quantization targets as well as RDNA4
+.\build.ps1 -CDNA
+
+# Custom target set
+.\build.ps1 -Arch "gfx942,gfx1200,gfx1201"
 ```
 
 ### PyTorch Extension (`_C`)
 Requires PyTorch with ROCm support (`torch 2.x+rocm`):
 ```powershell
-python setup_torch.py build_ext --inplace
+& "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
 ```
+
+To build a PyPI wheel that includes the compiled `_C.pyd` extension, build with
+the extension flag from the ROCm/PyTorch environment:
+```powershell
+$env:HIP_QUANT_BUILD_TORCH_EXT = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build --wheel --no-isolation
+```
+
+Without `HIP_QUANT_BUILD_TORCH_EXT=1`, `python -m build` intentionally creates a
+source-only `py3-none-any` wheel that still requires the local extension build.
 
 ---
 
 ## 📦 Installation
 
 ```powershell
-# Core offline library only
-python -m build
-pip install dist/hip_quant-0.4.3-py3-none-any.whl
+# Binary wheel with fused PyTorch kernels
+$env:HIP_QUANT_BUILD_TORCH_EXT = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m build --wheel --no-isolation
+pip install dist/hip_quant-0.4.5-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -126,7 +159,13 @@ x_back = dequantize_e4m3(x_fp8)    # torch.float32, no CPU transfer
 
 #### Fake-FP8 Linear (autograd-safe, Phase 3)
 
-`Fp8LinearFunction` uses **E4M3** for forward activations/weights and **E5M2** for backward gradients. It also implements **Activation Compression**, saving `uint8` tensors in the autograd graph to cut activation VRAM by 4×.
+`Fp8LinearFunction` uses **E4M3** for forward activations/weights and **E5M2** for backward gradients. It accepts `torch.float32`, `torch.float16`, and `torch.bfloat16` inputs/weights. It also implements **Activation Compression**, saving `uint8` tensors in the autograd graph to cut activation VRAM by 4× versus FP32, and 2× versus FP16/BF16.
+
+BF16/FP16 support applies to:
+- `quantize_e4m3()` and `quantize_e5m2()` inputs
+- `Fp8LinearFunction` forward/backward
+- `Fp8Linear`, `Fp8ScaledLinear`, and `Fp8ShadowLinear` module parameters and gradients
+- `Fp8ShadowLinear` master weights, so user-selected BF16/FP16 master weights reduce persistent parameter and gradient VRAM versus FP32
 
 ```python
 from hip_quant.torch_api import convert_to_fp8, Adafactor
@@ -204,7 +243,7 @@ x_back = meta.dequantize_e4m3(x_fp8)  # dequantized, then rescaled
 All PyTorch extension functions are guarded against:
 - Non-CUDA tensors (`TORCH_CHECK(is_cuda)`)
 - Non-contiguous layout (`TORCH_CHECK(is_contiguous)`)
-- Wrong dtype (`TORCH_CHECK(scalar_type == kFloat32 / kUInt8)`)
+- Wrong dtype (`float32` / `float16` / `bfloat16` for floating inputs, `uint8` for FP8 buffers)
 - Dimension mismatch for GEMM
 - **`int64 → int` narrowing** — explicit `checked_int()` with `TORCH_CHECK`
 - **Hardware grid limit** — `gridDim.y ≤ 65535` validated before launch
@@ -224,9 +263,9 @@ python tests/torch/test_math_fp8.py
 #### PyTorch GPU tests
 ```powershell
 # Build extension first
-python setup_torch.py build_ext --inplace
+& "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
 
-pytest tests/torch/test_fp8.py -v
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/torch/test_fp8.py -v
 ```
 
 #### Full Pipeline Tests (CPU Mock)
@@ -234,6 +273,15 @@ pytest tests/torch/test_fp8.py -v
 python tests/test_pipeline.py -v
 # Tests full integration of Adafactor, Shadow Linear, and activation compression
 # Pure-Python mock, 100% test coverage for the API
+```
+
+#### Compatibility Tests (CPU + DLL)
+```powershell
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/test_compat.py -v
+
+# Device/compat reports
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m hip_quant --info
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m hip_quant --compat
 ```
 
 ---
@@ -245,6 +293,8 @@ hip_quant/
 ├── __init__.py              # NumPy / ctypes offline API
 ├── __main__.py              # CLI entry point
 ├── torch_api.py             # PyTorch FP8 training API (Phases 1–4)
+├── device_info.py           # GPU/DLL compatibility probe helpers
+├── cdna_compat.py           # CDNA feature table, build configs, CPU refs
 ├── setup_torch.py           # PyTorch C++ extension build script
 ├── build.ps1                # DLL build script (hipcc)
 ├── hip_quantize.cpp         # Offline quantization kernels (DLL source)
@@ -262,7 +312,10 @@ hip_quant/
 
 ## 📋 Architecture Notes
 
-- **gfx1201 target** — all kernels compiled with `--offload-arch=gfx1201`
+- **RDNA4 PyTorch target** — FP8 WMMA extension kernels are compiled with `--offload-arch=gfx1200` and `--offload-arch=gfx1201`
+- **CDNA offline target** — `build.ps1 -CDNA` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, `gfx1200`, and `gfx1201`
+- **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
+- **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
 - **No CPU transfers** — the PyTorch extension operates exclusively on device pointers obtained from `tensor.data_ptr()` and uses `at::cuda::getCurrentCUDAStream()`
 - **Phase 4 GEMM** is a correctness-first tiled stub. Replace the inner loop with a `rocBLASLt` FP8 GEMM path for production throughput once validated on your ROCm stack
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly

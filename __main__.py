@@ -45,6 +45,8 @@ def build_parser():
     parser.add_argument("--imatrix", help="optional .npy importance matrix")
     parser.add_argument("--dll", help="path to hip_quantize.dll")
     parser.add_argument("--info", action="store_true", help="print DLL/device information")
+    parser.add_argument("--compat", action="store_true", help="print CDNA/RDNA compatibility report")
+    parser.add_argument("--emulate", choices=("auto", "cpu", "gpu"), default=None, help="set emulation mode for CDNA testing")
     parser.add_argument("--list-types", action="store_true", help="list supported quantization types and exit")
     return parser
 
@@ -58,11 +60,20 @@ def main(argv=None):
             print(f"{type_id:>2}  {name}")
         return 0
 
+    if args.emulate:
+        from .cdna_compat import set_emulation_mode
+        set_emulation_mode(args.emulate)
+
+    if args.compat:
+        from . import suggest_cdna_emulation
+        print(suggest_cdna_emulation())
+        if not args.input and not args.output and not args.info:
+            return 0
+
     hq = HipQuant(args.dll)
     if args.info:
-        print(f"DLL: {hq.dll_path}")
-        print(f"Device count: {hq.device_count}")
-        print(f"Device: {hq.device_name}")
+        from . import report_device
+        print(report_device(args.dll))
         if not args.input and not args.output:
             return 0
 

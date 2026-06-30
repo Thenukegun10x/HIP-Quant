@@ -2,7 +2,7 @@ import ctypes
 import numpy as np
 import os
 
-__version__ = "0.4.3"
+__version__ = "0.4.5"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -34,6 +34,12 @@ __all__ = [
     "HipQuant",
     "get_hip_quant",
     "quantize",
+    # Compatibility / device info
+    "probe_device",
+    "report_device",
+    "suggest_cdna_emulation",
+    "get_build_config",
+    "cpu_reference_quantize",
     *_TORCH_EXPORTS,
 ]
 
@@ -389,6 +395,59 @@ def get_hip_quant(dll_path=None):
 
 def quantize(arr, type_num):
     return get_hip_quant().quantize_numpy(arr, type_num)
+
+
+# =========================================================================
+# Compatibility / Device Info helpers
+# =========================================================================
+
+def probe_device(dll_path=None):
+    """Probe HIP device and return a DeviceProperties dataclass.
+
+    Safe to call without a GPU — returns graceful fallback info.
+    """
+    from .device_info import probe_device as _probe
+    return _probe(dll_path)
+
+
+def report_device(dll_path=None):
+    """Print a formatted GPU compatibility report."""
+    from .device_info import probe_device, report
+    dev = probe_device(dll_path)
+    return report(dev)
+
+
+def suggest_cdna_emulation():
+    """Print guidance on testing CDNA compatibility without CDNA hardware."""
+    from .cdna_compat import suggest_emulation
+    return suggest_emulation()
+
+
+def get_build_config(target="auto"):
+    """Get recommended build configuration for a given arch target.
+
+    Args:
+        target: "auto", "rdna4", "cdna", "cdna3", "all", or specific arch
+
+    Returns:
+        dict with archs, extra_flags, defines, note
+    """
+    from .cdna_compat import build_config_for_arch
+    return build_config_for_arch(target)
+
+
+def cpu_reference_quantize(arr, type_name):
+    """CPU-based reference quantization for testing without a GPU.
+
+    Args:
+        arr: float32 numpy array
+        type_name: str like "Q4_0", "Q8_0"
+
+    Returns:
+        uint8 numpy array
+    """
+    from .cdna_compat import cpu_reference_quantize as _cpu_ref
+    return _cpu_ref(arr, type_name)
 
 
 def __getattr__(name):

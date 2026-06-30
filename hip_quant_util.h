@@ -55,6 +55,21 @@ __device__ inline float fp16_to_fp32(uint16_t h) {
     return __int_as_float(u);
 }
 
+// float32 -> bfloat16 (round-to-nearest-even)
+__device__ inline uint16_t fp32_to_bf16(float f) {
+    uint32_t u = __float_as_int(f);
+    if ((u & 0x7FFFFFFF) > 0x7F800000) {
+        return (uint16_t)((u >> 16) | 0x0040); // quiet NaN
+    }
+    uint32_t lsb = (u >> 16) & 1;
+    return (uint16_t)((u + 0x7FFFu + lsb) >> 16);
+}
+
+// bfloat16 -> float32
+__device__ inline float bf16_to_fp32(uint16_t h) {
+    return __int_as_float((uint32_t)h << 16);
+}
+
 // ============ FP8 E4M3 (OCP standard) conversions ============
 // Layout: 1 sign | 4 exponent | 3 mantissa
 // Bias: 7, max finite: ±448, no infinities
