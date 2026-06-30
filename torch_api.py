@@ -42,6 +42,102 @@ def _scale_to_float(scale: "torch.Tensor") -> float:
     return float(scale.item())
 
 
+def _fp8_linear_backend() -> str:
+    backend = os.environ.get("HIP_QUANT_FP8_LINEAR_BACKEND", "hipblaslt").strip().lower()
+    if os.environ.get("HIP_QUANT_USE_CUSTOM_WMMA", "").lower() in ("1", "true", "yes", "on"):
+        return "custom"
+    if backend in ("custom", "wmma", "hip", "hip_wmma"):
+        return "custom"
+    return "hipblaslt"
+
+
+def _hipblaslt_fp8_linear_forward(
+    input:        "torch.Tensor",
+    weight:       "torch.Tensor",
+    bias:         Optional["torch.Tensor"],
+    input_scale:  float = 1.0,
+    weight_scale: float = 1.0,
+) -> Optional["torch.Tensor"]:
+    """Fast ROCm FP8 GEMM path through PyTorch's hipBLASLt-backed _scaled_mm."""
+    if _fp8_linear_backend() == "custom":
+        return None
+    if os.environ.get("HIP_QUANT_DISABLE_HIPBLASLT", "").lower() in ("1", "true", "yes", "on"):
+        return None
+    if not _TORCH_AVAILABLE or not input.is_cuda:
+        return None
+    if not hasattr(torch, "_scaled_mm") or not hasattr(torch, "float8_e4m3fn"):
+        return None
+    if input.dim() != 2 or weight.dim() != 2:
+        return None
+
+    a = input.contiguous()
+    b = weight.contiguous()
+    if input_scale != 1.0:
+        a = (a * input_scale).contiguous()
+    if weight_scale != 1.0:
+        b = (b * weight_scale).contiguous()
+
+    scale_a = torch.full((), 1.0 / float(input_scale), device=input.device, dtype=torch.float32)
+    scale_b = torch.full((), 1.0 / float(weight_scale), device=input.device, dtype=torch.float32)
+    a_fp8 = a.to(torch.float8_e4m3fn)
+    b_fp8_t = b.to(torch.float8_e4m3fn).contiguous().t()
+
+    try:
+        out = torch._scaled_mm(a_fp8, b_fp8_t, scale_a, scale_b, out_dtype=input.dtype)
+    except RuntimeError:
+        if os.environ.get("HIP_QUANT_HIPBLASLT_STRICT", "").lower() in ("1", "true", "yes", "on"):
+            raise
+        return None
+    if bias is not None:
+        out = out + bias.unsqueeze(0)
+    return out
+
+
+def _hipblaslt_fp8_backward(
+    grad_output: "torch.Tensor",
+    weight:      "torch.Tensor",
+    input_f32:   "torch.Tensor",
+    weight_scale: float = 1.0,
+    input_scale:  float = 1.0,
+) -> Optional[Tuple["torch.Tensor", "torch.Tensor"]]:
+    """Try backward via torch._scaled_mm with float8_e5m2.
+
+    _scaled_mm convention:
+      A row-major [M, K], B column-major [K, N]  ->  A @ B = [M, N].
+
+    Returns (grad_input, grad_weight) or None on failure.
+    """
+    if not _TORCH_AVAILABLE or not grad_output.is_cuda:
+        return None
+    if not hasattr(torch, "_scaled_mm") or not hasattr(torch, "float8_e5m2"):
+        return None
+
+    go = grad_output.contiguous()
+    w  = weight.contiguous()
+    x  = input_f32.contiguous()
+
+    try:
+        # grad_input = go @ w  ->  (M,N) @ (N,K) = (M,K)
+        # A = go [M,N] row-major, B = w [N,K] column-major
+        a_gi = go.to(torch.float8_e5m2)                                    # [M,N] row-major
+        b_gi = w.to(torch.float8_e5m2).t().contiguous().t()                # [N,K] column-major
+        s_go = torch.ones((), device=go.device, dtype=torch.float32)
+        s_w  = torch.full((), float(weight_scale), device=go.device, dtype=torch.float32)
+        grad_input = torch._scaled_mm(a_gi, b_gi, s_go, s_w, out_dtype=go.dtype)
+
+        # grad_weight = go.T @ input  ->  (N,M) @ (M,K) = (N,K)
+        # A = go.T [N,M] row-major, B = input [M,K] column-major
+        a_gw = go.t().contiguous().to(torch.float8_e5m2)                   # [N,M] row-major
+        b_gw = x.to(torch.float8_e5m2).t().contiguous().t()                # [M,K] column-major
+        s_go_t = torch.ones((), device=go.device, dtype=torch.float32)
+        s_x    = torch.full((), float(input_scale), device=go.device, dtype=torch.float32)
+        grad_weight = torch._scaled_mm(a_gw, b_gw, s_go_t, s_x, out_dtype=go.dtype)
+
+        return (grad_input, grad_weight)
+    except RuntimeError:
+        return None
+
+
 def _parse_rocm_version(value: Optional[str]) -> Tuple[int, int]:
     if not value:
         return (0, 0)
@@ -198,6 +294,10 @@ class Fp8LinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
+        out = _hipblaslt_fp8_linear_forward(input_c, weight_c, bias)
+        if out is not None:
+            return out
+
         return fp8_linear_forward_fp8_input(input_fp8, weight_c, input_c, 1.0, 1.0, bias)
 
     @staticmethod
@@ -212,6 +312,16 @@ class Fp8LinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8)
 
         grad_output_c = grad_output.contiguous()
+
+        # Try hipBLASLt e5m2 backward path first
+        hipblaslt_result = _hipblaslt_fp8_backward(
+            grad_output_c, weight, input_f32, weight_scale=1.0, input_scale=1.0
+        )
+        if hipblaslt_result is not None:
+            grad_input, grad_weight = hipblaslt_result
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight, grad_bias
+
         grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
             grad_output_fp8, grad_output_c, weight, 1.0
@@ -266,6 +376,10 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
+        out = _hipblaslt_fp8_linear_forward(input_c, weight_c, bias, input_scale, weight_scale)
+        if out is not None:
+            return out
+
         return fp8_linear_forward_fp8_input(
             input_fp8, weight_c, input_c, input_scale, weight_scale, bias
         )
@@ -282,6 +396,17 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
+
+        # Try hipBLASLt e5m2 backward path first
+        hipblaslt_result = _hipblaslt_fp8_backward(
+            grad_output_c, weight, input_f32,
+            weight_scale=ctx.weight_scale, input_scale=1.0
+        )
+        if hipblaslt_result is not None:
+            grad_input, grad_weight = hipblaslt_result
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight, grad_bias, None, None
+
         grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
             grad_output_fp8, grad_output_c, weight, ctx.weight_scale
@@ -565,6 +690,12 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight_master)
 
+        out = _hipblaslt_fp8_linear_forward(
+            input_c, weight_master.contiguous(), bias, input_scale, 1.0 / weight_inv_scale
+        )
+        if out is not None:
+            return out
+
         return fp8_linear_forward_fp8_input_weight(
             input_fp8, weight_fp8, input_c, weight_inv_scale, input_scale, bias
         )
@@ -581,6 +712,17 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
+
+        # Try hipBLASLt e5m2 backward path first
+        hipblaslt_result = _hipblaslt_fp8_backward(
+            grad_output_c, weight_master, input_f32,
+            weight_scale=ctx.weight_scale, input_scale=1.0
+        )
+        if hipblaslt_result is not None:
+            grad_input, grad_weight_master = hipblaslt_result
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight_master, None, None, None, grad_bias
+
         grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
             grad_output_fp8, grad_output_c, weight_master, ctx.weight_scale
