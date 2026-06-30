@@ -73,7 +73,10 @@ def _configure_windows_toolchain():
 _configure_windows_toolchain()
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths
+
+# Convert all torch include paths to Windows 8.3 short paths to avoid space-related build failures
+torch_includes = [_short_path(p) for p in include_paths()]
 
 ext = CUDAExtension(
     # The extension will be importable as  hip_quant._C
@@ -94,15 +97,15 @@ ext = CUDAExtension(
             "--offload-arch=gfx1201",
             # Allow device code to include project headers via relative paths
             "-I.",
-        ],
+        ] + [f"-I{p}" for p in torch_includes],
     },
     # Ensure headers shipped with the package are visible to hipcc
-    include_dirs=["."],
+    include_dirs=["."] + torch_includes,
 )
 
 setup(
     name="hip_quant_torch",
-    version="0.4.6",
+    version="0.4.7",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

@@ -12,6 +12,7 @@ include torch_api.py
 include device_info.py
 include cdna_compat.py
 include setup_torch.py
+include DOCUMENTATION.md
 exclude _C*.pyd
 exclude torch_ext/pytorch_bindings_hip.cpp
 global-exclude __pycache__/*

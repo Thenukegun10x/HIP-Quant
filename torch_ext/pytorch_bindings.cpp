@@ -19,9 +19,9 @@
 // fp8_linear_kernels.hip so this file only does argument validation and
 // tensor allocation.
 
+#include <hip/hip_runtime.h>
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
-#include <hip/hip_runtime.h>
 #include <pybind11/pybind11.h>
 #include <cstring>
 #include <cstdlib>
