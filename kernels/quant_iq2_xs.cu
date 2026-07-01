@@ -179,7 +179,7 @@ __global__ void quantize_iq2_xs_kernel(
             uint16_t u = 0;
             for (int i = 0; i < 8; ++i) u |= ((uint16_t)L[8 * k + i] << (2 * i));
             int grid_index = map[u];
-            if (grid_index < 0) { printf("error at type 17: map miss for u=%u\n", (unsigned)u); grid_index = 0; }
+            if (grid_index < 0) { grid_index = 0; }
             q2[2 * ib + k] = (uint16_t)(grid_index | ((uint16_t)block_signs[k] << 9));
         }
         scales[ib] = scale;

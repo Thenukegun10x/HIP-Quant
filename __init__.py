@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.4.8"
+__version__ = "0.5.1"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -27,6 +27,10 @@ _TORCH_EXPORTS = {
     "Fp8ScaledLinear",
     "Fp8ShadowLinearFunction",
     "Fp8ShadowLinear",
+    "fp8_conv1d",
+    "Fp8Conv1d",
+    "fp8_conv2d",
+    "Fp8Conv2d",
     "Fp8TensorMeta",
     "convert_to_fp8",
     "Adafactor",
@@ -325,6 +329,20 @@ class HipQuant:
         if lda is None: lda = K
         if ldb is None: ldb = N
         if ldc is None: ldc = N
+        M = int(M); N = int(N); K = int(K)
+        lda = int(lda); ldb = int(ldb); ldc = int(ldc)
+        if M <= 0 or N <= 0 or K <= 0:
+            raise ValueError("M, N, and K must be positive")
+        if M % 16 != 0 or N % 16 != 0:
+            raise ValueError("M and N must be multiples of 16 for fp8_gemm_test_wmma")
+        if lda < K or ldb < N or ldc < N:
+            raise ValueError("lda must be >= K, ldb >= N, and ldc >= N")
+        a_arr = np.asarray(A_fp8)
+        b_arr = np.asarray(B_fp8)
+        if a_arr.ndim != 2 or a_arr.shape[0] < M or a_arr.shape[1] < lda:
+            raise ValueError("A_fp8 must have shape at least (M, lda)")
+        if b_arr.ndim != 2 or b_arr.shape[0] < K or b_arr.shape[1] < ldb:
+            raise ValueError("B_fp8 must have shape at least (K, ldb)")
         if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
             raise RuntimeError("FP8 WMMA is disabled by HIP_QUANT_DISABLE_WMMA.")
         if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() not in ("1", "true", "yes", "on"):
@@ -344,8 +362,8 @@ class HipQuant:
                 f"FP8 WMMA test is disabled on ROCm/HIP runtime {runtime_version}. "
                 "Use the packaged ROCm 7.2.1 DLL/runtime; ROCm 7.1 and older can hang or zero GPU memory."
             )
-        A_fp8 = np.ascontiguousarray(A_fp8, dtype=np.uint8)
-        B_fp8 = np.ascontiguousarray(B_fp8, dtype=np.uint8)
+        A_fp8 = np.ascontiguousarray(a_arr[:M, :lda], dtype=np.uint8)
+        B_fp8 = np.ascontiguousarray(b_arr[:K, :ldb], dtype=np.uint8)
         C = np.empty((M, ldc), dtype=np.float32)
         ret = self._dll.fp8_gemm_test_wmma(
             A_fp8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),

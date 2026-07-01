@@ -194,7 +194,7 @@ x_back = dequantize_e4m3(x_fp8)    # torch.float32, no CPU transfer
 BF16/FP16 support applies to:
 - `quantize_e4m3()` and `quantize_e5m2()` inputs
 - `Fp8LinearFunction` forward/backward
-- `Fp8Linear`, `Fp8ScaledLinear`, and `Fp8ShadowLinear` module parameters and gradients
+- `Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`, `Fp8Conv1d`, and `Fp8Conv2d` module parameters and gradients
 - `Fp8ShadowLinear` master weights, so user-selected BF16/FP16 master weights reduce persistent parameter and gradient VRAM versus FP32
 
 ```python
@@ -214,6 +214,36 @@ model.cuda()
 opt = Adafactor(model.parameters(), relative_step=True)
 ```
 
+#### FP8 Conv1d / Conv2d
+
+`fp8_conv1d`, `fp8_conv2d`, `Fp8Conv1d`, and `Fp8Conv2d` lower convolution to
+an unfold/im2col matrix multiply and reuse the same FP8 scaled linear backend.
+That means hipBLASLt via PyTorch `torch._scaled_mm` is used first when
+available, while the custom gfx12 WMMA path remains the fallback/testing path.
+
+```python
+import torch
+from hip_quant.torch_api import Fp8Conv1d, Fp8Conv2d, fp8_conv1d, fp8_conv2d
+
+x1 = torch.randn(8, 16, 1024, device="cuda", dtype=torch.bfloat16)
+conv1 = Fp8Conv1d(16, 32, kernel_size=3, padding=1,
+                  device="cuda", dtype=torch.bfloat16)
+y1 = conv1(x1)
+y1_func = fp8_conv1d(x1, conv1.weight, conv1.bias, padding=1)
+
+x = torch.randn(8, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
+conv = Fp8Conv2d(3, 64, kernel_size=3, stride=2, padding=1,
+                 device="cuda", dtype=torch.bfloat16)
+
+y = conv(x)
+
+# Functional form mirrors torch.nn.functional.conv2d for numeric parameters.
+y2 = fp8_conv2d(x, conv.weight, conv.bias, stride=2, padding=1)
+```
+
+Supported convolution options: numeric `stride`, `padding`, `dilation`, and
+`groups` with zero padding mode. Inputs and weights must be CUDA/HIP tensors.
+
 **Combined VRAM savings for a 500M-param LLM:**
 Before: ~7.6 GB (Weights 2GB, Acts 1.6GB, AdamW 4GB)
 After: ~0.9 GB (Weights 0.5GB, Acts 0.4GB, Adafactor 4MB)
@@ -226,7 +256,11 @@ from hip_quant.torch_api import Fp8LinearFunction
 out = Fp8LinearFunction.apply(input, weight, bias)  # bias optional
 ```
 
-#### Fused FP8 Linear (gfx12 WMMA kernels)
+#### Fused FP8 Linear Fallback (gfx12 WMMA kernels)
+
+The high-level `Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`, `Fp8Conv1d`,
+and `Fp8Conv2d` APIs try the hipBLASLt-backed PyTorch `_scaled_mm` route first.
+These direct custom WMMA entry points are the fallback/testing path.
 
 These kernels are disabled by default. Enable only after validating your ROCm
 runtime and GPU stability:

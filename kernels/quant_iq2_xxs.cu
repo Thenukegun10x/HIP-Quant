@@ -268,7 +268,6 @@ __global__ void quantize_iq2_xxs_kernel(
             for (int i = 0; i < 8; ++i) u |= ((uint16_t)L[8 * k + i] << (2 * i));
             int grid_index = iq2xxs_map[u];
             if (grid_index < 0) {
-                printf("error at type 16: map miss for u=%u\n", (unsigned)u);
                 grid_index = 0;
             }
             q2[2 * ib + 0] |= ((uint32_t)grid_index << (8 * k));

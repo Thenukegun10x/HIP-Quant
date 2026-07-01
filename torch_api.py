@@ -29,6 +29,7 @@ from typing import Dict, Optional, Set, Tuple, Union
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
@@ -40,6 +41,20 @@ _WMMA_GUARD_CACHE: Dict[int, Tuple[str, str]] = {}
 def _scale_to_float(scale: "torch.Tensor") -> float:
     """Single sync point for legacy scalar-scale FP8 GEMM launchers."""
     return float(scale.item())
+
+
+def _pad_2d_cols(x: "torch.Tensor", multiple: int = 16) -> Tuple["torch.Tensor", int]:
+    pad = (-x.size(1)) % multiple
+    if pad:
+        x = F.pad(x, (0, pad))
+    return x, pad
+
+
+def _pad_2d_rows(x: "torch.Tensor", multiple: int = 16) -> Tuple["torch.Tensor", int]:
+    pad = (-x.size(0)) % multiple
+    if pad:
+        x = F.pad(x, (0, 0, 0, pad))
+    return x, pad
 
 
 def _fp8_linear_backend() -> str:
@@ -77,6 +92,13 @@ def _hipblaslt_fp8_linear_forward(
     if weight_scale != 1.0:
         b = (b * weight_scale).contiguous()
 
+    out_features = b.size(0)
+    a, row_pad = _pad_2d_rows(a)
+    a, k_pad = _pad_2d_cols(a)
+    if k_pad:
+        b = F.pad(b, (0, k_pad))
+    b, n_pad = _pad_2d_rows(b)
+
     scale_a = torch.full((), 1.0 / float(input_scale), device=input.device, dtype=torch.float32)
     scale_b = torch.full((), 1.0 / float(weight_scale), device=input.device, dtype=torch.float32)
     a_fp8 = a.to(torch.float8_e4m3fn)
@@ -88,6 +110,10 @@ def _hipblaslt_fp8_linear_forward(
         if os.environ.get("HIP_QUANT_HIPBLASLT_STRICT", "").lower() in ("1", "true", "yes", "on"):
             raise
         return None
+    if row_pad:
+        out = out[:-row_pad, :]
+    if n_pad:
+        out = out[:, :out_features]
     if bias is not None:
         out = out + bias.unsqueeze(0)
     return out
@@ -116,22 +142,47 @@ def _hipblaslt_fp8_backward(
     w  = weight.contiguous()
     x  = input_f32.contiguous()
 
+    m = go.size(0)
+    n = go.size(1)
+    k = w.size(1)
+
     try:
         # grad_input = go @ w  ->  (M,N) @ (N,K) = (M,K)
         # A = go [M,N] row-major, B = w [N,K] column-major
-        a_gi = go.to(torch.float8_e5m2)                                    # [M,N] row-major
-        b_gi = w.to(torch.float8_e5m2).t().contiguous().t()                # [N,K] column-major
+        go_gi, m_pad = _pad_2d_rows(go)
+        go_gi, n_pad = _pad_2d_cols(go_gi)
+        w_gi = w
+        if n_pad:
+            w_gi = F.pad(w_gi, (0, 0, 0, n_pad))
+        w_gi, k_pad = _pad_2d_cols(w_gi)
+        a_gi = go_gi.to(torch.float8_e5m2)                                  # [M,N] row-major
+        b_gi = w_gi.to(torch.float8_e5m2).t().contiguous().t()              # [N,K] column-major
         s_go = torch.ones((), device=go.device, dtype=torch.float32)
         s_w  = torch.full((), float(weight_scale), device=go.device, dtype=torch.float32)
         grad_input = torch._scaled_mm(a_gi, b_gi, s_go, s_w, out_dtype=go.dtype)
+        if m_pad:
+            grad_input = grad_input[:-m_pad, :]
+        if k_pad:
+            grad_input = grad_input[:, :k]
 
         # grad_weight = go.T @ input  ->  (N,M) @ (M,K) = (N,K)
         # A = go.T [N,M] row-major, B = input [M,K] column-major
-        a_gw = go.t().contiguous().to(torch.float8_e5m2)                   # [N,M] row-major
-        b_gw = x.to(torch.float8_e5m2).t().contiguous().t()                # [M,K] column-major
+        go_t = go.t().contiguous()
+        go_t, n_row_pad = _pad_2d_rows(go_t)
+        go_t, m_col_pad = _pad_2d_cols(go_t)
+        x_gw = x
+        if m_col_pad:
+            x_gw = F.pad(x_gw, (0, 0, 0, m_col_pad))
+        x_gw, k_col_pad = _pad_2d_cols(x_gw)
+        a_gw = go_t.to(torch.float8_e5m2)                                  # [N,M] row-major
+        b_gw = x_gw.to(torch.float8_e5m2).t().contiguous().t()             # [M,K] column-major
         s_go_t = torch.ones((), device=go.device, dtype=torch.float32)
         s_x    = torch.full((), float(input_scale), device=go.device, dtype=torch.float32)
         grad_weight = torch._scaled_mm(a_gw, b_gw, s_go_t, s_x, out_dtype=go.dtype)
+        if n_row_pad:
+            grad_weight = grad_weight[:-n_row_pad, :]
+        if k_col_pad:
+            grad_weight = grad_weight[:, :k]
 
         return (grad_input, grad_weight)
     except RuntimeError:
@@ -247,6 +298,60 @@ def _sim_fp8_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     return dequantize_e5m2(quantize_e5m2(x.contiguous()))
 
 
+def _cpu_fp8_linear_forward(
+    input:        "torch.Tensor",
+    weight:       "torch.Tensor",
+    bias:         Optional["torch.Tensor"],
+    input_scale:  float = 1.0,
+    weight_scale: float = 1.0,
+) -> "torch.Tensor":
+    input_sim = _sim_fp8_e4m3((input * input_scale).contiguous()) * (1.0 / input_scale)
+    weight_sim = _sim_fp8_e4m3((weight * weight_scale).contiguous()) * (1.0 / weight_scale)
+    out = input_sim.float() @ weight_sim.float().t()
+    if bias is not None:
+        out = out + bias.float().unsqueeze(0)
+    return out.to(input.dtype)
+
+
+def _cpu_fp8_linear_backward(
+    grad_output:  "torch.Tensor",
+    weight:       "torch.Tensor",
+    input_f32:    "torch.Tensor",
+    weight_scale: float = 1.0,
+    input_scale:  float = 1.0,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    grad_sim = _sim_fp8_e5m2(grad_output.contiguous()).float()
+    weight_sim = _sim_fp8_e5m2((weight * weight_scale).contiguous()).float() * (1.0 / weight_scale)
+    input_sim = _sim_fp8_e5m2((input_f32 * input_scale).contiguous()).float() * (1.0 / input_scale)
+    grad_input = grad_sim @ weight_sim
+    grad_weight = grad_sim.t() @ input_sim
+    return grad_input.to(grad_output.dtype), grad_weight.to(weight.dtype)
+
+
+def _pair(value: Union[int, Tuple[int, int]], name: str) -> Tuple[int, int]:
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, tuple) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise ValueError(f"{name} must be an int or a 2-tuple")
+
+
+def _conv2d_output_hw(
+    input_h: int,
+    input_w: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+    dilation: Tuple[int, int],
+) -> Tuple[int, int]:
+    out_h = (input_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
+    out_w = (input_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError("fp8_conv2d output spatial size must be positive")
+    return out_h, out_w
+
+
 # ---------------------------------------------------------------------------
 # Fp8LinearFunction — unscaled
 # ---------------------------------------------------------------------------
@@ -294,6 +399,9 @@ class Fp8LinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
+        if not input_c.is_cuda:
+            return _cpu_fp8_linear_forward(input_c, weight_c, bias)
+
         out = _hipblaslt_fp8_linear_forward(input_c, weight_c, bias)
         if out is not None:
             return out
@@ -312,6 +420,13 @@ class Fp8LinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8)
 
         grad_output_c = grad_output.contiguous()
+
+        if not grad_output_c.is_cuda:
+            grad_input, grad_weight = _cpu_fp8_linear_backward(
+                grad_output_c, weight, input_f32, weight_scale=1.0, input_scale=1.0
+            )
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight, grad_bias
 
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
@@ -376,6 +491,9 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight)
 
+        if not input_c.is_cuda:
+            return _cpu_fp8_linear_forward(input_c, weight_c, bias, input_scale, weight_scale)
+
         out = _hipblaslt_fp8_linear_forward(input_c, weight_c, bias, input_scale, weight_scale)
         if out is not None:
             return out
@@ -396,6 +514,14 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
+
+        if not grad_output_c.is_cuda:
+            grad_input, grad_weight = _cpu_fp8_linear_backward(
+                grad_output_c, weight, input_f32,
+                weight_scale=ctx.weight_scale, input_scale=1.0
+            )
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight, grad_bias, None, None
 
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
@@ -586,6 +712,10 @@ class Fp8ScaledLinear(nn.Module):
         x_2d = x.reshape(-1, self.in_features).contiguous()
 
         with torch.no_grad():
+            if self.input_meta.scale.device != x_2d.device:
+                self.input_meta.to(x_2d.device)
+            if self.weight_meta.scale.device != self.weight.device:
+                self.weight_meta.to(self.weight.device)
             self.input_meta.update(x_2d)
             self.weight_meta.update(self.weight)
 
@@ -641,6 +771,361 @@ class Fp8ScaledLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# FP8 Conv2d — im2col lowering into the hipBLASLt-backed FP8 linear path
+# ---------------------------------------------------------------------------
+
+def fp8_conv2d(
+    input:        "torch.Tensor",
+    weight:       "torch.Tensor",
+    bias:         Optional["torch.Tensor"] = None,
+    stride:       Union[int, Tuple[int, int]] = 1,
+    padding:      Union[int, Tuple[int, int]] = 0,
+    dilation:     Union[int, Tuple[int, int]] = 1,
+    groups:       int = 1,
+    input_scale:  Optional[float] = None,
+    weight_scale: Optional[float] = None,
+) -> "torch.Tensor":
+    """FP8 E4M3 conv2d using unfold + the existing FP8 linear backend.
+
+    The lowered matrix multiply is routed through ``Fp8ScaledLinearFunction``,
+    so hipBLASLt is used by default when PyTorch exposes ``torch._scaled_mm``;
+    the custom gfx12 WMMA kernel remains the fallback path.
+    """
+    if input.dim() != 4:
+        raise ValueError("fp8_conv2d: input must be NCHW with shape [N, C, H, W]")
+    if weight.dim() != 4:
+        raise ValueError("fp8_conv2d: weight must have shape [out_channels, in_channels/groups, kH, kW]")
+    if not input.is_cuda or not weight.is_cuda:
+        raise RuntimeError("fp8_conv2d: input and weight must be CUDA/HIP tensors")
+    if input.device != weight.device:
+        raise RuntimeError("fp8_conv2d: input and weight must be on the same device")
+    if bias is not None and (not bias.is_cuda or bias.device != input.device):
+        raise RuntimeError("fp8_conv2d: bias must be on the same CUDA/HIP device as input")
+
+    stride = _pair(stride, "stride")
+    padding = _pair(padding, "padding")
+    dilation = _pair(dilation, "dilation")
+    groups = int(groups)
+    if groups <= 0:
+        raise ValueError("fp8_conv2d: groups must be positive")
+
+    batch, in_channels, input_h, input_w = input.shape
+    out_channels, weight_in_channels, kernel_h, kernel_w = weight.shape
+    if in_channels % groups != 0 or out_channels % groups != 0:
+        raise ValueError("fp8_conv2d: in_channels and out_channels must be divisible by groups")
+    if weight_in_channels != in_channels // groups:
+        raise ValueError("fp8_conv2d: weight channel dimension does not match input channels/groups")
+    if bias is not None and (bias.dim() != 1 or bias.size(0) != out_channels):
+        raise ValueError("fp8_conv2d: bias must have shape [out_channels]")
+
+    out_h, out_w = _conv2d_output_hw(
+        int(input_h), int(input_w), int(kernel_h), int(kernel_w), stride, padding, dilation
+    )
+
+    with torch.no_grad():
+        if input_scale is None:
+            input_scale = _scale_to_float(448.0 / input.detach().abs().max().clamp(min=1e-12))
+        if weight_scale is None:
+            weight_scale = _scale_to_float(448.0 / weight.detach().abs().max().clamp(min=1e-12))
+
+    columns = F.unfold(input.contiguous(), (kernel_h, kernel_w), dilation, padding, stride)
+    locations = columns.size(-1)
+    input_2d = columns.transpose(1, 2).reshape(batch * locations, -1).contiguous()
+    weight_2d = weight.contiguous().reshape(out_channels, -1)
+
+    if groups == 1:
+        k_pad = (-input_2d.size(1)) % 16
+        if k_pad:
+            input_2d = F.pad(input_2d, (0, k_pad))
+            weight_2d = F.pad(weight_2d, (0, k_pad))
+        out_pad = (-out_channels) % 16
+        matmul_bias = bias
+        if out_pad:
+            weight_2d = F.pad(weight_2d, (0, 0, 0, out_pad))
+            matmul_bias = None if bias is None else F.pad(bias, (0, out_pad))
+        out_2d = Fp8ScaledLinearFunction.apply(
+            input_2d, weight_2d, matmul_bias, float(input_scale), float(weight_scale)
+        )
+        if out_pad:
+            out_2d = out_2d[:, :out_channels]
+    else:
+        in_per_group = weight_in_channels * kernel_h * kernel_w
+        out_per_group = out_channels // groups
+        chunks = []
+        for group_idx in range(groups):
+            in_start = group_idx * in_per_group
+            out_start = group_idx * out_per_group
+            group_bias = None if bias is None else bias.narrow(0, out_start, out_per_group).contiguous()
+            group_input = input_2d.narrow(1, in_start, in_per_group).contiguous()
+            group_weight = weight_2d.narrow(0, out_start, out_per_group).contiguous()
+            k_pad = (-in_per_group) % 16
+            if k_pad:
+                group_input = F.pad(group_input, (0, k_pad))
+                group_weight = F.pad(group_weight, (0, k_pad))
+            out_pad = (-out_per_group) % 16
+            if out_pad:
+                group_weight = F.pad(group_weight, (0, 0, 0, out_pad))
+                group_bias = None if group_bias is None else F.pad(group_bias, (0, out_pad))
+            chunks.append(Fp8ScaledLinearFunction.apply(
+                group_input,
+                group_weight,
+                group_bias,
+                float(input_scale),
+                float(weight_scale),
+            )[:, :out_per_group])
+        out_2d = torch.cat(chunks, dim=1)
+
+    return out_2d.reshape(batch, locations, out_channels).transpose(1, 2).reshape(
+        batch, out_channels, out_h, out_w
+    ).contiguous()
+
+
+class Fp8Conv2d(nn.Module):
+    """Drop-in ``nn.Conv2d``-style module backed by ``fp8_conv2d``.
+
+    Only zero-padding mode is implemented. Forward uses E4M3 FP8 with dynamic
+    per-tensor amax scaling and autograd support inherited from the FP8 linear
+    lowering path.
+    """
+
+    def __init__(
+        self,
+        in_channels:  int,
+        out_channels: int,
+        kernel_size:  Union[int, Tuple[int, int]],
+        stride:       Union[int, Tuple[int, int]] = 1,
+        padding:      Union[int, Tuple[int, int]] = 0,
+        dilation:     Union[int, Tuple[int, int]] = 1,
+        groups:       int = 1,
+        bias:         bool = True,
+        padding_mode: str = "zeros",
+        device:       Optional[Union[str, "torch.device"]] = None,
+        dtype:        Optional["torch.dtype"] = None,
+    ) -> None:
+        super().__init__()
+        if padding_mode != "zeros":
+            raise ValueError("Fp8Conv2d only supports padding_mode='zeros'")
+        if in_channels % groups != 0 or out_channels % groups != 0:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+
+        factory = {"device": device, "dtype": dtype}
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _pair(kernel_size, "kernel_size")
+        self.stride = _pair(stride, "stride")
+        self.padding = _pair(padding, "padding")
+        self.dilation = _pair(dilation, "dilation")
+        self.groups = int(groups)
+        self.padding_mode = padding_mode
+
+        self.weight = nn.Parameter(torch.empty(
+            out_channels, in_channels // self.groups, *self.kernel_size, **factory
+        ))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels, **factory))
+        else:
+            self.register_parameter("bias", None)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        return fp8_conv2d(
+            x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"stride={self.stride}, padding={self.padding}, dilation={self.dilation}, "
+            f"groups={self.groups}, bias={self.bias is not None}"
+        )
+
+    @classmethod
+    def from_conv2d(cls, conv: "nn.Conv2d") -> "Fp8Conv2d":
+        """Create an ``Fp8Conv2d`` by copying weights from ``nn.Conv2d``."""
+        layer = cls(
+            conv.in_channels,
+            conv.out_channels,
+            conv.kernel_size,
+            conv.stride,
+            conv.padding,
+            conv.dilation,
+            conv.groups,
+            bias=conv.bias is not None,
+            padding_mode=conv.padding_mode,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+        )
+        with torch.no_grad():
+            layer.weight.copy_(conv.weight)
+            if conv.bias is not None:
+                layer.bias.copy_(conv.bias)
+        return layer
+
+    def to_conv2d(self) -> "nn.Conv2d":
+        """Convert back to a standard ``nn.Conv2d``."""
+        conv = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+            bias=self.bias is not None,
+            padding_mode=self.padding_mode,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        with torch.no_grad():
+            conv.weight.copy_(self.weight)
+            if self.bias is not None:
+                conv.bias.copy_(self.bias)
+        return conv
+
+
+def fp8_conv1d(
+    input:        "torch.Tensor",
+    weight:       "torch.Tensor",
+    bias:         Optional["torch.Tensor"] = None,
+    stride:       int = 1,
+    padding:      int = 0,
+    dilation:     int = 1,
+    groups:       int = 1,
+    input_scale:  Optional[float] = None,
+    weight_scale: Optional[float] = None,
+) -> "torch.Tensor":
+    """FP8 E4M3 conv1d using the same hipBLASLt-backed lowering as conv2d."""
+    if input.dim() != 3:
+        raise ValueError("fp8_conv1d: input must have shape [N, C, L]")
+    if weight.dim() != 3:
+        raise ValueError("fp8_conv1d: weight must have shape [out_channels, in_channels/groups, kL]")
+    out = fp8_conv2d(
+        input.unsqueeze(2),
+        weight.unsqueeze(2),
+        bias,
+        stride=(1, int(stride)),
+        padding=(0, int(padding)),
+        dilation=(1, int(dilation)),
+        groups=groups,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+    )
+    return out.squeeze(2)
+
+
+class Fp8Conv1d(nn.Module):
+    """Drop-in ``nn.Conv1d``-style module backed by ``fp8_conv1d``."""
+
+    def __init__(
+        self,
+        in_channels:  int,
+        out_channels: int,
+        kernel_size:  int,
+        stride:       int = 1,
+        padding:      int = 0,
+        dilation:     int = 1,
+        groups:       int = 1,
+        bias:         bool = True,
+        padding_mode: str = "zeros",
+        device:       Optional[Union[str, "torch.device"]] = None,
+        dtype:        Optional["torch.dtype"] = None,
+    ) -> None:
+        super().__init__()
+        if padding_mode != "zeros":
+            raise ValueError("Fp8Conv1d only supports padding_mode='zeros'")
+        if in_channels % groups != 0 or out_channels % groups != 0:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+
+        factory = {"device": device, "dtype": dtype}
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.dilation = int(dilation)
+        self.groups = int(groups)
+        self.padding_mode = padding_mode
+
+        self.weight = nn.Parameter(torch.empty(
+            out_channels, in_channels // self.groups, self.kernel_size, **factory
+        ))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels, **factory))
+        else:
+            self.register_parameter("bias", None)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        return fp8_conv1d(
+            x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"stride={self.stride}, padding={self.padding}, dilation={self.dilation}, "
+            f"groups={self.groups}, bias={self.bias is not None}"
+        )
+
+    @classmethod
+    def from_conv1d(cls, conv: "nn.Conv1d") -> "Fp8Conv1d":
+        """Create an ``Fp8Conv1d`` by copying weights from ``nn.Conv1d``."""
+        layer = cls(
+            conv.in_channels,
+            conv.out_channels,
+            conv.kernel_size[0],
+            conv.stride[0],
+            conv.padding[0],
+            conv.dilation[0],
+            conv.groups,
+            bias=conv.bias is not None,
+            padding_mode=conv.padding_mode,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+        )
+        with torch.no_grad():
+            layer.weight.copy_(conv.weight)
+            if conv.bias is not None:
+                layer.bias.copy_(conv.bias)
+        return layer
+
+    def to_conv1d(self) -> "nn.Conv1d":
+        """Convert back to a standard ``nn.Conv1d``."""
+        conv = nn.Conv1d(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+            bias=self.bias is not None,
+            padding_mode=self.padding_mode,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        with torch.no_grad():
+            conv.weight.copy_(self.weight)
+            if self.bias is not None:
+                conv.bias.copy_(self.bias)
+        return conv
+
+
+# ---------------------------------------------------------------------------
 # convert_to_fp8 — one-call model converter
 # ---------------------------------------------------------------------------
 
@@ -690,6 +1175,14 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(input_fp8, weight_master)
 
+        if not input_c.is_cuda:
+            input_sim = dequantize_e4m3(input_fp8).float() * (1.0 / input_scale)
+            weight_sim = dequantize_e4m3(weight_fp8.contiguous()).float() * weight_inv_scale
+            out = input_sim @ weight_sim.t()
+            if bias is not None:
+                out = out + bias.float().unsqueeze(0)
+            return out.to(input_c.dtype)
+
         out = _hipblaslt_fp8_linear_forward(
             input_c, weight_master.contiguous(), bias, input_scale, 1.0 / weight_inv_scale
         )
@@ -712,6 +1205,14 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         input_f32 = dequantize_e4m3(input_fp8) * (1.0 / ctx.input_scale)
 
         grad_output_c = grad_output.contiguous()
+
+        if not grad_output_c.is_cuda:
+            grad_input, grad_weight_master = _cpu_fp8_linear_backward(
+                grad_output_c, weight_master, input_f32,
+                weight_scale=ctx.weight_scale, input_scale=1.0
+            )
+            grad_bias = grad_output.sum(0) if bias is not None else None
+            return grad_input, grad_weight_master, None, None, None, grad_bias
 
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
@@ -819,6 +1320,8 @@ class Fp8ShadowLinear(nn.Module):
 
     def _sync_shadow(self) -> None:
         """Re-quantise weight_master → weight_fp8.  Always inside no_grad."""
+        if self.weight_meta.scale.device != self.weight_master.device:
+            self.weight_meta.to(self.weight_master.device)
         self.weight_meta.update(self.weight_master)
         self.weight_fp8.copy_(
             quantize_e4m3((self.weight_master * self.weight_meta.scale).contiguous())
@@ -831,6 +1334,8 @@ class Fp8ShadowLinear(nn.Module):
 
         with torch.no_grad():
             self._sync_shadow()
+            if self.input_meta.scale.device != x_2d.device:
+                self.input_meta.to(x_2d.device)
             self.input_meta.update(x_2d)
 
         out = Fp8ShadowLinearFunction.apply(

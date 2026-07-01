@@ -56,7 +56,6 @@ __global__ void quantize_iq3_s_kernel(
     for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
     for (int i = 0; i < QK_K / 8; ++i) y->signs[i] = 0;
     for (int i = 0; i < IQ3S_N_SCALE; ++i) y->scales[i] = 0;
-    y->qs[0] = 123;
 
     float scales[QK_K / IQ3S_BLOCK_SIZE];
     float max_scale = 0;
@@ -173,7 +172,7 @@ __global__ void quantize_iq3_s_kernel(
             uint16_t u = 0;
             for (int i = 0; i < 4; ++i) u |= ((uint16_t)L[4 * k + i] << (3 * i));
             int grid_index = map[u];
-            if (grid_index < 0) { printf("error at type 21: map miss for u=%u\n", (unsigned)u); grid_index = 0; }
+            if (grid_index < 0) { grid_index = 0; }
             y->qs[qs_pos + k] = (uint8_t)(grid_index & 255);
             y->qh[(ib * (IQ3S_BLOCK_SIZE / 4) + k) / 8] |= (uint8_t)((grid_index >> 8) << ((ib * (IQ3S_BLOCK_SIZE / 4) + k) % 8));
         }

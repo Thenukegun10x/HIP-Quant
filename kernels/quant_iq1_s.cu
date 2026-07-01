@@ -59,7 +59,6 @@ __global__ void quantize_iq1_s_kernel(
     y->d = 0;
     for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
     for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
-    y->qs[0] = 123;
 
     const float x_p[3] = {-1.0f + IQ1S_DELTA, IQ1S_DELTA, 1.0f + IQ1S_DELTA};
     const float x_m[3] = {-1.0f - IQ1S_DELTA, -IQ1S_DELTA, 1.0f - IQ1S_DELTA};

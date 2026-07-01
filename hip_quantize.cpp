@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 
 #if defined(_MSC_VER)
 #define HIP_QUANT_EXPORT __declspec(dllexport)
@@ -89,65 +90,88 @@ extern "C" {
 // Initialization (HIP device + I-Quant lookup tables)
 // ============================================================
 
-static void ensure_initialized() {
+static bool hip_check(hipError_t e, const char *what) {
+    if (e == hipSuccess) return true;
+    fprintf(stderr, "hip_quantize: %s failed: %s\n", what, hipGetErrorString(e));
+    return false;
+}
+
+static void free_iq_tables(void ***ptrs, int count) {
+    for (int i = 0; i < count; ++i) {
+        if (*ptrs[i]) {
+            hipFree(*ptrs[i]);
+            *ptrs[i] = NULL;
+        }
+    }
+}
+
+static bool alloc_copy_table(void **dst, const void *src, size_t bytes, const char *name) {
+    if (!hip_check(hipMalloc(dst, bytes), name)) return false;
+    if (!hip_check(hipMemcpy(*dst, src, bytes, hipMemcpyHostToDevice), name)) {
+        hipFree(*dst);
+        *dst = NULL;
+        return false;
+    }
+    return true;
+}
+
+static bool ensure_initialized() {
     if (!hip_initialized) {
         int count = 0;
-        hipGetDeviceCount(&count);
+        if (!hip_check(hipGetDeviceCount(&count), "hipGetDeviceCount")) return false;
+        if (count <= 0) {
+            fprintf(stderr, "hip_quantize: no HIP devices available\n");
+            return false;
+        }
         device_id = 0;
         int best_cu = 0;
         for (int i = 0; i < count; i++) {
             hipDeviceProp_t p;
-            hipGetDeviceProperties(&p, i);
+            if (!hip_check(hipGetDeviceProperties(&p, i), "hipGetDeviceProperties")) return false;
             if (p.multiProcessorCount > best_cu) {
                 best_cu = p.multiProcessorCount;
                 device_id = i;
             }
         }
-        hipSetDevice(device_id);
-        hipGetDeviceProperties(&props, device_id);
+        if (!hip_check(hipSetDevice(device_id), "hipSetDevice")) return false;
+        if (!hip_check(hipGetDeviceProperties(&props, device_id), "hipGetDeviceProperties")) return false;
         hip_initialized = true;
     }
     if (!iq3xxs_tables_loaded) {
-        hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_grid), h_iq3xxs_grid, sizeof(h_iq3xxs_grid));
-        hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_map), h_iq3xxs_map, sizeof(h_iq3xxs_map));
-        hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_neighbours), h_iq3xxs_neighbours, sizeof(h_iq3xxs_neighbours));
+        if (!hip_check(hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_grid), h_iq3xxs_grid, sizeof(h_iq3xxs_grid)), "copy iq3xxs grid")) return false;
+        if (!hip_check(hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_map), h_iq3xxs_map, sizeof(h_iq3xxs_map)), "copy iq3xxs map")) return false;
+        if (!hip_check(hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_neighbours), h_iq3xxs_neighbours, sizeof(h_iq3xxs_neighbours)), "copy iq3xxs neighbours")) return false;
         iq3xxs_tables_loaded = true;
     }
     if (!iq2xxs_tables_loaded) {
-        hipMemcpyToSymbol(HIP_SYMBOL(d_iq2xxs_grid), h_iq2xxs_grid, sizeof(h_iq2xxs_grid));
-        hipMalloc(&d_iq2xxs_map_data, sizeof(h_iq2xxs_map));
-        hipMalloc(&d_iq2xxs_neighbours_data, sizeof(h_iq2xxs_neighbours));
-        hipMemcpy(d_iq2xxs_map_data, h_iq2xxs_map, sizeof(h_iq2xxs_map), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq2xxs_neighbours_data, h_iq2xxs_neighbours, sizeof(h_iq2xxs_neighbours), hipMemcpyHostToDevice);
+        void **ptrs[] = {(void **)&d_iq2xxs_map_data, (void **)&d_iq2xxs_neighbours_data};
+        if (!hip_check(hipMemcpyToSymbol(HIP_SYMBOL(d_iq2xxs_grid), h_iq2xxs_grid, sizeof(h_iq2xxs_grid)), "copy iq2xxs grid")) return false;
+        if (!alloc_copy_table((void **)&d_iq2xxs_map_data, h_iq2xxs_map, sizeof(h_iq2xxs_map), "copy iq2xxs map")) { free_iq_tables(ptrs, 2); return false; }
+        if (!alloc_copy_table((void **)&d_iq2xxs_neighbours_data, h_iq2xxs_neighbours, sizeof(h_iq2xxs_neighbours), "copy iq2xxs neighbours")) { free_iq_tables(ptrs, 2); return false; }
         iq2xxs_tables_loaded = true;
     }
     if (!iq2xs_tables_loaded) {
-        hipMalloc(&d_iq2xs_grid_data, sizeof(h_iq2xs_grid));
-        hipMalloc(&d_iq2xs_map_data, sizeof(h_iq2xs_map));
-        hipMalloc(&d_iq2xs_neighbours_data, sizeof(h_iq2xs_neighbours));
-        hipMemcpy(d_iq2xs_grid_data, h_iq2xs_grid, sizeof(h_iq2xs_grid), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq2xs_map_data, h_iq2xs_map, sizeof(h_iq2xs_map), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq2xs_neighbours_data, h_iq2xs_neighbours, sizeof(h_iq2xs_neighbours), hipMemcpyHostToDevice);
+        void **ptrs[] = {(void **)&d_iq2xs_grid_data, (void **)&d_iq2xs_map_data, (void **)&d_iq2xs_neighbours_data};
+        if (!alloc_copy_table((void **)&d_iq2xs_grid_data, h_iq2xs_grid, sizeof(h_iq2xs_grid), "copy iq2xs grid")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq2xs_map_data, h_iq2xs_map, sizeof(h_iq2xs_map), "copy iq2xs map")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq2xs_neighbours_data, h_iq2xs_neighbours, sizeof(h_iq2xs_neighbours), "copy iq2xs neighbours")) { free_iq_tables(ptrs, 3); return false; }
         iq2xs_tables_loaded = true;
     }
     if (!iq1s_tables_loaded) {
-        hipMalloc(&d_iq1s_grid_data, sizeof(h_iq1s_grid));
-        hipMalloc(&d_iq1s_map_data, sizeof(h_iq1s_map));
-        hipMalloc(&d_iq1s_neighbours_data, sizeof(h_iq1s_neighbours));
-        hipMemcpy(d_iq1s_grid_data, h_iq1s_grid, sizeof(h_iq1s_grid), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq1s_map_data, h_iq1s_map, sizeof(h_iq1s_map), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq1s_neighbours_data, h_iq1s_neighbours, sizeof(h_iq1s_neighbours), hipMemcpyHostToDevice);
+        void **ptrs[] = {(void **)&d_iq1s_grid_data, (void **)&d_iq1s_map_data, (void **)&d_iq1s_neighbours_data};
+        if (!alloc_copy_table((void **)&d_iq1s_grid_data, h_iq1s_grid, sizeof(h_iq1s_grid), "copy iq1s grid")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq1s_map_data, h_iq1s_map, sizeof(h_iq1s_map), "copy iq1s map")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq1s_neighbours_data, h_iq1s_neighbours, sizeof(h_iq1s_neighbours), "copy iq1s neighbours")) { free_iq_tables(ptrs, 3); return false; }
         iq1s_tables_loaded = true;
     }
     if (!iq3s_tables_loaded) {
-        hipMalloc(&d_iq3s_grid_data, sizeof(h_iq3s_grid));
-        hipMalloc(&d_iq3s_map_data, sizeof(h_iq3s_map));
-        hipMalloc(&d_iq3s_neighbours_data, sizeof(h_iq3s_neighbours));
-        hipMemcpy(d_iq3s_grid_data, h_iq3s_grid, sizeof(h_iq3s_grid), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq3s_map_data, h_iq3s_map, sizeof(h_iq3s_map), hipMemcpyHostToDevice);
-        hipMemcpy(d_iq3s_neighbours_data, h_iq3s_neighbours, sizeof(h_iq3s_neighbours), hipMemcpyHostToDevice);
+        void **ptrs[] = {(void **)&d_iq3s_grid_data, (void **)&d_iq3s_map_data, (void **)&d_iq3s_neighbours_data};
+        if (!alloc_copy_table((void **)&d_iq3s_grid_data, h_iq3s_grid, sizeof(h_iq3s_grid), "copy iq3s grid")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq3s_map_data, h_iq3s_map, sizeof(h_iq3s_map), "copy iq3s map")) { free_iq_tables(ptrs, 3); return false; }
+        if (!alloc_copy_table((void **)&d_iq3s_neighbours_data, h_iq3s_neighbours, sizeof(h_iq3s_neighbours), "copy iq3s neighbours")) { free_iq_tables(ptrs, 3); return false; }
         iq3s_tables_loaded = true;
     }
+    return true;
 }
 
 // ============================================================
@@ -193,6 +217,35 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
         case 36: case 37: return (int)(n_per_row / QK_F8);
         default: return 0;
     }
+}
+
+static bool validate_quant_dims(int64_t nrows, int64_t n_per_row, int n_blocks_per_row) {
+    if (nrows <= 0 || n_per_row <= 0 || n_blocks_per_row <= 0) {
+        fprintf(stderr, "hip_quantize: dimensions must be positive\n");
+        return false;
+    }
+    if (nrows > INT_MAX || n_per_row > INT_MAX || n_blocks_per_row > INT_MAX) {
+        fprintf(stderr, "hip_quantize: dimensions exceed supported int kernel range\n");
+        return false;
+    }
+    if ((uint64_t)nrows > (uint64_t)UINT_MAX || (uint64_t)n_blocks_per_row > (uint64_t)UINT_MAX) {
+        fprintf(stderr, "hip_quantize: grid dimensions exceed dim3 range\n");
+        return false;
+    }
+    return true;
+}
+
+static bool validate_flat_blocks(int64_t total_elements, int64_t elems_per_block, const char *op) {
+    if (total_elements < 0) {
+        fprintf(stderr, "hip_quantize: %s element count is negative\n", op);
+        return false;
+    }
+    int64_t blocks = (total_elements + elems_per_block - 1) / elems_per_block;
+    if (blocks > (int64_t)INT_MAX) {
+        fprintf(stderr, "hip_quantize: %s grid dimension exceeds dim3 range\n", op);
+        return false;
+    }
+    return true;
 }
 
 HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
@@ -241,9 +294,10 @@ HIP_QUANT_EXPORT size_t ggml_row_size_for(int type, int64_t n_per_row) {
 }
 
 HIP_QUANT_EXPORT const char* get_device_name() {
-    static char name[256];
-    ensure_initialized();
+    static thread_local char name[256];
+    if (!ensure_initialized()) return "";
     strncpy(name, props.name, 255);
+    name[255] = '\0';
     return name;
 }
 
@@ -360,6 +414,7 @@ static int dispatch_quantize_kernel(
         }
         case 36: {
             int64_t total = (int64_t)nrows * n_per_row;
+            if (!validate_flat_blocks(total, 256, "quantize_f8_e4m3")) return 0;
             dim3 flatGrid((unsigned int)((total + 255) / 256));
             hipLaunchKernelGGL(quantize_f8_e4m3_kernel, flatGrid, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
@@ -367,6 +422,7 @@ static int dispatch_quantize_kernel(
         }
         case 37: {
             int64_t total = (int64_t)nrows * n_per_row;
+            if (!validate_flat_blocks(total, 256, "quantize_f8_e5m2")) return 0;
             dim3 flatGrid((unsigned int)((total + 255) / 256));
             hipLaunchKernelGGL(quantize_f8_e5m2_kernel, flatGrid, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
@@ -390,7 +446,10 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
     int64_t n_per_row,
     const float* imatrix
 ) {
-    ensure_initialized();
+    if (!ensure_initialized()) return 0;
+
+    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
+    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
 
     size_t row_size = get_row_size(type, n_per_row);
     if (row_size == 0) {
@@ -399,8 +458,6 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
     }
     size_t total_size = row_size * nrows;
     if (total_size == 0) return 0;
-
-    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
 
     size_t src_bytes = (size_t)nrows * n_per_row * sizeof(float);
     size_t dst_bytes = total_size;
@@ -438,7 +495,7 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
-    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, g_d_imatrix, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
+    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
         return 0;
     }
 
@@ -487,7 +544,10 @@ static size_t quantize_tensor_fp8_input_impl(
     const float* imatrix,
     int src_fp8_type
 ) {
-    ensure_initialized();
+    if (!ensure_initialized()) return 0;
+
+    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
+    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
 
     size_t row_size = get_row_size(type, n_per_row);
     if (row_size == 0) {
@@ -497,8 +557,8 @@ static size_t quantize_tensor_fp8_input_impl(
     size_t total_size = row_size * nrows;
     if (total_size == 0) return 0;
 
-    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
     int64_t total_elements = nrows * n_per_row;
+    if (!validate_flat_blocks(total_elements, 256, "fp8 expand")) return 0;
 
     if (type == src_fp8_type && (type == 36 || type == 37)) {
         memcpy(dst, src_fp8, (size_t)total_elements);
@@ -635,7 +695,12 @@ HIP_QUANT_EXPORT int fp8_gemm_test_wmma(
     int ldb,
     int ldc
 ) {
-    ensure_initialized();
+    if (!ensure_initialized()) return 1;
+
+    if (M <= 0 || N <= 0 || K <= 0 || lda < K || ldb < N || ldc < N || (M % 16) != 0 || (N % 16) != 0) {
+        fprintf(stderr, "fp8_gemm: invalid dimensions or leading dimensions\n");
+        return 1;
+    }
 
     const char *disable_wmma = getenv("HIP_QUANT_DISABLE_WMMA");
     if (disable_wmma != NULL && (
@@ -735,7 +800,7 @@ HIP_QUANT_EXPORT int get_device_prop(
     int *warp_size,
     int *max_threads_per_block
 ) {
-    ensure_initialized();
+    if (!ensure_initialized()) return 1;
     strncpy(name_buf, props.name, (size_t)(name_buf_size - 1));
     name_buf[name_buf_size - 1] = '\0';
     *major = props.major;
@@ -749,7 +814,7 @@ HIP_QUANT_EXPORT int get_device_prop(
 }
 
 HIP_QUANT_EXPORT int get_arch_name(char *buf, int buf_size) {
-    ensure_initialized();
+    if (!ensure_initialized()) return 1;
     strncpy(buf, props.gcnArchName, (size_t)(buf_size - 1));
     buf[buf_size - 1] = '\0';
     return 0;
@@ -762,7 +827,11 @@ HIP_QUANT_EXPORT int get_hip_runtime_version() {
 }
 
 HIP_QUANT_EXPORT int get_device_memory(size_t *free_bytes, size_t *total_bytes) {
-    ensure_initialized();
+    if (!ensure_initialized()) {
+        *free_bytes = 0;
+        *total_bytes = 0;
+        return 1;
+    }
     hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
     if (e != hipSuccess) {
         *free_bytes = 0;
@@ -773,7 +842,7 @@ HIP_QUANT_EXPORT int get_device_memory(size_t *free_bytes, size_t *total_bytes) 
 }
 
 HIP_QUANT_EXPORT int device_has_wmma() {
-    ensure_initialized();
+    if (!ensure_initialized()) return 0;
     const char *arch = props.gcnArchName;
     // This reports support for the FP8/BF8 gfx12 w32 intrinsics used by
     // fp8_gemm_wmma_kernel, not general matrix-core or rocWMMA capability.

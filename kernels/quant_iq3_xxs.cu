@@ -213,7 +213,6 @@ __global__ void quantize_iq3_xxs_kernel(
                     u |= ((uint16_t)L[4 * k + i] << (3 * i));
                 int grid_index = d_iq3xxs_map[u];
                 if (grid_index < 0) {
-                    printf("error at type 18: map miss for u=%u\n", (unsigned)u);
                     grid_index = 0;
                 }
                 q3[8 * ib + k] = (uint8_t)grid_index;
