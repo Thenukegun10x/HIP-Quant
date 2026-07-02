@@ -3,11 +3,12 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.5.1"
+__version__ = "0.5.3"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
     "quantize_e5m2",
+    "quantize_e5m2_stochastic",
     "dequantize_e4m3",
     "dequantize_e5m2",
     "fp8_linear_forward",

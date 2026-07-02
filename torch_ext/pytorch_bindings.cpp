@@ -26,6 +26,7 @@
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
 #include <pybind11/pybind11.h>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
@@ -48,8 +49,10 @@ void launch_quant_e4m3(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
 void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
+void launch_quant_e5m2_stochastic(const void* src, uint8_t* dst, int64_t numel,
+                                  int dtype, uint64_t seed, hipStream_t stream);
 void launch_dequant_e4m3(const uint8_t* src, float* dst, int64_t numel,
-                         hipStream_t stream);
+                          hipStream_t stream);
 void launch_dequant_e5m2(const uint8_t* src, float* dst, int64_t numel,
                          hipStream_t stream);
 
@@ -250,6 +253,25 @@ torch::Tensor quantize_e5m2(torch::Tensor input) {
         output.data_ptr<uint8_t>(),
         numel,
         input_dtype,
+        current_stream()
+    );
+    return output;
+}
+
+torch::Tensor quantize_e5m2_stochastic(torch::Tensor input, uint64_t seed) {
+    TORCH_CHECK(input.is_cuda(),       "quantize_e5m2_stochastic: input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "quantize_e5m2_stochastic: input must be contiguous");
+    int input_dtype = float_dtype_code(input, "quantize_e5m2_stochastic: input");
+
+    auto output = torch::empty(input.sizes(),
+                               input.options().dtype(torch::kUInt8));
+    int64_t numel = input.numel();
+    launch_quant_e5m2_stochastic(
+        input.data_ptr(),
+        output.data_ptr<uint8_t>(),
+        numel,
+        input_dtype,
+        seed,
         current_stream()
     );
     return output;
@@ -801,6 +823,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_e5m2",   &quantize_e5m2,
           "Quantize float32 tensor to FP8 E5M2 (uint8) on-device",
           py::arg("input"));
+    m.def("quantize_e5m2_stochastic", &quantize_e5m2_stochastic,
+          "Quantize tensor to FP8 E5M2 (uint8) with stochastic rounding on-device",
+          py::arg("input"), py::arg("seed"));
     m.def("dequantize_e4m3", &dequantize_e4m3,
           "Dequantize FP8 E4M3 (uint8) tensor to float32 on-device",
           py::arg("input"));

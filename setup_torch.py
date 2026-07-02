@@ -47,10 +47,13 @@ def _configure_windows_toolchain():
     rocm_home = Path(os.environ.get("HIP_QUANT_ROCM_HOME", r"C:\Program Files\AMD\ROCm\7.1"))
     if rocm_home.exists():
         rocm_home_short = _short_path(rocm_home)
+        hip_clang_path = rocm_home / "lib" / "llvm" / "bin"
         os.environ["ROCM_HOME"] = rocm_home_short
         os.environ["HIP_PATH"] = rocm_home_short
-        os.environ["HIP_CLANG_PATH"] = _short_path(rocm_home / "bin")
+        os.environ["HIP_CLANG_PATH"] = _short_path(hip_clang_path if hip_clang_path.exists() else rocm_home / "bin")
         _prepend_path(rocm_home / "bin")
+        if hip_clang_path.exists():
+            _prepend_path(hip_clang_path)
 
     if "CC" not in os.environ or "CXX" not in os.environ:
         candidates = glob.glob(
@@ -105,7 +108,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.5.1",
+    version="0.5.3",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

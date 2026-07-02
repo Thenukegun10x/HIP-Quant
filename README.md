@@ -78,7 +78,7 @@ For models trained to be ternary (BitNet, TriLM):
 | `F8_E4M3` | 1s·4e·3m, bias=7, max=±448, NaN only | Forward activations & weights |
 | `F8_E5M2` | 1s·5e·2m, bias=15, max=±57344, ±Inf+NaN | Backward gradients |
 
-Both use OCP standard semantics with round-to-nearest-even. Math is validated against `ml_dtypes` reference — 90/90 test cases pass.
+Default FP8 quantization uses OCP standard semantics with round-to-nearest-even. The PyTorch extension also exposes opt-in stochastic E5M2 rounding for backward gradients.
 
 ---
 
@@ -120,8 +120,8 @@ extension can still be built locally with `setup_torch.py build_ext --inplace`.
 ## 📦 Installation
 
 ```powershell
-# Binary wheel with packaged ROCm 7.2.1 ctypes DLL
-pip install dist/hip_quant-0.4.8-cp312-cp312-win_amd64.whl
+# Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
+pip install dist/hip_quant-0.5.3-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -179,13 +179,43 @@ python -m hip_quant --help
 ```python
 import torch
 from hip_quant.torch_api import quantize_e4m3, dequantize_e4m3
-from hip_quant.torch_api import quantize_e5m2, dequantize_e5m2
+from hip_quant.torch_api import quantize_e5m2, quantize_e5m2_stochastic, dequantize_e5m2
 
 x = torch.randn(1024, 1024, device="cuda")  # stays on GPU the whole time
 
 x_fp8  = quantize_e4m3(x)          # torch.uint8, same shape, same device
 x_back = dequantize_e4m3(x_fp8)    # torch.float32, no CPU transfer
+
+g_fp8 = quantize_e5m2_stochastic(x, seed=1234)  # reproducible stochastic E5M2
 ```
+
+#### Stochastic E5M2 Backward Gradients
+
+E5M2 has the range needed for backward gradients, but only two mantissa bits.
+For tiny gradients, deterministic round-to-nearest-even can repeatedly flush or
+bias values. `quantize_e5m2_stochastic()` rounds between adjacent E5M2 bins with
+probability proportional to the input value's distance between those bins, using
+a stateless per-element hash of `(seed, element_index)`.
+
+Use it directly:
+```python
+from hip_quant.torch_api import quantize_e5m2_stochastic, dequantize_e5m2
+
+grad_fp8 = quantize_e5m2_stochastic(grad, seed=42)
+grad_sim = dequantize_e5m2(grad_fp8)
+```
+
+Enable stochastic E5M2 for FP8 linear backward `grad_output` quantization:
+```powershell
+$env:HIP_QUANT_STOCHASTIC_E5M2 = "1"
+
+# Optional deterministic base seed for reproducible experiments
+$env:HIP_QUANT_STOCHASTIC_E5M2_SEED = "1234"
+```
+
+This path is opt-in. It stochastic-quantizes `grad_output` once, dequantizes
+those exact FP8 choices back to the training dtype, then reuses the existing
+hipBLASLt/custom backward matrix kernels.
 
 #### Fake-FP8 Linear (autograd-safe, Phase 3)
 
@@ -416,18 +446,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-0.4.8-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.4.8.tar.gz"
+  "dist\hip_quant-0.5.3-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.3.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-0.4.8-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.4.8.tar.gz"
+  "dist\hip_quant-0.5.3-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.3.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-0.4.8-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-0.5.3-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:

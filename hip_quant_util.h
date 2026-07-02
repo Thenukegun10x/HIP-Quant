@@ -243,6 +243,67 @@ __device__ inline uint8_t fp32_to_fp8_e5m2(float f) {
     return fp32_bits_to_fp8_e5m2(__float_as_int(f));
 }
 
+__device__ inline uint32_t hip_quant_splitmix32(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x = x ^ (x >> 31);
+    return (uint32_t)(x >> 32);
+}
+
+__device__ inline float hip_quant_uniform01(uint64_t seed, uint64_t idx) {
+    uint32_t r = hip_quant_splitmix32(seed ^ (idx * 0xD1B54A32D192ED03ull));
+    return (float)(r >> 8) * (1.0f / 16777216.0f);
+}
+
+__device__ inline float fp8_e5m2_positive_code_to_fp32(uint8_t code) {
+    uint32_t exp = (code >> 2) & 0x1F;
+    uint32_t mant = code & 0x3;
+
+    if (exp == 0) {
+        return mant == 0 ? 0.0f : (float)mant * 0x1.0p-16f;
+    }
+    return ldexpf(1.0f + 0.25f * (float)mant, (int)exp - 15);
+}
+
+// float32 -> FP8 E5M2 with unbiased stochastic rounding between adjacent bins.
+// NaN/Inf and overflow remain deterministic; finite in-range values round up
+// with probability proportional to their distance from the lower E5M2 value.
+__device__ inline uint8_t fp32_to_fp8_e5m2_stochastic(float f, uint64_t seed, uint64_t idx) {
+    uint32_t u = __float_as_int(f);
+    uint32_t sign = u >> 31;
+    uint32_t abs_u = u & 0x7FFFFFFF;
+
+    if (abs_u == 0) return (uint8_t)(sign << 7);
+    if (abs_u > 0x7F800000) return (uint8_t)((sign << 7) | 0x7F);
+    if (abs_u == 0x7F800000) return (uint8_t)((sign << 7) | 0x7C);
+
+    float af = fabsf(f);
+    if (af > 57344.0f) return (uint8_t)((sign << 7) | 0x7C);
+
+    uint8_t lo = 0;
+    uint8_t hi = 0x7B; // Largest positive finite E5M2 code.
+    while (lo < hi) {
+        uint8_t mid = (uint8_t)((lo + hi + 1) >> 1);
+        if (fp8_e5m2_positive_code_to_fp32(mid) <= af) {
+            lo = mid;
+        } else {
+            hi = (uint8_t)(mid - 1);
+        }
+    }
+
+    float lower = fp8_e5m2_positive_code_to_fp32(lo);
+    if (af == lower || lo == 0x7B) {
+        return (uint8_t)((sign << 7) | lo);
+    }
+
+    uint8_t upper_code = (uint8_t)(lo + 1);
+    float upper = fp8_e5m2_positive_code_to_fp32(upper_code);
+    float p_up = (af - lower) / (upper - lower);
+    uint8_t mag = hip_quant_uniform01(seed, idx) < p_up ? upper_code : lo;
+    return (uint8_t)((sign << 7) | mag);
+}
+
 // bfloat16 -> FP8 E5M2 without first materializing a float value.
 __device__ inline uint8_t bf16_to_fp8_e5m2(uint16_t h) {
     return fp32_bits_to_fp8_e5m2((uint32_t)h << 16);

@@ -36,11 +36,34 @@ except ImportError:
 
 _C = None
 _WMMA_GUARD_CACHE: Dict[int, Tuple[str, str]] = {}
+_STOCHASTIC_E5M2_COUNTER = 0
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 def _scale_to_float(scale: "torch.Tensor") -> float:
     """Single sync point for legacy scalar-scale FP8 GEMM launchers."""
     return float(scale.item())
+
+
+def _stochastic_e5m2_enabled() -> bool:
+    return _env_flag("HIP_QUANT_STOCHASTIC_E5M2")
+
+
+def _next_stochastic_e5m2_seed() -> int:
+    global _STOCHASTIC_E5M2_COUNTER
+    env_seed = os.environ.get("HIP_QUANT_STOCHASTIC_E5M2_SEED")
+    if env_seed is not None:
+        base = int(env_seed, 0)
+    elif _TORCH_AVAILABLE:
+        base = int(torch.initial_seed())
+    else:
+        base = 0x9E3779B97F4A7C15
+    seed = (base + _STOCHASTIC_E5M2_COUNTER * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    _STOCHASTIC_E5M2_COUNTER += 1
+    return seed
 
 
 def _pad_2d_cols(x: "torch.Tensor", multiple: int = 16) -> Tuple["torch.Tensor", int]:
@@ -274,6 +297,19 @@ def quantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     return _load_extension().quantize_e5m2(x.contiguous())
 
 
+def quantize_e5m2_stochastic(x: "torch.Tensor", seed: Optional[int] = None) -> "torch.Tensor":
+    """Quantize to FP8 E5M2 using stochastic rounding on-device.
+
+    Passing ``seed`` makes the result exactly reproducible for the same input.
+    If omitted, a process-local counter is mixed with ``torch.initial_seed()``.
+    """
+    if seed is None:
+        seed = _next_stochastic_e5m2_seed()
+    return _load_extension().quantize_e5m2_stochastic(
+        x.contiguous(), int(seed) & 0xFFFFFFFFFFFFFFFF
+    )
+
+
 def dequantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
     """Dequantize an FP8 E4M3 uint8 tensor to float32 on-device."""
     return _load_extension().dequantize_e4m3(x.contiguous())
@@ -296,6 +332,16 @@ def _sim_fp8_e4m3(x: "torch.Tensor") -> "torch.Tensor":
 def _sim_fp8_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     """Quantize-then-dequantize in E5M2 — applies FP8 quantization noise."""
     return dequantize_e5m2(quantize_e5m2(x.contiguous()))
+
+
+def _prepare_e5m2_backward_grad_output(
+    grad_output: "torch.Tensor",
+) -> Tuple["torch.Tensor", Optional["torch.Tensor"]]:
+    if not _stochastic_e5m2_enabled():
+        return grad_output, None
+    grad_output_fp8 = quantize_e5m2_stochastic(grad_output)
+    grad_output_e5m2 = dequantize_e5m2(grad_output_fp8).to(grad_output.dtype).contiguous()
+    return grad_output_e5m2, grad_output_fp8
 
 
 def _cpu_fp8_linear_forward(
@@ -428,16 +474,19 @@ class Fp8LinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight, grad_bias
 
+        grad_output_for_backward, grad_output_fp8 = _prepare_e5m2_backward_grad_output(grad_output_c)
+
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
-            grad_output_c, weight, input_f32, weight_scale=1.0, input_scale=1.0
+            grad_output_for_backward, weight, input_f32, weight_scale=1.0, input_scale=1.0
         )
         if hipblaslt_result is not None:
             grad_input, grad_weight = hipblaslt_result
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight, grad_bias
 
-        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        if grad_output_fp8 is None:
+            grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
             grad_output_fp8, grad_output_c, weight, 1.0
         )
@@ -523,9 +572,11 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight, grad_bias, None, None
 
+        grad_output_for_backward, grad_output_fp8 = _prepare_e5m2_backward_grad_output(grad_output_c)
+
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
-            grad_output_c, weight, input_f32,
+            grad_output_for_backward, weight, input_f32,
             weight_scale=ctx.weight_scale, input_scale=1.0
         )
         if hipblaslt_result is not None:
@@ -533,7 +584,8 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight, grad_bias, None, None
 
-        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        if grad_output_fp8 is None:
+            grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
             grad_output_fp8, grad_output_c, weight, ctx.weight_scale
         )

@@ -181,6 +181,133 @@ class TestQuantizeE5M2:
             f"1.0 should encode to 0x3C in E5M2, got {out.item():#04x}"
         )
 
+    def test_stochastic_output_contract(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.randn(128, 64, device=device, dtype=torch.float32)
+        out = quantize_e5m2_stochastic(t, seed=123)
+        assert out.dtype == torch.uint8
+        assert out.device.type == device.type
+        assert out.shape == t.shape
+
+    def test_stochastic_rejects_cpu_tensor(self):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        with pytest.raises((RuntimeError, Exception)):
+            quantize_e5m2_stochastic(torch.randn(8, device="cpu"), seed=1)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_stochastic_accepts_half_and_bfloat16(self, device, dtype):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.tensor([1.0, -1.0, 0.0], device=device, dtype=dtype)
+        out = quantize_e5m2_stochastic(t, seed=123)
+        assert out.dtype == torch.uint8
+        assert out.tolist()[:2] == [0x3C, 0xBC]
+
+    def test_stochastic_special_values(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.tensor([float("inf"), -float("inf"), float("nan"), 1e9], device=device)
+        out = quantize_e5m2_stochastic(t, seed=123)
+        assert out[0].item() == 0x7C
+        assert out[1].item() == 0xFC
+        assert out[2].item() & 0x7C == 0x7C
+        assert out[2].item() & 0x03 != 0
+        assert out[3].item() == 0x7C
+
+    def test_stochastic_reproducible_with_seed(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.full((8192,), 1.125, device=device, dtype=torch.float32)
+        a = quantize_e5m2_stochastic(t, seed=111)
+        b = quantize_e5m2_stochastic(t, seed=111)
+        c = quantize_e5m2_stochastic(t, seed=112)
+        assert torch.equal(a, b)
+        assert not torch.equal(a, c)
+
+    def test_stochastic_exact_values_remain_exact(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.full((4096,), 1.0, device=device, dtype=torch.float32)
+        a = quantize_e5m2_stochastic(t, seed=1)
+        b = quantize_e5m2_stochastic(t, seed=2)
+        assert torch.all(a == 0x3C).item()
+        assert torch.equal(a, b)
+
+    def test_stochastic_midpoint_is_unbiased(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic, dequantize_e5m2
+        t = torch.full((32768,), 1.125, device=device, dtype=torch.float32)
+        out = quantize_e5m2_stochastic(t, seed=98765)
+        lower = (out == 0x3C).sum().item()
+        upper = (out == 0x3D).sum().item()
+        assert lower + upper == t.numel()
+        up_ratio = upper / t.numel()
+        assert 0.45 <= up_ratio <= 0.55
+        mean = dequantize_e5m2(out).mean().item()
+        assert mean == pytest.approx(1.125, abs=0.02)
+
+    def test_stochastic_fractional_distance_probability(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        # 1.0625 is 25% of the way from 1.0 (0x3C) to 1.25 (0x3D).
+        t = torch.full((32768,), 1.0625, device=device, dtype=torch.float32)
+        out = quantize_e5m2_stochastic(t, seed=2468)
+        upper = (out == 0x3D).sum().item()
+        up_ratio = upper / t.numel()
+        assert 0.20 <= up_ratio <= 0.30
+
+    def test_stochastic_preserves_negative_bins(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        t = torch.full((32768,), -1.125, device=device, dtype=torch.float32)
+        out = quantize_e5m2_stochastic(t, seed=13579)
+        lower = (out == 0xBC).sum().item()
+        upper = (out == 0xBD).sum().item()
+        assert lower + upper == t.numel()
+        assert 0.45 <= upper / t.numel() <= 0.55
+
+    def test_stochastic_tiny_gradients_do_not_all_flush_to_zero(self, device):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant.torch_api import quantize_e5m2_stochastic
+        # Halfway between zero and the smallest E5M2 subnormal, useful for
+        # catching early-gradient collapse in deterministic underflow cases.
+        t = torch.full((32768,), 2.0 ** -17, device=device, dtype=torch.float32)
+        out = quantize_e5m2_stochastic(t, seed=97531)
+        zeros = (out == 0x00).sum().item()
+        min_subs = (out == 0x01).sum().item()
+        assert zeros + min_subs == t.numel()
+        assert 0.45 <= min_subs / t.numel() <= 0.55
+
+    def test_backward_helper_uses_stochastic_env_flag(self, device, monkeypatch):
+        if not hasattr(_C, "quantize_e5m2_stochastic"):
+            pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
+        from hip_quant import torch_api as hqt
+        t = torch.full((1024,), 1.125, device=device, dtype=torch.float32)
+
+        monkeypatch.delenv("HIP_QUANT_STOCHASTIC_E5M2", raising=False)
+        prepared, fp8 = hqt._prepare_e5m2_backward_grad_output(t)
+        assert prepared is t
+        assert fp8 is None
+
+        monkeypatch.setenv("HIP_QUANT_STOCHASTIC_E5M2", "1")
+        monkeypatch.setenv("HIP_QUANT_STOCHASTIC_E5M2_SEED", "1234")
+        prepared, fp8 = hqt._prepare_e5m2_backward_grad_output(t)
+        assert fp8 is not None
+        assert fp8.dtype == torch.uint8
+        assert torch.equal(prepared, hqt.dequantize_e5m2(fp8).to(t.dtype))
+
 
 # ===========================================================================
 # Phase 1 — dequantize_e4m3
