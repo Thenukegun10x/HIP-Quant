@@ -1,6 +1,7 @@
 include hip_quantize.dll
 include hip_quantize_rocm721.dll
 include libhip_quantize.so
+include _C*.pyd
 include *.h
 include *.cpp
 include build.ps1
@@ -13,7 +14,5 @@ include device_info.py
 include cdna_compat.py
 include setup_torch.py
 include DOCUMENTATION.md
-exclude _C*.pyd
-exclude torch_ext/pytorch_bindings_hip.cpp
 global-exclude __pycache__/*
 global-exclude *.py[cod]

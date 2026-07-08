@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "0.5.3"
+version = "0.5.4"
 description = "HIP/ROCm quantization library for AMD GPUs"
 readme = "README.md"
 authors = [
@@ -34,6 +34,7 @@ packages = ["hip_quant"]
     "hip_quantize.dll",
     "hip_quantize_rocm721.dll",
     "libhip_quantize.so",
+    "_C*.pyd",
     "*.h",
     "*.cpp",
     "build.ps1",
@@ -41,6 +42,7 @@ packages = ["hip_quant"]
     "kernels/*.cu",
     "torch_ext/*.hip",
     "torch_ext/pytorch_bindings.cpp",
+    "torch_ext/pytorch_bindings_hip.cpp",
     "torch_api.py",
     "device_info.py",
     "cdna_compat.py",
