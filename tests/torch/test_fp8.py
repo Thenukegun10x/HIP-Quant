@@ -578,6 +578,31 @@ class TestBlockwiseFp8:
         )
         torch.testing.assert_close(packed, row_major, rtol=0, atol=0)
 
+    def test_v2_lds_staged_wmma_matches_v1(self, device, monkeypatch):
+        """V2 cooperative LDS-staged FP8 kernel matches V1 row-major output."""
+        if not hasattr(_C, "fp8_linear_forward_v2_input_weight"):
+            pytest.skip("extension must be rebuilt with V2 LDS-staged kernel")
+        monkeypatch.setenv("HIP_QUANT_ENABLE_GFX12_WMMA", "1")
+        from hip_quant.torch_api import (
+            fp8_linear_forward_fp8_input_weight,
+            fp8_linear_forward_v2_input_weight,
+            quantize_e4m3,
+        )
+
+        torch.manual_seed(789)
+        x = torch.randn(17, 33, device=device, dtype=torch.bfloat16)
+        w = torch.randn(19, 33, device=device, dtype=torch.bfloat16)
+        x_fp8 = quantize_e4m3(x)
+        w_fp8 = quantize_e4m3(w)
+
+        v1 = fp8_linear_forward_fp8_input_weight(
+            x_fp8, w_fp8, x, weight_inv_scale=1.0, input_scale=1.0, bias=None
+        )
+        v2 = fp8_linear_forward_v2_input_weight(
+            x_fp8, w_fp8, x, weight_inv_scale=1.0, input_scale=1.0, bias=None
+        )
+        torch.testing.assert_close(v2, v1, rtol=0, atol=0)
+
 
 # ===========================================================================
 # Phase 3 — Fp8LinearFunction autograd

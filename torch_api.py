@@ -1710,6 +1710,22 @@ def fp8_linear_forward_fp8_input_weight_packed(
     )
 
 
+def fp8_linear_forward_v2_input_weight(
+    input_fp8:           "torch.Tensor",
+    weight_fp8:          "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    weight_inv_scale:    float,
+    input_scale:         float,
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """V2 cooperative LDS-staged FP8 linear using pre-quantized E4M3 input and weight."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_forward_v2_input_weight(
+        input_fp8.contiguous(), weight_fp8.contiguous(), output_dtype_source,
+        float(weight_inv_scale), float(input_scale), bias
+    )
+
+
 def fp8_linear_forward_blockwise_quantized(
     input_fp8:           "torch.Tensor",
     input_scales:        "torch.Tensor",
