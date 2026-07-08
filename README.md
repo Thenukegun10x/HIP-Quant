@@ -217,6 +217,80 @@ This path is opt-in. It stochastic-quantizes `grad_output` once, dequantizes
 those exact FP8 choices back to the training dtype, then reuses the existing
 hipBLASLt/custom backward matrix kernels.
 
+#### Block-wise FP8 Scaling
+
+The PyTorch extension also exposes block-wise FP8 quantization. Values are stored
+as raw FP8 bytes plus one FP32 dequant scale per block along the last dimension:
+
+```text
+real_value ~= fp8_value * fp32_block_scale
+```
+
+For an input shape `[..., K]`, the scale tensor has shape
+`[..., ceil(K / block_size)]`.
+
+```python
+from hip_quant.torch_api import (
+    quantize_e4m3_blockwise,
+    quantize_e5m2_blockwise,
+    quantize_e5m2_blockwise_stochastic,
+    dequantize_e4m3_blockwise,
+    refresh_fp8_blockwise_shadow,
+)
+
+x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
+grad = torch.randn_like(x)
+weight = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+
+# Forward activations/weights: E4M3 + FP32 per-block scales
+x_fp8, x_scales = quantize_e4m3_blockwise(x, block_size=32)
+x_back = dequantize_e4m3_blockwise(x_fp8, x_scales, block_size=32)
+
+# Backward gradients: E5M2 + stochastic rounding + FP32 per-block scales
+g_fp8, g_scales = quantize_e5m2_blockwise_stochastic(grad, block_size=32, seed=1234)
+
+# Master weight -> block-wise FP8 shadow buffers
+weight_fp8, weight_scales = refresh_fp8_blockwise_shadow(weight, block_size=32)
+```
+
+Block-wise scaling is useful when a tensor has uneven dynamic range across its
+last dimension. It usually reduces FP8 quantization error compared with one
+global scale for the entire tensor. Existing per-tensor FP8 APIs remain unchanged.
+
+#### Block-scaled Linear and Adafactor Kernel Helpers
+
+Two lower-level training helpers are available for experiments and future fused
+training paths:
+
+```python
+from hip_quant.torch_api import (
+    adafactor_row_col_mean_square,
+    fp8_linear_forward_blockwise,
+    fp8_linear_forward_blockwise_quantized,
+)
+
+# GPU-side Adafactor 2-D statistics
+row_ms, col_ms = adafactor_row_col_mean_square(grad_2d, eps=1e-30)
+
+# Convenience path: quantize input/weight block-wise, then run block-scaled FP8 linear
+out = fp8_linear_forward_blockwise(input, weight, bias=bias, block_size=32)
+
+# Pre-quantized path: consumes FP8 bytes + FP32 scale tensors directly
+out = fp8_linear_forward_blockwise_quantized(
+    input_fp8, input_scales,
+    weight_fp8, weight_scales,
+    output_dtype_source=input,
+    block_size=32,
+    bias=bias,
+)
+```
+
+The current block-scaled linear kernel is correctness-first and intentionally
+does not use gfx12 WMMA yet. It validates the `FP8 bytes + per-block scales`
+layout and math before replacing the inner loop with a tiled/WMMA or rocBLASLt
+implementation. The Adafactor helper computes row/column mean-square statistics;
+it is not a full fused optimizer step yet.
+
 #### Fake-FP8 Linear (autograd-safe, Phase 3)
 
 `Fp8LinearFunction` uses **E4M3** for forward activations/weights and **E5M2** for backward gradients. It accepts `torch.float32`, `torch.float16`, and `torch.bfloat16` inputs/weights. It also implements **Activation Compression**, saving `uint8` tensors in the autograd graph to cut activation VRAM by 4× versus FP32, and 2× versus FP16/BF16.
@@ -303,6 +377,7 @@ from hip_quant import (
     fp8_linear_forward,
     fp8_linear_forward_scaled,
     fp8_linear_forward_fp8_weight,
+    fp8_linear_forward_blockwise,
     fp8_linear_backward_input,
     fp8_linear_backward_input_scaled,
     fp8_linear_backward_weight,
@@ -319,6 +394,9 @@ grad_wt    = fp8_linear_backward_weight(grad_output, input)
 out_scaled = fp8_linear_forward_scaled(input, weight, bias, input_scale, weight_scale)
 grad_in_s  = fp8_linear_backward_input_scaled(grad_output, weight, weight_scale)
 grad_wt_s  = fp8_linear_backward_weight_scaled(grad_output, input, input_scale)
+
+# Correctness-first block-scaled FP8 path, no WMMA requirement
+out_block = fp8_linear_forward_blockwise(input, weight, bias, block_size=32)
 ```
 
 These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
@@ -498,6 +576,7 @@ hip_quant/
 - **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
-- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`; scalar scale metadata is passed through legacy float launcher arguments. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
-- **Phase 4 GEMM** is a correctness-first tiled stub. Replace the inner loop with a `rocBLASLt` FP8 GEMM path for production throughput once validated on your ROCm stack
+- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`; scalar scale metadata is passed through legacy float launcher arguments, while block-wise FP8 metadata stays in device FP32 scale tensors. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
+- **Phase 4 GEMM** includes gfx12 WMMA per-tensor-scale paths plus a correctness-first block-scaled FP8 linear path. Replace the block-scaled inner loop with tiled WMMA or `rocBLASLt` FP8 GEMM for production throughput once validated on your ROCm stack
+- **Adafactor kernel support** currently covers GPU-side row/column mean-square reductions for 2-D gradients. A fully fused Adafactor update kernel is a future optimization target.
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly

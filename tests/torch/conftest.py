@@ -14,6 +14,18 @@ import sys
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_torch_api_extension_cache():
+    """Undo CPU mock injection from tests/test_pipeline.py before GPU tests."""
+    try:
+        import hip_quant.torch_api as torch_api
+
+        torch_api._C = None
+    except Exception:
+        pass
+    yield
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if os.environ.get("HIP_QUANT_PYTEST_NO_FORCE_EXIT", "").lower() in {"1", "true", "yes", "on"}:

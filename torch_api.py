@@ -310,6 +310,60 @@ def quantize_e5m2_stochastic(x: "torch.Tensor", seed: Optional[int] = None) -> "
     )
 
 
+def quantize_e4m3_blockwise(
+    x: "torch.Tensor",
+    block_size: int = 32,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Quantize to FP8 E4M3 with one FP32 dequant scale per last-dim block.
+
+    Returns ``(fp8_bytes, scales)``. For an input shape ``[..., K]``, scales has
+    shape ``[..., ceil(K / block_size)]`` and represents ``real ~= fp8 * scale``.
+    """
+    return _load_extension().quantize_e4m3_blockwise(x.contiguous(), int(block_size))
+
+
+def quantize_e5m2_blockwise(
+    x: "torch.Tensor",
+    block_size: int = 32,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Quantize to FP8 E5M2 with one FP32 dequant scale per last-dim block."""
+    return _load_extension().quantize_e5m2_blockwise(x.contiguous(), int(block_size))
+
+
+def quantize_e5m2_blockwise_stochastic(
+    x: "torch.Tensor",
+    block_size: int = 32,
+    seed: Optional[int] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Block-wise E5M2 quantization with stochastic rounding inside each scale block."""
+    if seed is None:
+        seed = _next_stochastic_e5m2_seed()
+    return _load_extension().quantize_e5m2_blockwise_stochastic(
+        x.contiguous(), int(block_size), int(seed) & 0xFFFFFFFFFFFFFFFF
+    )
+
+
+def refresh_fp8_blockwise_shadow(
+    weight: "torch.Tensor",
+    weight_fp8: Optional["torch.Tensor"] = None,
+    weight_scales: Optional["torch.Tensor"] = None,
+    block_size: int = 32,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Quantize a master weight into block-wise E4M3 shadow storage.
+
+    If ``weight_fp8`` and/or ``weight_scales`` are provided, they are updated
+    in-place and returned. Otherwise new tensors are allocated.
+    """
+    q, scales = quantize_e4m3_blockwise(weight, block_size)
+    if weight_fp8 is not None:
+        weight_fp8.copy_(q)
+        q = weight_fp8
+    if weight_scales is not None:
+        weight_scales.copy_(scales)
+        scales = weight_scales
+    return q, scales
+
+
 def dequantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
     """Dequantize an FP8 E4M3 uint8 tensor to float32 on-device."""
     return _load_extension().dequantize_e4m3(x.contiguous())
@@ -318,6 +372,36 @@ def dequantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
 def dequantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     """Dequantize an FP8 E5M2 uint8 tensor to float32 on-device."""
     return _load_extension().dequantize_e5m2(x.contiguous())
+
+
+def dequantize_e4m3_blockwise(
+    x: "torch.Tensor",
+    scales: "torch.Tensor",
+    block_size: int = 32,
+) -> "torch.Tensor":
+    """Dequantize block-wise FP8 E4M3 bytes using FP32 dequant scales."""
+    return _load_extension().dequantize_e4m3_blockwise(
+        x.contiguous(), scales.contiguous(), int(block_size)
+    )
+
+
+def dequantize_e5m2_blockwise(
+    x: "torch.Tensor",
+    scales: "torch.Tensor",
+    block_size: int = 32,
+) -> "torch.Tensor":
+    """Dequantize block-wise FP8 E5M2 bytes using FP32 dequant scales."""
+    return _load_extension().dequantize_e5m2_blockwise(
+        x.contiguous(), scales.contiguous(), int(block_size)
+    )
+
+
+def adafactor_row_col_mean_square(
+    grad: "torch.Tensor",
+    eps: float = 0.0,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Compute Adafactor 2-D row/column mean-square stats on-device."""
+    return _load_extension().adafactor_row_col_mean_square(grad.contiguous(), float(eps))
 
 
 # ===========================================================================
@@ -1601,6 +1685,62 @@ def fp8_linear_forward_fp8_input_weight(
     return _load_extension().fp8_linear_forward_fp8_input_weight(
         input_fp8.contiguous(), weight_fp8.contiguous(), output_dtype_source,
         float(weight_inv_scale), float(input_scale), bias
+    )
+
+
+def pack_fp8_weight_for_wmma(weight_fp8: "torch.Tensor") -> "torch.Tensor":
+    """Pack row-major E4M3 weight bytes into the custom WMMA forward layout."""
+    return _load_extension().pack_fp8_weight_for_wmma(weight_fp8.contiguous())
+
+
+def fp8_linear_forward_fp8_input_weight_packed(
+    input_fp8:           "torch.Tensor",
+    weight_packed:       "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    output_features:     int,
+    weight_inv_scale:    float,
+    input_scale:         float,
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Scaled FP8 linear using pre-quantized input and packed custom-WMMA weight."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_forward_fp8_input_weight_packed(
+        input_fp8.contiguous(), weight_packed.contiguous(), output_dtype_source,
+        int(output_features), float(weight_inv_scale), float(input_scale), bias
+    )
+
+
+def fp8_linear_forward_blockwise_quantized(
+    input_fp8:           "torch.Tensor",
+    input_scales:        "torch.Tensor",
+    weight_fp8:          "torch.Tensor",
+    weight_scales:       "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    block_size:          int = 32,
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Fused block-scaled FP8 linear from pre-quantized E4M3 tensors."""
+    return _load_extension().fp8_linear_forward_blockwise(
+        input_fp8.contiguous(), input_scales.contiguous(),
+        weight_fp8.contiguous(), weight_scales.contiguous(),
+        output_dtype_source, int(block_size), bias
+    )
+
+
+def fp8_linear_forward_blockwise(
+    input:      "torch.Tensor",
+    weight:     "torch.Tensor",
+    bias:       Optional["torch.Tensor"] = None,
+    block_size: int = 32,
+) -> "torch.Tensor":
+    """Quantize input/weight block-wise then run fused block-scaled FP8 linear."""
+    input_2d = input.contiguous()
+    weight_2d = weight.contiguous()
+    input_fp8, input_scales = quantize_e4m3_blockwise(input_2d, block_size)
+    weight_fp8, weight_scales = quantize_e4m3_blockwise(weight_2d, block_size)
+    return fp8_linear_forward_blockwise_quantized(
+        input_fp8, input_scales, weight_fp8, weight_scales,
+        input_2d, block_size, bias
     )
 
 

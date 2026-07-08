@@ -25,6 +25,7 @@
 #define TILE_M 16
 #define TILE_N 16
 #define TILE_K 16
+#define WAVES_PER_BLOCK_N 16
 
 typedef float v8f __attribute__((ext_vector_type(8)));
 typedef int   v2i __attribute__((ext_vector_type(2)));
@@ -232,9 +233,53 @@ void fp8_gemm_e4m3_input_fp8_kernel(
     }
 }
 
+// Correctness-first fused block-scaled FP8 linear:
+// C[M,N] = dequant(A_fp8[M,K], A_scales[M,KB]) @ dequant(B_fp8[N,K], B_scales[N,KB]).T + bias
+// This intentionally avoids gfx12 WMMA so the block-scale API can be validated
+// independently before an optimized tiled implementation is added.
+__global__
+__launch_bounds__(256, 4)
+void fp8_gemm_e4m3_blockwise_naive_kernel(
+    const uint8_t * __restrict__ A_fp8,
+    const float   * __restrict__ A_scales,
+    const uint8_t * __restrict__ B_fp8,
+    const float   * __restrict__ B_scales,
+    void          * __restrict__ C,
+    const void    * __restrict__ bias,
+    int M, int N, int K,
+    int blocks_per_row,
+    int block_size,
+    int c_dtype, int bias_dtype, bool has_bias
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)M * N;
+    if (idx >= total) return;
+
+    int m = (int)(idx / N);
+    int n = (int)(idx - (int64_t)m * N);
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < blocks_per_row; ++kb) {
+        int k_start = kb * block_size;
+        int k_end = k_start + block_size;
+        if (k_end > K) k_end = K;
+        float scale = A_scales[m * blocks_per_row + kb] * B_scales[n * blocks_per_row + kb];
+        float partial = 0.0f;
+        for (int k = k_start; k < k_end; ++k) {
+            float av = fp8_e4m3_to_fp32(A_fp8[m * K + k]);
+            float bv = fp8_e4m3_to_fp32(B_fp8[n * K + k]);
+            partial += av * bv;
+        }
+        acc += partial * scale;
+    }
+
+    if (has_bias) acc += load_float_input(bias, bias_dtype, n);
+    store_float_output(C, c_dtype, idx, acc);
+}
+
 // Same forward GEMM, but both A and B are already scaled E4M3 bytes.
 __global__
-__launch_bounds__(32, 1)
+__launch_bounds__(32 * WAVES_PER_BLOCK_N, 2)
 void fp8_gemm_e4m3_input_weight_fp8_kernel(
     const uint8_t * __restrict__ A_fp8,   // [M, K]
     const uint8_t * __restrict__ B_fp8,   // [N, K]
@@ -244,12 +289,13 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
     float out_scale,
     int c_dtype, int bias_dtype, bool has_bias
 ) {
-    int m = blockIdx.y * TILE_M;
-    int n = blockIdx.x * TILE_N;
-    if (m >= M || n >= N) return;
+    int wave = threadIdx.x >> 5;
+    int tid = threadIdx.x & 31;
+    if (wave >= WAVES_PER_BLOCK_N) return;
 
-    int tid = threadIdx.x;
-    if (tid >= 32) return;
+    int m = blockIdx.y * TILE_M;
+    int n = (blockIdx.x * WAVES_PER_BLOCK_N + wave) * TILE_N;
+    if (m >= M || n >= N) return;
 
     int lane_wrapped = tid & 15;
     int lane_group   = tid >> 4;
@@ -273,6 +319,91 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
             int b_col = n + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
                 (b_row < K && b_col < N) ? B_fp8[b_col * K + b_row] : 0;
+        }
+
+        v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
+        v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int row = m + lane_group * 8 + i;
+        int col = n + lane_wrapped;
+        if (row < M && col < N) {
+            float value = acc[i] * out_scale;
+            if (has_bias) value += load_float_input(bias, bias_dtype, col);
+            store_float_output(C, c_dtype, row * N + col, value);
+        }
+    }
+}
+
+__global__
+__launch_bounds__(256, 4)
+void pack_fp8_weight_wmma_kernel(
+    const uint8_t * __restrict__ B_fp8,      // [N, K]
+    uint8_t       * __restrict__ B_packed,   // [NT, KT, 16, 16]
+    int N, int K, int n_tiles, int k_tiles
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)n_tiles * k_tiles * TILE_K * TILE_N;
+    if (idx >= total) return;
+
+    int n_off = (int)(idx % TILE_N);
+    int t = (int)(idx / TILE_N);
+    int k_off = t % TILE_K;
+    t /= TILE_K;
+    int k_tile = t % k_tiles;
+    int n_tile = t / k_tiles;
+
+    int n = n_tile * TILE_N + n_off;
+    int k = k_tile * TILE_K + k_off;
+    B_packed[idx] = (n < N && k < K) ? B_fp8[n * K + k] : 0;
+}
+
+__global__
+__launch_bounds__(32 * WAVES_PER_BLOCK_N, 2)
+void fp8_gemm_e4m3_input_weight_fp8_packed_kernel(
+    const uint8_t * __restrict__ A_fp8,     // [M, K]
+    const uint8_t * __restrict__ B_packed,  // [NT, KT, 16, 16]
+    void          * __restrict__ C,         // [M, N]
+    const void    * __restrict__ bias,
+    int M, int N, int K,
+    int k_tiles,
+    float out_scale,
+    int c_dtype, int bias_dtype, bool has_bias
+) {
+    int wave = threadIdx.x >> 5;
+    int tid = threadIdx.x & 31;
+    if (wave >= WAVES_PER_BLOCK_N) return;
+
+    int m = blockIdx.y * TILE_M;
+    int n_tile = blockIdx.x * WAVES_PER_BLOCK_N + wave;
+    int n = n_tile * TILE_N;
+    if (m >= M || n >= N) return;
+
+    int lane_wrapped = tid & 15;
+    int lane_group   = tid >> 4;
+
+    v8f acc = (v8f){};
+
+    for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
+        int k = k_tile * TILE_K;
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int k_offset = lane_group * 8 + i;
+
+            int a_row = m + lane_wrapped;
+            int a_col = k + k_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < M && a_col < K) ? A_fp8[a_row * K + a_col] : 0;
+
+            int b_col = n + lane_wrapped;
+            int64_t b_idx = (((int64_t)n_tile * k_tiles + k_tile) * TILE_K + k_offset) * TILE_N + lane_wrapped;
+            ((uint8_t*)b_packed)[i] = (b_col < N) ? B_packed[b_idx] : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -598,12 +729,62 @@ void launch_fp8_linear_forward_fp8_input_weight(
     int c_dtype, int bias_dtype, bool has_bias,
     hipStream_t stream
 ) {
-    dim3 block(32);
-    dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+    dim3 block(32 * WAVES_PER_BLOCK_N);
+    dim3 grid((N + TILE_N * WAVES_PER_BLOCK_N - 1) / (TILE_N * WAVES_PER_BLOCK_N),
+              (M + TILE_M - 1) / TILE_M);
     float out_scale = weight_inv_scale / input_scale;
     hipLaunchKernelGGL(fp8_gemm_e4m3_input_weight_fp8_kernel, grid, block, 0, stream,
                        A_fp8, B_fp8, C, bias, M, N, K, out_scale, c_dtype,
                        bias_dtype, has_bias);
+}
+
+void launch_pack_fp8_weight_for_wmma(
+    const uint8_t* B_fp8, uint8_t* B_packed,
+    int N, int K, int n_tiles, int k_tiles,
+    hipStream_t stream
+) {
+    int64_t total = (int64_t)n_tiles * k_tiles * TILE_K * TILE_N;
+    if (total == 0) return;
+    int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(pack_fp8_weight_wmma_kernel,
+                       dim3((uint32_t)blocks), dim3(threads), 0, stream,
+                       B_fp8, B_packed, N, K, n_tiles, k_tiles);
+}
+
+void launch_fp8_linear_forward_fp8_input_weight_packed(
+    const uint8_t* A_fp8, const uint8_t* B_packed, void* C, const void* bias,
+    int M, int N, int K, int k_tiles,
+    float input_scale, float weight_inv_scale,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream
+) {
+    dim3 block(32 * WAVES_PER_BLOCK_N);
+    dim3 grid((N + TILE_N * WAVES_PER_BLOCK_N - 1) / (TILE_N * WAVES_PER_BLOCK_N),
+              (M + TILE_M - 1) / TILE_M);
+    float out_scale = weight_inv_scale / input_scale;
+    hipLaunchKernelGGL(fp8_gemm_e4m3_input_weight_fp8_packed_kernel, grid, block, 0, stream,
+                       A_fp8, B_packed, C, bias, M, N, K, k_tiles, out_scale,
+                       c_dtype, bias_dtype, has_bias);
+}
+
+void launch_fp8_linear_forward_blockwise(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int blocks_per_row, int block_size,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream
+) {
+    int64_t total = (int64_t)M * N;
+    if (total == 0) return;
+    int threads = 256;
+    int64_t blocks64 = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(fp8_gemm_e4m3_blockwise_naive_kernel,
+                       dim3((uint32_t)blocks64), dim3(threads), 0, stream,
+                       A_fp8, A_scales, B_fp8, B_scales, C, bias,
+                       M, N, K, blocks_per_row, block_size,
+                       c_dtype, bias_dtype, has_bias);
 }
 
 void launch_fp8_linear_backward_input(

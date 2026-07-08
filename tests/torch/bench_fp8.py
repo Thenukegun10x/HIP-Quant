@@ -18,6 +18,9 @@ from hip_quant.torch_api import (
     Fp8ShadowLinear,
     dequantize_e4m3,
     dequantize_e5m2,
+    fp8_linear_forward_fp8_input_weight,
+    fp8_linear_forward_fp8_input_weight_packed,
+    pack_fp8_weight_for_wmma,
     quantize_e4m3,
     quantize_e5m2,
 )
@@ -109,6 +112,16 @@ def main() -> None:
         def hipblaslt_scaled_mm_precast() -> None:
             torch._scaled_mm(inp_f8, weight_f8_t, scale_a, scale_b, out_dtype=torch.bfloat16)
 
+        def custom_wmma_precast() -> None:
+            fp8_linear_forward_fp8_input_weight(
+                quantize_e4m3(inp_detached),
+                quantize_e4m3(weight),
+                inp_detached,
+                weight_inv_scale=1.0,
+                input_scale=1.0,
+                bias=None,
+            )
+
         def hipblaslt_scaled_mm_with_cast() -> None:
             torch._scaled_mm(
                 inp_detached.to(torch.float8_e4m3fn),
@@ -122,6 +135,39 @@ def main() -> None:
         try:
             print(f"precast FP8:      {_time_cuda(hipblaslt_scaled_mm_precast, warmup=5, iters=20):.3f} ms")
             print(f"cast+matmul:      {_time_cuda(hipblaslt_scaled_mm_with_cast, warmup=3, iters=10):.3f} ms")
+            if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() in {"1", "true", "yes", "on"}:
+                input_fp8 = quantize_e4m3(inp_detached)
+                weight_fp8 = quantize_e4m3(weight)
+                weight_packed = pack_fp8_weight_for_wmma(weight_fp8)
+
+                def custom_wmma_prequantized() -> None:
+                    fp8_linear_forward_fp8_input_weight(
+                        input_fp8,
+                        weight_fp8,
+                        inp_detached,
+                        weight_inv_scale=1.0,
+                        input_scale=1.0,
+                        bias=None,
+                    )
+
+                def custom_wmma_prepacked() -> None:
+                    fp8_linear_forward_fp8_input_weight_packed(
+                        input_fp8,
+                        weight_packed,
+                        inp_detached,
+                        output_features=weight.size(0),
+                        weight_inv_scale=1.0,
+                        input_scale=1.0,
+                        bias=None,
+                    )
+
+                def custom_pack_weight() -> None:
+                    pack_fp8_weight_for_wmma(weight_fp8)
+
+                print(f"custom WMMA precast: {_time_cuda(custom_wmma_prequantized, warmup=5, iters=20):.3f} ms")
+                print(f"custom WMMA prepacked: {_time_cuda(custom_wmma_prepacked, warmup=5, iters=20):.3f} ms")
+                print(f"custom pack weight: {_time_cuda(custom_pack_weight, warmup=3, iters=10):.3f} ms")
+                print(f"custom quant+WMMA:  {_time_cuda(custom_wmma_precast, warmup=3, iters=10):.3f} ms")
         except RuntimeError as exc:
             print(f"hipBLASLt raw: {exc}")
     else:

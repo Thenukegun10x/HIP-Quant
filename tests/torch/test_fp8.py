@@ -69,6 +69,10 @@ def fp8_e5m2_tensor(float32_tensor):
     return quantize_e5m2(float32_tensor)
 
 
+def _expanded_scales(scales, cols, block_size):
+    return scales.repeat_interleave(block_size, dim=-1)[..., :cols]
+
+
 # ===========================================================================
 # Phase 1 — quantize_e4m3
 # ===========================================================================
@@ -383,6 +387,196 @@ class TestDequantizeE5M2:
         ref  = float32_tensor.abs().clamp(min=1e-6)
         rel  = (diff / ref).mean().item()
         assert rel < 0.35, f"E5M2 round-trip mean relative error too large: {rel:.4f}"
+
+
+# ===========================================================================
+# Phase 1 — block-wise FP8 quantize / dequantize
+# ===========================================================================
+
+class TestBlockwiseFp8:
+    def test_e4m3_contract(self, device):
+        if not hasattr(_C, "quantize_e4m3_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import quantize_e4m3_blockwise
+
+        x = torch.randn(3, 70, device=device, dtype=torch.float32)
+        q, scales = quantize_e4m3_blockwise(x, block_size=16)
+
+        assert q.dtype == torch.uint8
+        assert q.shape == x.shape
+        assert q.device == x.device
+        assert scales.dtype == torch.float32
+        assert scales.shape == (3, 5)
+        assert scales.device == x.device
+        assert torch.all(scales > 0)
+
+    def test_e4m3_matches_scaled_elementwise(self, device):
+        if not hasattr(_C, "quantize_e4m3_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import (
+            dequantize_e4m3,
+            dequantize_e4m3_blockwise,
+            quantize_e4m3,
+            quantize_e4m3_blockwise,
+        )
+
+        torch.manual_seed(123)
+        x = torch.randn(4, 70, device=device, dtype=torch.float32)
+        x[:, 32:] *= 0.015625
+        block_size = 16
+
+        q, scales = quantize_e4m3_blockwise(x, block_size)
+        y = dequantize_e4m3_blockwise(q, scales, block_size)
+
+        scale_full = _expanded_scales(scales, x.size(-1), block_size)
+        expected = dequantize_e4m3(quantize_e4m3((x / scale_full).contiguous())) * scale_full
+        torch.testing.assert_close(y, expected, rtol=0, atol=0)
+
+    def test_e5m2_matches_scaled_elementwise(self, device):
+        if not hasattr(_C, "quantize_e5m2_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import (
+            dequantize_e5m2,
+            dequantize_e5m2_blockwise,
+            quantize_e5m2,
+            quantize_e5m2_blockwise,
+        )
+
+        torch.manual_seed(456)
+        x = torch.randn(2, 3, 65, device=device, dtype=torch.float32) * 128.0
+        block_size = 32
+
+        q, scales = quantize_e5m2_blockwise(x, block_size)
+        y = dequantize_e5m2_blockwise(q, scales, block_size)
+
+        assert q.shape == x.shape
+        assert scales.shape == (2, 3, 3)
+
+        scale_full = _expanded_scales(scales, x.size(-1), block_size)
+        expected = dequantize_e5m2(quantize_e5m2((x / scale_full).contiguous())) * scale_full
+        torch.testing.assert_close(y, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_accepts_half_and_bfloat16(self, device, dtype):
+        if not hasattr(_C, "quantize_e4m3_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import dequantize_e4m3_blockwise, quantize_e4m3_blockwise
+
+        x = torch.tensor([[1.0, -1.0, 0.0, 2.0]], device=device, dtype=dtype)
+        q, scales = quantize_e4m3_blockwise(x, block_size=4)
+        y = dequantize_e4m3_blockwise(q, scales, block_size=4)
+
+        assert q.dtype == torch.uint8
+        assert scales.shape == (1, 1)
+        assert y.dtype == torch.float32
+        torch.testing.assert_close(y, x.float(), rtol=0, atol=1e-6)
+
+    def test_rejects_bad_block_size(self, device):
+        if not hasattr(_C, "quantize_e4m3_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import quantize_e4m3_blockwise
+
+        with pytest.raises((RuntimeError, Exception)):
+            quantize_e4m3_blockwise(torch.randn(8, device=device), block_size=0)
+
+    def test_e5m2_stochastic_blockwise_reproducible(self, device):
+        if not hasattr(_C, "quantize_e5m2_blockwise_stochastic"):
+            pytest.skip("extension must be rebuilt with stochastic block-wise FP8 ops")
+        from hip_quant.torch_api import quantize_e5m2_blockwise_stochastic
+
+        x = torch.full((1, 4096), 1.125, device=device, dtype=torch.float32)
+        x[0, 0] = 57344.0  # forces scale=1.0 for this block
+        a, scales_a = quantize_e5m2_blockwise_stochastic(x, block_size=4096, seed=123)
+        b, scales_b = quantize_e5m2_blockwise_stochastic(x, block_size=4096, seed=123)
+        c, _ = quantize_e5m2_blockwise_stochastic(x, block_size=4096, seed=124)
+
+        assert torch.equal(a, b)
+        assert torch.equal(scales_a, scales_b)
+        assert not torch.equal(a[:, 1:], c[:, 1:])
+        upper_ratio = (a[:, 1:] == 0x3D).sum().item() / (x.numel() - 1)
+        assert 0.45 <= upper_ratio <= 0.55
+
+    def test_refresh_fp8_blockwise_shadow_copies_buffers(self, device):
+        if not hasattr(_C, "quantize_e4m3_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise FP8 ops")
+        from hip_quant.torch_api import refresh_fp8_blockwise_shadow, quantize_e4m3_blockwise
+
+        weight = torch.randn(5, 33, device=device, dtype=torch.float32)
+        expected_q, expected_scales = quantize_e4m3_blockwise(weight, block_size=16)
+        weight_fp8 = torch.empty_like(expected_q)
+        weight_scales = torch.empty_like(expected_scales)
+
+        q, scales = refresh_fp8_blockwise_shadow(weight, weight_fp8, weight_scales, block_size=16)
+
+        assert q.data_ptr() == weight_fp8.data_ptr()
+        assert scales.data_ptr() == weight_scales.data_ptr()
+        assert torch.equal(q, expected_q)
+        torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+    def test_adafactor_row_col_mean_square(self, device):
+        if not hasattr(_C, "adafactor_row_col_mean_square"):
+            pytest.skip("extension must be rebuilt with Adafactor reduction ops")
+        from hip_quant.torch_api import adafactor_row_col_mean_square
+
+        torch.manual_seed(789)
+        grad = torch.randn(17, 31, device=device, dtype=torch.float32)
+        row, col = adafactor_row_col_mean_square(grad, eps=1e-7)
+
+        torch.testing.assert_close(row, grad.pow(2).mean(dim=-1) + 1e-7, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(col, grad.pow(2).mean(dim=-2) + 1e-7, rtol=1e-6, atol=1e-7)
+
+    def test_fp8_linear_forward_blockwise_matches_dequant_reference(self, device):
+        if not hasattr(_C, "fp8_linear_forward_blockwise"):
+            pytest.skip("extension must be rebuilt with block-wise linear op")
+        from hip_quant.torch_api import (
+            dequantize_e4m3_blockwise,
+            fp8_linear_forward_blockwise_quantized,
+            quantize_e4m3_blockwise,
+        )
+
+        torch.manual_seed(321)
+        x = torch.randn(7, 33, device=device, dtype=torch.float32)
+        w = torch.randn(11, 33, device=device, dtype=torch.float32)
+        bias = torch.randn(11, device=device, dtype=torch.float32)
+        block_size = 16
+        x_fp8, x_scales = quantize_e4m3_blockwise(x, block_size)
+        w_fp8, w_scales = quantize_e4m3_blockwise(w, block_size)
+
+        out = fp8_linear_forward_blockwise_quantized(
+            x_fp8, x_scales, w_fp8, w_scales, x, block_size, bias
+        )
+        ref = dequantize_e4m3_blockwise(x_fp8, x_scales, block_size).matmul(
+            dequantize_e4m3_blockwise(w_fp8, w_scales, block_size).t()
+        ) + bias
+
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    def test_packed_wmma_weight_matches_row_major_wmma(self, device, monkeypatch):
+        if not hasattr(_C, "pack_fp8_weight_for_wmma"):
+            pytest.skip("extension must be rebuilt with packed WMMA weight op")
+        monkeypatch.setenv("HIP_QUANT_ENABLE_GFX12_WMMA", "1")
+        from hip_quant.torch_api import (
+            fp8_linear_forward_fp8_input_weight,
+            fp8_linear_forward_fp8_input_weight_packed,
+            pack_fp8_weight_for_wmma,
+            quantize_e4m3,
+        )
+
+        torch.manual_seed(654)
+        x = torch.randn(17, 33, device=device, dtype=torch.bfloat16)
+        w = torch.randn(19, 33, device=device, dtype=torch.bfloat16)
+        x_fp8 = quantize_e4m3(x)
+        w_fp8 = quantize_e4m3(w)
+        w_packed = pack_fp8_weight_for_wmma(w_fp8)
+
+        row_major = fp8_linear_forward_fp8_input_weight(
+            x_fp8, w_fp8, x, weight_inv_scale=1.0, input_scale=1.0, bias=None
+        )
+        packed = fp8_linear_forward_fp8_input_weight_packed(
+            x_fp8, w_packed, x, output_features=w.size(0),
+            weight_inv_scale=1.0, input_scale=1.0, bias=None
+        )
+        torch.testing.assert_close(packed, row_major, rtol=0, atol=0)
 
 
 # ===========================================================================
