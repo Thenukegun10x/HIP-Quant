@@ -128,7 +128,7 @@ extension can still be built locally with `setup_torch.py build_ext --inplace`.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-0.5.3-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-0.5.5-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -565,18 +565,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-0.5.3-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.3.tar.gz"
+  "dist\hip_quant-0.5.5-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.5.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-0.5.3-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.3.tar.gz"
+  "dist\hip_quant-0.5.5-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.5.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-0.5.3-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-0.5.5-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:

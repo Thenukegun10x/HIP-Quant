@@ -2,6 +2,7 @@ include hip_quantize.dll
 include hip_quantize_rocm721.dll
 include libhip_quantize.so
 include _C*.pyd
+include _C.cp312-win_amd64.pyd
 include *.h
 include *.cpp
 include build.ps1
