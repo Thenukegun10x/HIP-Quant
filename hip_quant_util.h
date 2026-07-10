@@ -13,45 +13,69 @@ __device__ inline int nearest_int(float f) {
 __device__ inline uint16_t fp32_to_fp16(float f) {
     uint32_t u = __float_as_int(f);
     uint32_t sign = (u >> 16) & 0x8000;
-    int32_t exp = ((u >> 23) & 0xFF) - 127 + 15;
+    uint32_t f32_exp = (u >> 23) & 0xFF;
     uint32_t mant = u & 0x007FFFFF;
 
-    if (exp > 30) {
-        return (uint16_t)(sign | 0x7C00 | (mant ? 0x200 : 0));
+    if (f32_exp == 0xFF) {
+        // Preserve infinities and emit a quiet half NaN for every F32 NaN.
+        return (uint16_t)(sign | 0x7C00 | (mant ? 0x0200 : 0));
     }
 
+    int32_t exp = (int32_t)f32_exp - 127 + 15;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+
     if (exp <= 0) {
-        mant = (mant | 0x800000) >> (1 - exp);
-        if (mant == 0) return (uint16_t)sign;
-        while (!(mant & 0x3E00000)) mant <<= 1;
-        exp = 1;
-        mant >>= 13;
-        return (uint16_t)(sign | (exp << 10) | (mant & 0x3FF));
+        // Half subnormal. exp == -10 is exactly the range containing the
+        // midpoint between zero and the smallest half subnormal.
+        if (exp < -10) return (uint16_t)sign;
+        uint32_t full = mant | 0x00800000;
+        int shift = 14 - exp;
+        uint32_t half_mant = full >> shift;
+        uint32_t remainder = full & ((1u << shift) - 1u);
+        uint32_t midpoint = 1u << (shift - 1);
+        if (remainder > midpoint || (remainder == midpoint && (half_mant & 1u))) {
+            half_mant++;
+        }
+        // A rounded value of 0x400 is the smallest normal half.
+        return (uint16_t)(sign | half_mant);
     }
 
     uint32_t rnd = mant & 0x1FFF;
-    mant >>= 13;
-    if (rnd > 0x1000 || (rnd == 0x1000 && (mant & 1))) {
-        mant++;
-        if (mant & 0x400) { mant = 0; exp++; }
+    uint32_t half_mant = mant >> 13;
+    if (rnd > 0x1000 || (rnd == 0x1000 && (half_mant & 1u))) {
+        half_mant++;
+        if (half_mant == 0x400) {
+            half_mant = 0;
+            exp++;
+        }
     }
 
-    if (exp >= 30) return (uint16_t)(sign | 0x7C00);
-    return (uint16_t)(sign | (exp << 10) | (mant & 0x3FF));
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
 }
 
 // IEEE 754 half → float32
 __device__ inline float fp16_to_fp32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 0x1;
-    int32_t exp = (h >> 10) & 0x1F;
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x3FF;
-    if (exp == 0 && mant == 0) return 0.0f;
-    if (exp == 0) {
-        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-        mant &= 0x3FF;
-        exp += 1;
+
+    if (exp == 0 && mant == 0) return __int_as_float(sign);
+    if (exp == 31) {
+        uint32_t payload = mant ? ((mant << 13) | 0x00400000u) : 0u;
+        return __int_as_float(sign | 0x7F800000u | payload);
     }
-    uint32_t u = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    if (exp == 0) {
+        int32_t unbiased_exp = -14;
+        while (!(mant & 0x400)) {
+            mant <<= 1;
+            unbiased_exp--;
+        }
+        mant &= 0x3FF;
+        uint32_t u = sign | ((uint32_t)(unbiased_exp + 127) << 23) | (mant << 13);
+        return __int_as_float(u);
+    }
+    uint32_t u = sign | ((exp + 112) << 23) | (mant << 13);
     return __int_as_float(u);
 }
 
@@ -178,7 +202,7 @@ __device__ inline float fp8_e4m3_to_fp32(uint8_t h) {
 // Bias: 15, max finite: +/-57344, infinities supported
 // Inf: S.11111.00, NaN: S.11111.xx where xx != 00
 
-// float32 bits -> FP8 E5M2 (round-to-nearest-even, overflow to infinity)
+// float32 bits -> FP8 E5M2 (round-to-nearest-even, finite overflow saturates)
 __device__ inline uint8_t fp32_bits_to_fp8_e5m2(uint32_t u) {
     uint32_t sign = u >> 31;
     uint32_t abs_u = u & 0x7FFFFFFF;
@@ -230,15 +254,16 @@ __device__ inline uint8_t fp32_bits_to_fp8_e5m2(uint32_t u) {
         if (fp8_mant >= 4) { fp8_mant = 0; exp++; }
     }
 
-    // Post-rounding overflow: E5M2 supports infinity.
+    // Saturate finite overflow so a large finite gradient cannot become Inf.
+    // Actual F32 infinities are preserved by the special case above.
     if (exp >= 31) {
-        return (uint8_t)((sign << 7) | 0x7C);
+        return (uint8_t)((sign << 7) | 0x7B);
     }
 
     return (uint8_t)((sign << 7) | (exp << 2) | fp8_mant);
 }
 
-// float32 -> FP8 E5M2 (round-to-nearest-even, overflow to infinity)
+// float32 -> FP8 E5M2 (round-to-nearest-even, finite overflow saturates)
 __device__ inline uint8_t fp32_to_fp8_e5m2(float f) {
     return fp32_bits_to_fp8_e5m2(__float_as_int(f));
 }
@@ -267,7 +292,7 @@ __device__ inline float fp8_e5m2_positive_code_to_fp32(uint8_t code) {
 }
 
 // float32 -> FP8 E5M2 with unbiased stochastic rounding between adjacent bins.
-// NaN/Inf and overflow remain deterministic; finite in-range values round up
+// NaN/Inf and finite overflow remain deterministic; finite in-range values round up
 // with probability proportional to their distance from the lower E5M2 value.
 __device__ inline uint8_t fp32_to_fp8_e5m2_stochastic(float f, uint64_t seed, uint64_t idx) {
     uint32_t u = __float_as_int(f);
@@ -279,7 +304,7 @@ __device__ inline uint8_t fp32_to_fp8_e5m2_stochastic(float f, uint64_t seed, ui
     if (abs_u == 0x7F800000) return (uint8_t)((sign << 7) | 0x7C);
 
     float af = fabsf(f);
-    if (af > 57344.0f) return (uint8_t)((sign << 7) | 0x7C);
+    if (af > 57344.0f) return (uint8_t)((sign << 7) | 0x7B);
 
     uint8_t lo = 0;
     uint8_t hi = 0x7B; // Largest positive finite E5M2 code.

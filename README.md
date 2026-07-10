@@ -99,10 +99,17 @@ Default build emits one DLL for CDNA, RDNA3, and RDNA4 targets. By default it us
 The build script adds `-mno-wavefrontsize64` so gfx12 `w32` WMMA code is compiled as Wave32.
 
 ### PyTorch Extension (`_C`)
-Requires PyTorch with ROCm support (`torch 2.x+rocm`):
+Requires PyTorch with ROCm support (`torch 2.x+rocm`) and an **x64** MSVC
+toolchain (`Hostx64\x64\link.exe`). Do not build from an x86 Developer shell —
+that produces `temp.win32` objects and fails to link a 64-bit `_C.pyd`.
+
 ```powershell
+# From "x64 Native Tools Command Prompt for VS 2022", or after vcvars64.bat:
 & "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
 ```
+
+Expect `build\temp.win-amd64-cpython-312` and `rc.exe` /
+`link.exe` from the Windows SDK x64 and MSVC Hostx64 paths.
 
 To build a PyPI wheel that includes the compiled `_C.pyd` extension, build with
 the extension flag from the ROCm/PyTorch environment:
@@ -288,8 +295,9 @@ out = fp8_linear_forward_blockwise_quantized(
 The current block-scaled linear kernel is correctness-first and intentionally
 does not use gfx12 WMMA yet. It validates the `FP8 bytes + per-block scales`
 layout and math before replacing the inner loop with a tiled/WMMA or rocBLASLt
-implementation. The Adafactor helper computes row/column mean-square statistics;
-it is not a full fused optimizer step yet.
+implementation. `Adafactor` is a full Python optimizer step with factored
+second-moment state; GPU-side row/column mean-square helpers exist, while a
+fully fused Adafactor update kernel remains a future optimization.
 
 #### Fake-FP8 Linear (autograd-safe, Phase 3)
 
@@ -316,7 +324,25 @@ model.cuda()
 # Adafactor optimizer: adaptive learning rates with sublinear memory cost
 # Cuts optimizer state VRAM by ~1000× compared to AdamW
 opt = Adafactor(model.parameters(), relative_step=True)
+
+# One nonfinite gradient skips the entire optimizer step (no state poison).
+loss.backward()
+opt.step()
+if opt.last_step_skipped:
+    # reduce loss scale / skip weight update for this step
+    pass
 ```
+
+Training-path numerical guards:
+- hipBLASLt backward applies quant scales as *pre-quant multipliers* and uses
+  the reciprocal as the GEMM dequant scale (avoids exploding `grad_input`).
+- `Fp8TensorMeta.update` ignores NaN/Inf amax samples and keeps the last valid
+  scale (`found_nonfinite` sticky flag).
+- `Adafactor.step` preflights all gradients and sets `last_step_skipped=True`
+  instead of mutating state when any gradient is nonfinite.
+- Weight-gradient kernels can retain FP32 accumulation for master weights.
+- `Fp8ShadowLinear` caches the FP8 weight shadow between optimizer updates;
+  hipBLASLt reuses pre-quantized E4M3 bytes instead of re-casting masters.
 
 #### FP8 Conv1d / Conv2d
 
@@ -463,6 +489,8 @@ All PyTorch extension functions are guarded against:
 - **Hardware grid limit** — `gridDim.y ≤ 65535` validated before launch
 - **Cross-device pointers** — `input.device() == weight.device()` checked
 - **Empty tensors** — `numel == 0` early-return before `dim3(0)` (UB in HIP)
+- **Positive finite scales** — invalid FP8 scales raise before launch / GEMM
+- **Nonfinite training step** — delayed scales and Adafactor refuse to poison state
 
 ---
 
@@ -474,19 +502,32 @@ python tests/torch/test_math_fp8.py
 # 90/90 pass — validated against ml_dtypes reference
 ```
 
-#### PyTorch GPU tests
+#### Full pipeline tests (CPU mock, no GPU required)
 ```powershell
-# Build extension first
-& "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
+# Preferred: pure unittest (no GPU init)
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -c "import unittest, tests.test_pipeline as t; unittest.main(module=t, exit=True)"
 
-& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/torch/test_fp8.py -v
+# Or pytest
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/test_pipeline.py -q
 ```
 
-#### Full Pipeline Tests (CPU Mock)
+`Fp8TensorMeta` and scaled/shadow modules keep delayed-scale metadata on the
+parameter device (CPU by default). That avoids accidental ROCm init during the
+mocked CPU suite. If a GPU-enabled run still stalls on process exit under
+Windows, force CPU visibility:
+
 ```powershell
-python tests/test_pipeline.py -v
-# Tests full integration of Adafactor, Shadow Linear, and activation compression
-# Pure-Python mock, 100% test coverage for the API
+$env:CUDA_VISIBLE_DEVICES = ""
+$env:HIP_VISIBLE_DEVICES = ""
+```
+
+#### PyTorch GPU tests
+```powershell
+# Build extension first (x64 VS toolchain)
+& "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
+
+$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/torch/test_fp8.py -v
 ```
 
 #### Compatibility Tests (CPU + DLL)
@@ -576,7 +617,7 @@ hip_quant/
 - **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
-- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`; scalar scale metadata is passed through legacy float launcher arguments, while block-wise FP8 metadata stays in device FP32 scale tensors. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
-- **Phase 4 GEMM** includes gfx12 WMMA per-tensor-scale paths plus a correctness-first block-scaled FP8 linear path. Replace the block-scaled inner loop with tiled WMMA or `rocBLASLt` FP8 GEMM for production throughput once validated on your ROCm stack
-- **Adafactor kernel support** currently covers GPU-side row/column mean-square reductions for 2-D gradients. A fully fused Adafactor update kernel is a future optimization target.
+- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`. hipBLASLt training paths keep delayed scales device-resident where possible; legacy custom WMMA launchers still take scalar float scales. Block-wise FP8 metadata stays in device FP32 scale tensors. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
+- **Phase 4 GEMM** includes gfx12 WMMA per-tensor-scale paths, packed-weight WMMA variants, and a correctness-first block-scaled FP8 linear path. Large training shapes prefer hipBLASLt via `torch._scaled_mm`; custom WMMA remains the fallback/small-shape path.
+- **Adafactor** provides a complete optimizer step in Python with nonfinite step skipping. GPU-side row/column mean-square reductions for 2-D gradients exist; a fully fused Adafactor update kernel is a future optimization target.
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly

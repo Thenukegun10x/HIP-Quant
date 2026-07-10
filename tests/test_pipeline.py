@@ -84,7 +84,7 @@ def _fp32_to_fp8_e5m2(f):
     if rnd > 0x100000 or (rnd == 0x100000 and (m8 & 1)):
         m8 += 1
         if m8 >= 4: m8 = 0; exp8 += 1
-    if exp8 >= 31: return ((sign << 7) | 0x7C) & 0xFF
+    if exp8 >= 31: return ((sign << 7) | 0x7B) & 0xFF
     return ((sign << 7) | (exp8 << 2) | m8) & 0xFF
 
 def _fp8_e5m2_to_fp32(h):
@@ -709,6 +709,23 @@ class TestFp8TensorMeta(unittest.TestCase):
         back = meta.dequantize_e4m3(qx)    # dequantise and unscale
         self.assertAlmostEqual(back.item(), 1.0, places=1)
 
+    def test_nonfinite_update_preserves_valid_scale(self):
+        meta = Fp8TensorMeta(history_len=4, device="cpu")
+        meta.update(torch.tensor([2.0]))
+        scale_before = meta.scale.clone()
+        history_before = meta.amax_history.clone()
+
+        meta.update(torch.tensor([float("nan"), float("inf")]))
+
+        self.assertTrue(torch.equal(meta.scale, scale_before))
+        self.assertTrue(torch.equal(meta.amax_history, history_before))
+        self.assertTrue(meta.found_nonfinite.item())
+        self.assertTrue(torch.isfinite(meta.scale).all())
+        self.assertTrue(torch.isfinite(meta.inv_scale).all())
+
+        meta.clear_nonfinite()
+        self.assertFalse(meta.found_nonfinite.item())
+
 
 # ===========================================================================
 # 10. Adafactor
@@ -818,6 +835,23 @@ class TestAdafactor(unittest.TestCase):
         (p @ torch.randn(32, 8)).sum().backward()
         opt.step()
         self.assertFalse(torch.isnan(p.data).any(), "NaN in param after Adafactor step")
+
+    def test_nonfinite_gradient_skips_entire_step(self):
+        p1 = nn.Parameter(torch.ones(4, 4))
+        p2 = nn.Parameter(torch.ones(4, 4) * 2.0)
+        opt = Adafactor([p1, p2], lr=1e-2, relative_step=False)
+        p1.grad = torch.ones_like(p1)
+        p2.grad = torch.ones_like(p2)
+        p2.grad[0, 0] = float("inf")
+        before1, before2 = p1.detach().clone(), p2.detach().clone()
+
+        opt.step()
+
+        self.assertTrue(opt.last_step_skipped)
+        self.assertTrue(torch.equal(p1, before1))
+        self.assertTrue(torch.equal(p2, before2))
+        self.assertEqual(len(opt.state[p1]), 0)
+        self.assertEqual(len(opt.state[p2]), 0)
 
 
 # ===========================================================================

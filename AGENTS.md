@@ -34,3 +34,27 @@ We use `pyproject.toml` and `setuptools` to bundle the Python wrapper together w
 - **Python-Native Interop**: When modifying Python code, ensure `ctypes` signatures perfectly match the types exposed by `hip_quantize.cpp` to prevent segfaults.
 - **DLL Resolution**: The path to `hip_quantize.dll` is dynamically resolved in `__init__.py` to support `pip install` workflows. Do not hardcode absolute paths in the python wrapper.
 - **Packaging**: Any new header files or kernels must be included in `MANIFEST.in` and the `package-data` section of `pyproject.toml`.
+
+## Testing Notes
+- **CPU pipeline suite** (`tests/test_pipeline.py`): mocked `_C`, no GPU required.
+  ```powershell
+  & 'C:\venvs\medusa_rocm\Scripts\python.exe' -c "import unittest, tests.test_pipeline as t; unittest.main(module=t, exit=True)"
+  # or
+  & 'C:\venvs\medusa_rocm\Scripts\python.exe' -m pytest tests\test_pipeline.py -q
+  ```
+- **Why pytest looked hung**: `Fp8TensorMeta` used to default to CUDA when available even for CPU layers. That initialized ROCm during “CPU” tests; on Windows the process often stalls in GPU teardown after tests already passed (no failure output). Meta now defaults to CPU / parameter device.
+- **If a GPU run still stalls on exit**: force CPU visibility for pipeline tests:
+  ```powershell
+  $env:CUDA_VISIBLE_DEVICES=''; $env:HIP_VISIBLE_DEVICES=''
+  ```
+- **GPU / WMMA tests**: require the real extension and an x64 VS toolchain build. Enable only when intentional:
+  ```powershell
+  $env:HIP_QUANT_ENABLE_GFX12_WMMA='1'
+  ```
+- **Venv**: `C:\venvs\medusa_rocm\Scripts\python.exe`
+- **x64 extension build** (not x86 Developer PowerShell):
+  ```bat
+  "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+  "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
+  ```
+  Expect `temp.win-amd64-cpython-312` and `Hostx64\x64\link.exe`.

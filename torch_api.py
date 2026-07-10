@@ -43,9 +43,39 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
-def _scale_to_float(scale: "torch.Tensor") -> float:
+def _scale_to_float(scale: Union["torch.Tensor", float]) -> float:
     """Single sync point for legacy scalar-scale FP8 GEMM launchers."""
-    return float(scale.item())
+    value = float(scale.item()) if torch.is_tensor(scale) else float(scale)
+    if not math.isfinite(value) or value <= 0.0:
+        raise FloatingPointError(f"FP8 scale must be finite and positive, got {value!r}")
+    return value
+
+
+def _validate_fp8_scale(value: float, name: str) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise FloatingPointError(f"{name} must be finite and positive, got {value!r}")
+    return value
+
+
+def _fp8_scale_tensor(
+    scale: Union["torch.Tensor", float],
+    name: str,
+    device: "torch.device",
+) -> "torch.Tensor":
+    """Return a device scalar without synchronizing a CUDA scale to the host."""
+    if torch.is_tensor(scale):
+        if scale.numel() != 1:
+            raise ValueError(f"{name} must contain exactly one value")
+        result = scale.detach().to(device=device, dtype=torch.float32).reshape(())
+        valid = torch.isfinite(result) & (result > 0.0)
+        if result.is_cuda and hasattr(torch, "_assert_async"):
+            torch._assert_async(valid, f"{name} must be finite and positive")
+        elif not bool(valid.item()):
+            raise FloatingPointError(f"{name} must be finite and positive")
+        return result
+    value = _validate_fp8_scale(scale, name)
+    return torch.full((), value, device=device, dtype=torch.float32)
 
 
 def _stochastic_e5m2_enabled() -> bool:
@@ -89,12 +119,73 @@ def _fp8_linear_backend() -> str:
     return "hipblaslt"
 
 
+def _as_float8_e4m3(x: "torch.Tensor") -> "torch.Tensor":
+    """Reinterpret hip_quant uint8 E4M3 storage as torch.float8_e4m3fn."""
+    if x.dtype == torch.float8_e4m3fn:
+        return x
+    if x.dtype == torch.uint8:
+        return x.view(torch.float8_e4m3fn)
+    raise TypeError(f"expected uint8 or float8_e4m3fn FP8 storage, got {x.dtype}")
+
+
+def _hipblaslt_fp8_linear_forward_prequant(
+    input_fp8:        "torch.Tensor",
+    weight_fp8:       "torch.Tensor",
+    bias:             Optional["torch.Tensor"],
+    input_inv_scale:  Union["torch.Tensor", float],
+    weight_inv_scale: Union["torch.Tensor", float],
+    out_dtype:        "torch.dtype",
+) -> Optional["torch.Tensor"]:
+    """hipBLASLt path for already-quantized E4M3 operands.
+
+    ``input_inv_scale`` / ``weight_inv_scale`` are dequant scales applied by
+    ``_scaled_mm`` (i.e. reciprocal of the quant multipliers).
+    """
+    if _fp8_linear_backend() == "custom" or _env_flag("HIP_QUANT_DISABLE_HIPBLASLT"):
+        return None
+    if not _TORCH_AVAILABLE or not input_fp8.is_cuda:
+        return None
+    if not hasattr(torch, "_scaled_mm") or not hasattr(torch, "float8_e4m3fn"):
+        return None
+    if input_fp8.dim() != 2 or weight_fp8.dim() != 2:
+        return None
+
+    scale_a = _fp8_scale_tensor(input_inv_scale, "input_inv_scale", input_fp8.device)
+    scale_b = _fp8_scale_tensor(weight_inv_scale, "weight_inv_scale", input_fp8.device)
+
+    a = _as_float8_e4m3(input_fp8.contiguous())
+    b = _as_float8_e4m3(weight_fp8.contiguous())
+    out_features = b.size(0)
+
+    a, row_pad = _pad_2d_rows(a)
+    a, k_pad = _pad_2d_cols(a)
+    if k_pad:
+        b = F.pad(b, (0, k_pad))
+    b, n_pad = _pad_2d_rows(b)
+    # Row-major A @ column-major B: keep the transpose non-contiguous.
+    b_t = b.contiguous().t()
+
+    try:
+        out = torch._scaled_mm(a, b_t, scale_a, scale_b, out_dtype=out_dtype)
+    except RuntimeError:
+        if _env_flag("HIP_QUANT_HIPBLASLT_STRICT"):
+            raise
+        return None
+    if row_pad:
+        out = out[:-row_pad, :]
+    if n_pad:
+        out = out[:, :out_features]
+    if bias is not None:
+        out = out + bias.unsqueeze(0)
+    return out
+
+
 def _hipblaslt_fp8_linear_forward(
     input:        "torch.Tensor",
     weight:       "torch.Tensor",
     bias:         Optional["torch.Tensor"],
-    input_scale:  float = 1.0,
-    weight_scale: float = 1.0,
+    input_scale:  Union["torch.Tensor", float] = 1.0,
+    weight_scale: Union["torch.Tensor", float] = 1.0,
 ) -> Optional["torch.Tensor"]:
     """Fast ROCm FP8 GEMM path through PyTorch's hipBLASLt-backed _scaled_mm."""
     if _fp8_linear_backend() == "custom":
@@ -108,12 +199,28 @@ def _hipblaslt_fp8_linear_forward(
     if input.dim() != 2 or weight.dim() != 2:
         return None
 
+    input_scale_t = _fp8_scale_tensor(input_scale, "input_scale", input.device)
+    weight_scale_t = _fp8_scale_tensor(weight_scale, "weight_scale", input.device)
+
     a = input.contiguous()
     b = weight.contiguous()
-    if input_scale != 1.0:
-        a = (a * input_scale).contiguous()
-    if weight_scale != 1.0:
-        b = (b * weight_scale).contiguous()
+    scale_is_one = (
+        (not torch.is_tensor(input_scale) and float(input_scale) == 1.0)
+        and (not torch.is_tensor(weight_scale) and float(weight_scale) == 1.0)
+    )
+    if not scale_is_one:
+        # Prefer one quant pass into uint8 storage that can be reused by
+        # autograd save-for-backward callers via the prequant helper.
+        a_fp8 = quantize_e4m3((a * input_scale_t).contiguous())
+        b_fp8 = quantize_e4m3((b * weight_scale_t).contiguous())
+        return _hipblaslt_fp8_linear_forward_prequant(
+            a_fp8,
+            b_fp8,
+            bias,
+            input_scale_t.reciprocal(),
+            weight_scale_t.reciprocal(),
+            input.dtype,
+        )
 
     out_features = b.size(0)
     a, row_pad = _pad_2d_rows(a)
@@ -122,8 +229,8 @@ def _hipblaslt_fp8_linear_forward(
         b = F.pad(b, (0, k_pad))
     b, n_pad = _pad_2d_rows(b)
 
-    scale_a = torch.full((), 1.0 / float(input_scale), device=input.device, dtype=torch.float32)
-    scale_b = torch.full((), 1.0 / float(weight_scale), device=input.device, dtype=torch.float32)
+    scale_a = input_scale_t.reciprocal()
+    scale_b = weight_scale_t.reciprocal()
     a_fp8 = a.to(torch.float8_e4m3fn)
     b_fp8_t = b.to(torch.float8_e4m3fn).contiguous().t()
 
@@ -146,8 +253,8 @@ def _hipblaslt_fp8_backward(
     grad_output: "torch.Tensor",
     weight:      "torch.Tensor",
     input_f32:   "torch.Tensor",
-    weight_scale: float = 1.0,
-    input_scale:  float = 1.0,
+    weight_scale: Union["torch.Tensor", float] = 1.0,
+    input_scale:  Union["torch.Tensor", float] = 1.0,
 ) -> Optional[Tuple["torch.Tensor", "torch.Tensor"]]:
     """Try backward via torch._scaled_mm with float8_e5m2.
 
@@ -156,10 +263,15 @@ def _hipblaslt_fp8_backward(
 
     Returns (grad_input, grad_weight) or None on failure.
     """
+    if _fp8_linear_backend() == "custom" or _env_flag("HIP_QUANT_DISABLE_HIPBLASLT"):
+        return None
     if not _TORCH_AVAILABLE or not grad_output.is_cuda:
         return None
     if not hasattr(torch, "_scaled_mm") or not hasattr(torch, "float8_e5m2"):
         return None
+
+    weight_scale_t = _fp8_scale_tensor(weight_scale, "weight_scale", grad_output.device)
+    input_scale_t = _fp8_scale_tensor(input_scale, "input_scale", grad_output.device)
 
     go = grad_output.contiguous()
     w  = weight.contiguous()
@@ -174,14 +286,20 @@ def _hipblaslt_fp8_backward(
         # A = go [M,N] row-major, B = w [N,K] column-major
         go_gi, m_pad = _pad_2d_rows(go)
         go_gi, n_pad = _pad_2d_cols(go_gi)
-        w_gi = w
+        # Quantize the scaled operand, then use the reciprocal dequant scale.
+        # Callers pass quantization multipliers (FP8_MAX / amax), not inverse
+        # scales. Applying the multiplier after GEMM amplifies gradients.
+        w_gi = (
+            w if not torch.is_tensor(weight_scale) and float(weight_scale) == 1.0
+            else (w * weight_scale_t).contiguous()
+        )
         if n_pad:
             w_gi = F.pad(w_gi, (0, 0, 0, n_pad))
         w_gi, k_pad = _pad_2d_cols(w_gi)
         a_gi = go_gi.to(torch.float8_e5m2)                                  # [M,N] row-major
         b_gi = w_gi.to(torch.float8_e5m2).t().contiguous().t()              # [N,K] column-major
         s_go = torch.ones((), device=go.device, dtype=torch.float32)
-        s_w  = torch.full((), float(weight_scale), device=go.device, dtype=torch.float32)
+        s_w  = weight_scale_t.reciprocal()
         grad_input = torch._scaled_mm(a_gi, b_gi, s_go, s_w, out_dtype=go.dtype)
         if m_pad:
             grad_input = grad_input[:-m_pad, :]
@@ -193,15 +311,18 @@ def _hipblaslt_fp8_backward(
         go_t = go.t().contiguous()
         go_t, n_row_pad = _pad_2d_rows(go_t)
         go_t, m_col_pad = _pad_2d_cols(go_t)
-        x_gw = x
+        x_gw = (
+            x if not torch.is_tensor(input_scale) and float(input_scale) == 1.0
+            else (x * input_scale_t).contiguous()
+        )
         if m_col_pad:
             x_gw = F.pad(x_gw, (0, 0, 0, m_col_pad))
         x_gw, k_col_pad = _pad_2d_cols(x_gw)
         a_gw = go_t.to(torch.float8_e5m2)                                  # [N,M] row-major
         b_gw = x_gw.to(torch.float8_e5m2).t().contiguous().t()             # [M,K] column-major
         s_go_t = torch.ones((), device=go.device, dtype=torch.float32)
-        s_x    = torch.full((), float(input_scale), device=go.device, dtype=torch.float32)
-        grad_weight = torch._scaled_mm(a_gw, b_gw, s_go_t, s_x, out_dtype=go.dtype)
+        s_x    = input_scale_t.reciprocal()
+        grad_weight = torch._scaled_mm(a_gw, b_gw, s_go_t, s_x, out_dtype=weight.dtype)
         if n_row_pad:
             grad_weight = grad_weight[:-n_row_pad, :]
         if k_col_pad:
@@ -209,6 +330,8 @@ def _hipblaslt_fp8_backward(
 
         return (grad_input, grad_weight)
     except RuntimeError:
+        if _env_flag("HIP_QUANT_HIPBLASLT_STRICT"):
+            raise
         return None
 
 
@@ -577,6 +700,8 @@ class Fp8LinearFunction(torch.autograd.Function):
         grad_weight = fp8_linear_backward_weight_fp8_grad(
             grad_output_fp8, grad_output_c, input_f32, 1.0
         )
+        if grad_weight.dtype != weight.dtype:
+            grad_weight = grad_weight.to(weight.dtype)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias
@@ -596,7 +721,7 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
        storing ``input_scale`` as a ctx attribute to allow correct
        scaled dequantization in backward.
 
-    input_scale and weight_scale are plain Python floats — not tracked.
+    input_scale and weight_scale may be device scalars; neither is differentiated.
     """
 
     @staticmethod
@@ -609,12 +734,20 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         weight_scale: float,
     ) -> "torch.Tensor":
 
+        # Snapshot mutable delayed-scale metadata for this autograd context
+        # without copying it to the host.
+        if torch.is_tensor(input_scale):
+            input_scale = input_scale.detach().clone()
+        if torch.is_tensor(weight_scale):
+            weight_scale = weight_scale.detach().clone()
+
         input_c = input.contiguous()
         weight_c = weight.contiguous()
 
-        # Save compressed scaled activation for backward. Forward itself uses
-        # scaled in-register E4M3 quantization and gfx12 FP8 WMMA.
+        # One scaled quant pass for both GEMM operands. Activation FP8 is also
+        # the compressed save-for-backward tensor.
         input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        weight_fp8 = quantize_e4m3((weight_c * weight_scale).contiguous())
 
         ctx.has_bias    = bias is not None
         ctx.input_scale = input_scale          # needed to dequantise in backward
@@ -627,12 +760,20 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         if not input_c.is_cuda:
             return _cpu_fp8_linear_forward(input_c, weight_c, bias, input_scale, weight_scale)
 
-        out = _hipblaslt_fp8_linear_forward(input_c, weight_c, bias, input_scale, weight_scale)
+        out = _hipblaslt_fp8_linear_forward_prequant(
+            input_fp8,
+            weight_fp8,
+            bias,
+            1.0 / input_scale if torch.is_tensor(input_scale) else (1.0 / _scale_to_float(input_scale)),
+            1.0 / weight_scale if torch.is_tensor(weight_scale) else (1.0 / _scale_to_float(weight_scale)),
+            input_c.dtype,
+        )
         if out is not None:
             return out
 
         return fp8_linear_forward_fp8_input(
-            input_fp8, weight_c, input_c, input_scale, weight_scale, bias
+            input_fp8, weight_c, input_c,
+            _scale_to_float(input_scale), _scale_to_float(weight_scale), bias
         )
 
     @staticmethod
@@ -671,11 +812,13 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         if grad_output_fp8 is None:
             grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
-            grad_output_fp8, grad_output_c, weight, ctx.weight_scale
+            grad_output_fp8, grad_output_c, weight, _scale_to_float(ctx.weight_scale)
         )
         grad_weight = fp8_linear_backward_weight_fp8_grad(
             grad_output_fp8, grad_output_c, input_f32, 1.0
         )
+        if grad_weight.dtype != weight.dtype:
+            grad_weight = grad_weight.to(weight.dtype)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias, None, None
@@ -797,8 +940,8 @@ class Fp8ScaledLinear(nn.Module):
     and in the first few layers of an LLM).
 
     The amax measurement runs inside ``torch.no_grad()`` and does not affect
-    the autograd graph.  Scale values are passed as plain Python floats to
-    ``Fp8ScaledLinearFunction`` so they do not create extra graph nodes.
+    the autograd graph. Scale values remain device-resident on the hipBLASLt
+    path, avoiding per-layer host synchronization.
 
     Args:
         in_features:  input size.
@@ -830,9 +973,9 @@ class Fp8ScaledLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        dev_str = str(device) if device is not None else None
-        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=dev_str)
-        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=dev_str)
+        meta_device = str(self.weight.device)
+        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=meta_device)
+        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=meta_device)
 
         self._reset_parameters()
 
@@ -857,8 +1000,8 @@ class Fp8ScaledLinear(nn.Module):
 
         out = Fp8ScaledLinearFunction.apply(
             x_2d, self.weight, self.bias,
-            _scale_to_float(self.input_meta.scale),
-            _scale_to_float(self.weight_meta.scale),
+            self.input_meta.scale,
+            self.weight_meta.scale,
         )
         return out.reshape(*orig_shape[:-1], self.out_features)
 
@@ -1297,11 +1440,19 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         bias:            Optional["torch.Tensor"], # [N] or None
     ) -> "torch.Tensor":
 
+        # Metadata tensors are updated in-place on later forwards, so retain
+        # device-side snapshots for this backward pass.
+        if torch.is_tensor(weight_inv_scale):
+            weight_inv_scale = weight_inv_scale.detach().clone()
+        if torch.is_tensor(input_scale):
+            input_scale = input_scale.detach().clone()
+
         input_c = input.contiguous()
 
-        # Compress activation for backward. Forward consumes this scale and the
-        # pre-quantized E4M3 weight shadow inside a gfx12 FP8 WMMA kernel.
+        # Compress activation for backward. Reuse the cached E4M3 weight shadow
+        # for hipBLASLt so the master weight is not re-cast every forward.
         input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        weight_fp8_c = weight_fp8.contiguous()
 
         ctx.has_bias       = bias is not None
         ctx.input_scale    = input_scale
@@ -1313,20 +1464,26 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
 
         if not input_c.is_cuda:
             input_sim = dequantize_e4m3(input_fp8).float() * (1.0 / input_scale)
-            weight_sim = dequantize_e4m3(weight_fp8.contiguous()).float() * weight_inv_scale
+            weight_sim = dequantize_e4m3(weight_fp8_c).float() * weight_inv_scale
             out = input_sim @ weight_sim.t()
             if bias is not None:
                 out = out + bias.float().unsqueeze(0)
             return out.to(input_c.dtype)
 
-        out = _hipblaslt_fp8_linear_forward(
-            input_c, weight_master.contiguous(), bias, input_scale, 1.0 / weight_inv_scale
+        out = _hipblaslt_fp8_linear_forward_prequant(
+            input_fp8,
+            weight_fp8_c,
+            bias,
+            1.0 / input_scale if torch.is_tensor(input_scale) else (1.0 / _scale_to_float(input_scale)),
+            weight_inv_scale if torch.is_tensor(weight_inv_scale) else _scale_to_float(weight_inv_scale),
+            input_c.dtype,
         )
         if out is not None:
             return out
 
         return fp8_linear_forward_fp8_input_weight(
-            input_fp8, weight_fp8, input_c, weight_inv_scale, input_scale, bias
+            input_fp8, weight_fp8_c, input_c,
+            _scale_to_float(weight_inv_scale), _scale_to_float(input_scale), bias
         )
 
     @staticmethod
@@ -1350,9 +1507,11 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight_master, None, None, None, grad_bias
 
+        grad_output_for_backward, grad_output_fp8 = _prepare_e5m2_backward_grad_output(grad_output_c)
+
         # Try hipBLASLt e5m2 backward path first
         hipblaslt_result = _hipblaslt_fp8_backward(
-            grad_output_c, weight_master, input_f32,
+            grad_output_for_backward, weight_master, input_f32,
             weight_scale=ctx.weight_scale, input_scale=1.0
         )
         if hipblaslt_result is not None:
@@ -1360,13 +1519,17 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight_master, None, None, None, grad_bias
 
-        grad_output_fp8 = quantize_e5m2(grad_output_c)
+        if grad_output_fp8 is None:
+            grad_output_fp8 = quantize_e5m2(grad_output_c)
         grad_input = fp8_linear_backward_input_fp8_grad(
-            grad_output_fp8, grad_output_c, weight_master, ctx.weight_scale
+            grad_output_fp8, grad_output_c, weight_master,
+            _scale_to_float(ctx.weight_scale)
         )
         grad_weight_master = fp8_linear_backward_weight_fp8_grad(
             grad_output_fp8, grad_output_c, input_f32, 1.0
         )
+        if grad_weight_master.dtype != weight_master.dtype:
+            grad_weight_master = grad_weight_master.to(weight_master.dtype)
         grad_bias          = grad_output.sum(0) if bias is not None else None
 
         # Returns align with forward args:
@@ -1434,9 +1597,10 @@ class Fp8ShadowLinear(nn.Module):
                         **{"device": device} if device else {}),
         )
 
-        dev_str = str(device) if device is not None else None
-        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=dev_str)
-        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=dev_str)
+        meta_device = str(self.weight_master.device)
+        self.input_meta  = Fp8TensorMeta(history_len=history_len, device=meta_device)
+        self.weight_meta = Fp8TensorMeta(history_len=history_len, device=meta_device)
+        self._shadow_version = -1
 
         self._reset_parameters()
 
@@ -1455,13 +1619,20 @@ class Fp8ShadowLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def _sync_shadow(self) -> None:
-        """Re-quantise weight_master → weight_fp8.  Always inside no_grad."""
+        """Re-quantise a changed master weight; reuse it for repeated forwards."""
+        current_version = int(self.weight_master._version)
+        if (
+            current_version == self._shadow_version
+            and self.weight_meta.scale.device == self.weight_master.device
+        ):
+            return
         if self.weight_meta.scale.device != self.weight_master.device:
             self.weight_meta.to(self.weight_master.device)
         self.weight_meta.update(self.weight_master)
         self.weight_fp8.copy_(
             quantize_e4m3((self.weight_master * self.weight_meta.scale).contiguous())
         )
+        self._shadow_version = current_version
 
     # ------------------------------------------------------------------
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
@@ -1478,8 +1649,8 @@ class Fp8ShadowLinear(nn.Module):
             x_2d,
             self.weight_master,
             self.weight_fp8,
-            _scale_to_float(self.weight_meta.inv_scale),
-            _scale_to_float(self.input_meta.scale),
+            self.weight_meta.inv_scale,
+            self.input_meta.scale,
             self.bias,
         )
         return out.reshape(*orig_shape[:-1], self.out_features)
@@ -1689,7 +1860,7 @@ def fp8_linear_forward_fp8_input_weight(
 
 
 def pack_fp8_weight_for_wmma(weight_fp8: "torch.Tensor") -> "torch.Tensor":
-    """Pack row-major E4M3 weight bytes into the custom WMMA forward layout."""
+    """Pack E4M3 weights into the lane-native ``[NT, KT, 2, 16, 8]`` WMMA layout."""
     return _load_extension().pack_fp8_weight_for_wmma(weight_fp8.contiguous())
 
 
@@ -1861,22 +2032,43 @@ class Fp8TensorMeta:
     ) -> None:
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is not available.")
-        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if history_len <= 0:
+            raise ValueError("history_len must be positive")
+        # Default to CPU so constructing layers for unit tests does not
+        # initialize ROCm/CUDA (Windows teardown can hang after GPU init).
+        # Modules move meta onto the parameter/activation device on first use.
+        dev = device or "cpu"
         self.scale        = torch.ones(1,  dtype=torch.float32, device=dev)
         self.inv_scale    = torch.ones(1,  dtype=torch.float32, device=dev)
         self.amax_history = torch.zeros(history_len,
                                         dtype=torch.float32, device=dev)
+        self.found_nonfinite = torch.zeros(1, dtype=torch.bool, device=dev)
         self._history_len = history_len
         self._ptr         = 0
 
     def update(self, tensor: "torch.Tensor") -> None:
-        """Record the absolute maximum of *tensor* and refresh scale."""
-        amax = tensor.abs().max().detach()
-        self.amax_history[self._ptr % self._history_len] = amax
+        """Record a finite amax and refresh scale without poisoning metadata."""
+        detached = tensor.detach()
+        finite = torch.isfinite(detached)
+        all_finite = finite.all()
+        self.found_nonfinite.logical_or_(~all_finite.reshape_as(self.found_nonfinite))
+
+        # Keep the previous history entry when this sample contains NaN/Inf.
+        # The original tensor remains non-finite so a training-step guard can
+        # skip the update, while future finite batches retain valid scales.
+        finite_amax = torch.where(finite, detached.abs(), 0.0).max()
+        slot = self._ptr % self._history_len
+        previous = self.amax_history[slot].clone()
+        self.amax_history[slot].copy_(torch.where(all_finite, finite_amax, previous))
         self._ptr += 1
-        observed_max   = self.amax_history.max().clamp(min=1e-12)
-        self.scale     = (self._FP8_E4M3_MAX / observed_max).float()
-        self.inv_scale = (1.0 / self.scale).float()
+        observed_max = self.amax_history.max().clamp(min=1e-12)
+        new_scale = (self._FP8_E4M3_MAX / observed_max).float()
+        self.scale.copy_(new_scale)
+        self.inv_scale.copy_((1.0 / new_scale).float())
+
+    def clear_nonfinite(self) -> None:
+        """Clear the sticky non-finite observation flag after a skipped step."""
+        self.found_nonfinite.zero_()
 
     def quantize_e4m3(self, x: "torch.Tensor") -> "torch.Tensor":
         """Scale then quantize to FP8 E4M3."""
@@ -1891,6 +2083,7 @@ class Fp8TensorMeta:
         self.scale        = self.scale.to(device)
         self.inv_scale    = self.inv_scale.to(device)
         self.amax_history = self.amax_history.to(device)
+        self.found_nonfinite = self.found_nonfinite.to(device)
         return self
 
     def state_dict(self) -> Dict[str, "torch.Tensor"]:
@@ -1899,6 +2092,7 @@ class Fp8TensorMeta:
             "scale":        self.scale,
             "inv_scale":    self.inv_scale,
             "amax_history": self.amax_history,
+            "found_nonfinite": self.found_nonfinite,
             "ptr":          torch.tensor(self._ptr),
         }
 
@@ -1907,6 +2101,10 @@ class Fp8TensorMeta:
         self.scale        = state["scale"]
         self.inv_scale    = state["inv_scale"]
         self.amax_history = state["amax_history"]
+        self.found_nonfinite = state.get(
+            "found_nonfinite",
+            torch.zeros(1, dtype=torch.bool, device=self.scale.device),
+        )
         self._ptr         = int(state["ptr"].item())
         self._history_len = len(self.amax_history)
 
@@ -1998,6 +2196,7 @@ class Adafactor(torch.optim.Optimizer):
             weight_decay    = weight_decay,
         )
         super().__init__(params, defaults)
+        self.last_step_skipped = False
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -2022,6 +2221,27 @@ class Adafactor(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # Preflight every gradient before mutating any parameter or optimizer
+        # state. This gives GradScaler-like all-or-nothing behavior when one
+        # layer produces NaN/Inf instead of partially corrupting the model.
+        finite_by_device = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("Adafactor does not support sparse gradients.")
+                device = p.grad.device
+                is_finite = torch.isfinite(p.grad).all()
+                finite_by_device[device] = (
+                    is_finite if device not in finite_by_device
+                    else finite_by_device[device] & is_finite
+                )
+        if any(not bool(is_finite.item()) for is_finite in finite_by_device.values()):
+            self.last_step_skipped = True
+            return loss
+        self.last_step_skipped = False
+
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -2031,12 +2251,7 @@ class Adafactor(torch.optim.Optimizer):
                 # Work in float32 regardless of parameter dtype
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        "Adafactor does not support sparse gradients."
-                    )
-
-                p_f32    = p.data.float() if p.data.dtype != torch.float32 else p.data
+                p_f32    = p.float() if p.dtype != torch.float32 else p
                 factored = grad.dim() >= 2     # factorise 2-D+ params
                 state    = self.state[p]
 
@@ -2101,7 +2316,7 @@ class Adafactor(torch.optim.Optimizer):
                     p_f32.add_(p_f32, alpha=-group["weight_decay"] * lr)
 
                 # Cast back if parameter is not float32
-                if p.data.dtype != torch.float32:
-                    p.data.copy_(p_f32)
+                if p.dtype != torch.float32:
+                    p.copy_(p_f32)
 
         return loss

@@ -185,6 +185,18 @@ class TestQuantizeE5M2:
             f"1.0 should encode to 0x3C in E5M2, got {out.item():#04x}"
         )
 
+    def test_finite_overflow_saturates_but_inf_is_preserved(self, device):
+        from hip_quant.torch_api import quantize_e5m2
+        t = torch.tensor([1e9, -1e9, float("inf"), -float("inf")], device=device)
+        out = quantize_e5m2(t)
+        assert out.tolist() == [0x7B, 0xFB, 0x7C, 0xFC]
+
+    def test_half_nan_remains_nan(self, device):
+        from hip_quant.torch_api import quantize_e5m2, dequantize_e5m2
+        t = torch.tensor([float("nan")], device=device, dtype=torch.float16)
+        out = dequantize_e5m2(quantize_e5m2(t))
+        assert torch.isnan(out).item()
+
     def test_stochastic_output_contract(self, device):
         if not hasattr(_C, "quantize_e5m2_stochastic"):
             pytest.skip("extension must be rebuilt with quantize_e5m2_stochastic")
@@ -222,7 +234,7 @@ class TestQuantizeE5M2:
         assert out[1].item() == 0xFC
         assert out[2].item() & 0x7C == 0x7C
         assert out[2].item() & 0x03 != 0
-        assert out[3].item() == 0x7C
+        assert out[3].item() == 0x7B
 
     def test_stochastic_reproducible_with_seed(self, device):
         if not hasattr(_C, "quantize_e5m2_stochastic"):
@@ -609,6 +621,29 @@ class TestBlockwiseFp8:
 # ===========================================================================
 
 class TestFp8LinearFunction:
+    def test_hipblaslt_backward_uses_reciprocal_quant_scale(self, device, monkeypatch):
+        from hip_quant import torch_api as hqt
+        if not hasattr(torch, "_scaled_mm") or not hasattr(torch, "float8_e5m2"):
+            pytest.skip("test requires the hipBLASLt FP8 path")
+        monkeypatch.setenv("HIP_QUANT_FP8_LINEAR_BACKEND", "hipblaslt")
+        monkeypatch.delenv("HIP_QUANT_DISABLE_HIPBLASLT", raising=False)
+        torch.manual_seed(91)
+        go = torch.randn(16, 16, device=device)
+        weight = torch.randn(16, 16, device=device) * 0.05
+        inp = torch.randn(16, 16, device=device)
+        scale = 100.0
+
+        result = hqt._hipblaslt_fp8_backward(
+            go, weight, inp, weight_scale=scale, input_scale=1.0
+        )
+        if result is None:
+            pytest.skip("hipBLASLt does not support E5M2 backward on this device")
+        grad_input, _ = result
+        go_sim = go.to(torch.float8_e5m2).float()
+        weight_sim = (weight * scale).to(torch.float8_e5m2).float() / scale
+        expected = go_sim @ weight_sim
+        torch.testing.assert_close(grad_input.float(), expected, rtol=2e-3, atol=2e-3)
+
     def test_forward_shape(self, device):
         from hip_quant.torch_api import Fp8LinearFunction
         M, K, N = 8, 16, 32

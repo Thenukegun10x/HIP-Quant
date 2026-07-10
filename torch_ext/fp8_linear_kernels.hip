@@ -342,85 +342,23 @@ __global__
 __launch_bounds__(256, 4)
 void pack_fp8_weight_wmma_kernel(
     const uint8_t * __restrict__ B_fp8,      // [N, K]
-    uint8_t       * __restrict__ B_packed,   // [NT, KT, 16, 16]
+    uint8_t       * __restrict__ B_packed,   // [NT, KT, lane_group, lane, byte]
     int N, int K, int n_tiles, int k_tiles
 ) {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total = (int64_t)n_tiles * k_tiles * TILE_K * TILE_N;
     if (idx >= total) return;
 
-    int n_off = (int)(idx % TILE_N);
-    int t = (int)(idx / TILE_N);
-    int k_off = t % TILE_K;
-    t /= TILE_K;
-    int k_tile = t % k_tiles;
-    int n_tile = t / k_tiles;
+    int byte = (int)(idx & 7);
+    int lane = (int)((idx >> 3) & 15);
+    int lane_group = (int)((idx >> 7) & 1);
+    int64_t tile = idx >> 8;
+    int k_tile = (int)(tile % k_tiles);
+    int n_tile = (int)(tile / k_tiles);
 
-    int n = n_tile * TILE_N + n_off;
-    int k = k_tile * TILE_K + k_off;
+    int n = n_tile * TILE_N + lane;
+    int k = k_tile * TILE_K + lane_group * 8 + byte;
     B_packed[idx] = (n < N && k < K) ? B_fp8[n * K + k] : 0;
-}
-
-__global__
-__launch_bounds__(32 * WAVES_PER_BLOCK_N, 2)
-void fp8_gemm_e4m3_input_weight_fp8_packed_kernel(
-    const uint8_t * __restrict__ A_fp8,     // [M, K]
-    const uint8_t * __restrict__ B_packed,  // [NT, KT, 16, 16]
-    void          * __restrict__ C,         // [M, N]
-    const void    * __restrict__ bias,
-    int M, int N, int K,
-    int k_tiles,
-    float out_scale,
-    int c_dtype, int bias_dtype, bool has_bias
-) {
-    int wave = threadIdx.x >> 5;
-    int tid = threadIdx.x & 31;
-    if (wave >= WAVES_PER_BLOCK_N) return;
-
-    int m = blockIdx.y * TILE_M;
-    int n_tile = blockIdx.x * WAVES_PER_BLOCK_N + wave;
-    int n = n_tile * TILE_N;
-    if (m >= M || n >= N) return;
-
-    int lane_wrapped = tid & 15;
-    int lane_group   = tid >> 4;
-
-    v8f acc = (v8f){};
-
-    for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
-        int k = k_tile * TILE_K;
-        int a_packed[2] = {0, 0};
-        int b_packed[2] = {0, 0};
-
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            int k_offset = lane_group * 8 + i;
-
-            int a_row = m + lane_wrapped;
-            int a_col = k + k_offset;
-            ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < K) ? A_fp8[a_row * K + a_col] : 0;
-
-            int b_col = n + lane_wrapped;
-            int64_t b_idx = (((int64_t)n_tile * k_tiles + k_tile) * TILE_K + k_offset) * TILE_N + lane_wrapped;
-            ((uint8_t*)b_packed)[i] = (b_col < N) ? B_packed[b_idx] : 0;
-        }
-
-        v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
-        v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        int row = m + lane_group * 8 + i;
-        int col = n + lane_wrapped;
-        if (row < M && col < N) {
-            float value = acc[i] * out_scale;
-            if (has_bias) value += load_float_input(bias, bias_dtype, col);
-            store_float_output(C, c_dtype, row * N + col, value);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,22 +688,6 @@ void launch_pack_fp8_weight_for_wmma(
     hipLaunchKernelGGL(pack_fp8_weight_wmma_kernel,
                        dim3((uint32_t)blocks), dim3(threads), 0, stream,
                        B_fp8, B_packed, N, K, n_tiles, k_tiles);
-}
-
-void launch_fp8_linear_forward_fp8_input_weight_packed(
-    const uint8_t* A_fp8, const uint8_t* B_packed, void* C, const void* bias,
-    int M, int N, int K, int k_tiles,
-    float input_scale, float weight_inv_scale,
-    int c_dtype, int bias_dtype, bool has_bias,
-    hipStream_t stream
-) {
-    dim3 block(32 * WAVES_PER_BLOCK_N);
-    dim3 grid((N + TILE_N * WAVES_PER_BLOCK_N - 1) / (TILE_N * WAVES_PER_BLOCK_N),
-              (M + TILE_M - 1) / TILE_M);
-    float out_scale = weight_inv_scale / input_scale;
-    hipLaunchKernelGGL(fp8_gemm_e4m3_input_weight_fp8_packed_kernel, grid, block, 0, stream,
-                       A_fp8, B_packed, C, bias, M, N, K, k_tiles, out_scale,
-                       c_dtype, bias_dtype, has_bias);
 }
 
 void launch_fp8_linear_forward_blockwise(
