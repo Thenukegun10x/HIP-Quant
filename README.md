@@ -128,7 +128,7 @@ extension can still be built locally with `setup_torch.py build_ext --inplace`.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-0.5.5-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-0.5.6-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -168,6 +168,34 @@ grad = (np.random.randn(4096, 4096) * 128).astype(np.float32)
 x_e4m3    = hq.quantize_numpy(x,    GGML_TYPE["F8_E4M3"])  # forward
 grad_e5m2 = hq.quantize_numpy(grad, GGML_TYPE["F8_E5M2"])  # backward
 ```
+
+#### Q → FP8 dequantization (offline)
+`dequantize_to_fp8` expands packed GGML Q blocks **directly** to raw FP8 bytes on
+the GPU. Each thread reconstructs a scalar from the Q block and immediately
+encodes it as E4M3 or E5M2 in the same kernel, so no float32 buffer is
+allocated or transferred. Supported source types: legacy `Q4_0/Q4_1/Q5_0/Q5_1/
+Q8_0/Q8_1` and K-quants `Q2_K` through `Q6_K`. I-quants and ternary quants are
+rejected (their codebook decoders are not part of this direct path yet).
+
+```python
+from hip_quant import GGML_TYPE, get_hip_quant
+
+hq = get_hip_quant()
+w  = np.random.randn(4096, 4096).astype(np.float32)
+
+# First quantize to a narrow Q type, then expand straight to FP8 bytes
+q4k = hq.quantize_numpy(w, GGML_TYPE["Q4_K"])          # 4-bit K-quant
+e4m3 = hq.dequantize_to_e4m3(q4k, GGML_TYPE["Q4_K"], 4096)  # uint8 (4096,4096)
+e5m2 = hq.dequantize_to_e5m2(q4k, GGML_TYPE["Q4_K"], 4096)  # uint8 (4096,4096)
+
+# Generic form: pick output format at runtime
+e4m3 = hq.dequantize_to_fp8(q4k, GGML_TYPE["Q4_K"], 4096, output_format="E4M3")
+```
+
+- The output array shape is `(nrows, n_per_row)` with one FP8 byte per logical
+  element — same layout as `quantize_numpy(..., GGML_TYPE["F8_E4M3"])`.
+- If the source type matches the requested FP8 format (`F8_E4M3`/`F8_E5M2`), the
+  path short-circuits to a host byte copy and skips the GPU altogether.
 
 #### CLI
 ```powershell
@@ -565,18 +593,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-0.5.5-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.5.tar.gz"
+  "dist\hip_quant-0.5.6-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.6.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-0.5.5-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.5.tar.gz"
+  "dist\hip_quant-0.5.6-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-0.5.6.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-0.5.5-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-0.5.6-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:

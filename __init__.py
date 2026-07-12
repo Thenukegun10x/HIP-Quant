@@ -247,6 +247,19 @@ class HipQuant:
             ]
         except AttributeError:
             self._quantize_tensor_fp8_e5m2_input = None
+        try:
+            self._dequantize_tensor_to_fp8 = self._dll.dequantize_tensor_to_fp8
+            self._dequantize_tensor_to_fp8.restype = ctypes.c_size_t
+            self._dequantize_tensor_to_fp8.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int,
+            ]
+        except AttributeError:
+            self._dequantize_tensor_to_fp8 = None
         self._dll.ggml_type_size_for.restype = ctypes.c_size_t
         self._dll.ggml_type_size_for.argtypes = [ctypes.c_int]
         self._dll.ggml_blck_size_for.restype = ctypes.c_size_t
@@ -510,6 +523,85 @@ class HipQuant:
                 f"Quantize (FP8 input) returned {result} bytes, expected {out_nbytes}"
             )
         return dst
+
+    def dequantize_to_fp8(self, packed, type_num, n_per_row, output_format="E4M3"):
+        """Dequantize packed GGML Q blocks directly to raw FP8 bytes.
+
+        The conversion and FP8 encode execute in one GPU kernel, so no F32
+        tensor is allocated or copied back to the host.  It supports legacy
+        Q4/Q5/Q8 formats and Q2_K through Q6_K.  I-Quants and ternary quants
+        are intentionally rejected because their table/codebook decoders are
+        not part of this direct conversion path yet.
+
+        Args:
+            packed: Flat packed ``uint8`` Q-type data, such as returned by
+                :meth:`quantize_numpy` or :meth:`quantize_from_fp8`.
+            type_num: Source GGML Q type number (for example,
+                ``GGML_TYPE["Q4_K"]``).
+            n_per_row: Logical number of elements in each source row.  It
+                must be a multiple of the source type's block size.
+            output_format: ``"E4M3"`` / ``"F8_E4M3"`` or ``"E5M2"`` /
+                ``"F8_E5M2"``.  The result contains one raw FP8 byte per
+                logical element.
+
+        Returns:
+            A C-contiguous ``uint8`` array with shape ``(nrows, n_per_row)``.
+        """
+        if self._dequantize_tensor_to_fp8 is None:
+            raise RuntimeError(
+                "Loaded hip_quantize library does not support Q-to-FP8 dequantization; rebuild hip_quantize.dll"
+            )
+
+        type_num = int(type_num)
+        n_per_row = int(n_per_row)
+        block_size = self.blck_size(type_num)
+        type_size = self.type_size(type_num)
+        if block_size <= 0 or type_size <= 0:
+            raise ValueError(f"Unsupported source type: {type_num}")
+        if n_per_row <= 0 or n_per_row % block_size != 0:
+            raise ValueError(
+                f"n_per_row ({n_per_row}) must be a positive multiple of block size ({block_size})"
+            )
+
+        if isinstance(output_format, str):
+            output_format = output_format.upper()
+        if output_format in ("E4M3", "F8_E4M3", GGML_TYPE["F8_E4M3"]):
+            output_type = GGML_TYPE["F8_E4M3"]
+        elif output_format in ("E5M2", "F8_E5M2", GGML_TYPE["F8_E5M2"]):
+            output_type = GGML_TYPE["F8_E5M2"]
+        else:
+            raise ValueError(f"Unsupported FP8 output_format: {output_format}")
+
+        packed = np.ascontiguousarray(packed, dtype=np.uint8).reshape(-1)
+        row_bytes = type_size * (n_per_row // block_size)
+        if packed.size == 0 or packed.size % row_bytes != 0:
+            raise ValueError(
+                f"packed size ({packed.size}) must be a non-zero multiple of row size ({row_bytes})"
+            )
+        nrows = packed.size // row_bytes
+        dst = np.empty((nrows, n_per_row), dtype=np.uint8)
+
+        result = self._dequantize_tensor_to_fp8(
+            type_num,
+            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            nrows,
+            n_per_row,
+            output_type,
+        )
+        if result != dst.size:
+            raise RuntimeError(
+                f"Q-to-FP8 dequantization returned {result} bytes, expected {dst.size}"
+            )
+        return dst
+
+    def dequantize_to_e4m3(self, packed, type_num, n_per_row):
+        """Shortcut for :meth:`dequantize_to_fp8` with E4M3 output."""
+        return self.dequantize_to_fp8(packed, type_num, n_per_row, "E4M3")
+
+    def dequantize_to_e5m2(self, packed, type_num, n_per_row):
+        """Shortcut for :meth:`dequantize_to_fp8` with E5M2 output."""
+        return self.dequantize_to_fp8(packed, type_num, n_per_row, "E5M2")
 
 
 _default_instance = None

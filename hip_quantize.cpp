@@ -34,6 +34,7 @@
 #include "kernels/quant_f8_e4m3.cu"
 #include "kernels/quant_f8_e5m2.cu"
 #include "kernels/fp8_expand.cu"
+#include "kernels/dequant_to_fp8.cu"
 #include "kernels/fp8_gemm_test.cu"
 #include "hip_quant_iq2xxs_data.h"
 #include "hip_quant_iq2xs_data.h"
@@ -435,6 +436,74 @@ static int dispatch_quantize_kernel(
 }
 
 // ============================================================
+// Q-type -> FP8 kernel dispatch
+// ============================================================
+
+#ifdef __cplusplus
+extern "C++" {
+#endif
+template <bool E5M2>
+static int dispatch_dequantize_to_fp8_kernel(
+    int type, const uint8_t *d_src, uint8_t *d_dst,
+    int nrows, int n_per_row, int n_blocks_per_row
+) {
+    dim3 gridDim((unsigned int)nrows, (unsigned int)n_blocks_per_row);
+
+    switch (type) {
+        case 2:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q4_0_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q4_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 3:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q4_1_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q4_1 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 6:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q5_0_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q5_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 7:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q5_1_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q5_1 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 8:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q8_0_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q8_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 9:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q8_1_to_fp8_kernel<E5M2>), gridDim, 32, 0, 0,
+                (const block_q8_1 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 10:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q2_k_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_q2_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 11:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q3_k_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_q3_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 12:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q4_k_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_q4_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 13:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q5_k_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_q5_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 14:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q6_k_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_q6_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        default:
+            return 0;
+    }
+    return 1;
+}
+#ifdef __cplusplus
+}
+#endif
+
+// ============================================================
 // quantize_tensor — standard F32 input path
 // ============================================================
 
@@ -671,6 +740,93 @@ HIP_QUANT_EXPORT size_t quantize_tensor_fp8_e5m2_input(
     const float* imatrix
 ) {
     return quantize_tensor_fp8_input_impl(type, src_fp8, dst, nrows, n_per_row, imatrix, 37);
+}
+
+// ============================================================
+// dequantize_tensor_to_fp8 — packed GGML Q input path
+//
+// Expands Q4/Q5/Q8 and K-quant blocks directly to raw FP8 E4M3 or E5M2
+// bytes.  The intermediate float value exists only in a GPU register, so the
+// conversion does not allocate or transfer an F32 tensor.
+// ============================================================
+
+HIP_QUANT_EXPORT size_t dequantize_tensor_to_fp8(
+    int type,
+    const uint8_t* src,
+    uint8_t* dst_fp8,
+    int64_t nrows,
+    int64_t n_per_row,
+    int dst_fp8_type
+) {
+    if (dst_fp8_type != 36 && dst_fp8_type != 37) {
+        fprintf(stderr, "hip_quantize: FP8 destination type must be F8_E4M3 (36) or F8_E5M2 (37)\n");
+        return 0;
+    }
+    if (!ensure_initialized()) return 0;
+
+    int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
+    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
+
+    size_t row_size = get_row_size(type, n_per_row);
+    if (row_size == 0) {
+        fprintf(stderr, "hip_quantize: unsupported type %d\n", type);
+        return 0;
+    }
+    const int64_t total_elements = nrows * n_per_row;
+    if (!validate_flat_blocks(total_elements, 256, "Q to FP8 dequantize")) return 0;
+
+    // A matching FP8 source is already the requested output representation.
+    if (type == dst_fp8_type) {
+        memcpy(dst_fp8, src, (size_t)total_elements);
+        return (size_t)total_elements;
+    }
+
+    const size_t src_bytes = row_size * (size_t)nrows;
+    const size_t dst_bytes = (size_t)total_elements;
+    if (src_bytes > g_d_dst_cap) {
+        if (g_d_dst) hipFree(g_d_dst);
+        hipError_t e = hipMalloc(&g_d_dst, src_bytes);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(Q source) failed: %s\n", hipGetErrorString(e)); return 0; }
+        g_d_dst_cap = src_bytes;
+    }
+    if (dst_bytes > g_d_src_fp8_cap) {
+        if (g_d_src_fp8) hipFree(g_d_src_fp8);
+        hipError_t e = hipMalloc(&g_d_src_fp8, dst_bytes);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMalloc(FP8 destination) failed: %s\n", hipGetErrorString(e)); return 0; }
+        g_d_src_fp8_cap = dst_bytes;
+    }
+
+    {
+        hipError_t e = hipMemcpy(g_d_dst, src, src_bytes, hipMemcpyHostToDevice);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(Q source) failed: %s\n", hipGetErrorString(e)); return 0; }
+    }
+
+    const bool launched = dst_fp8_type == 37
+        ? dispatch_dequantize_to_fp8_kernel<true>(type, g_d_dst, g_d_src_fp8,
+                                                   (int)nrows, (int)n_per_row, n_blocks_per_row)
+        : dispatch_dequantize_to_fp8_kernel<false>(type, g_d_dst, g_d_src_fp8,
+                                                    (int)nrows, (int)n_per_row, n_blocks_per_row);
+    if (!launched) {
+        fprintf(stderr,
+            "hip_quantize: Q to FP8 dequantization supports Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K through Q6_K; type %d is not supported\n",
+            type);
+        return 0;
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "hip_quantize: Q to FP8 kernel launch error: %s (code %d)\n", hipGetErrorString(err), (int)err);
+        return 0;
+    }
+    {
+        hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: Q to FP8 synchronize failed: %s\n", hipGetErrorString(e)); return 0; }
+    }
+    {
+        hipError_t e = hipMemcpy(dst_fp8, g_d_src_fp8, dst_bytes, hipMemcpyDeviceToHost);
+        if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemcpy(FP8 destination) failed: %s\n", hipGetErrorString(e)); return 0; }
+    }
+    return dst_bytes;
 }
 
 // ============================================================
