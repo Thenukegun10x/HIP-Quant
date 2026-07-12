@@ -151,6 +151,11 @@ void launch_fp8_linear_forward_v2_input_weight(
     float input_scale, float weight_inv_scale,
     int c_dtype, int bias_dtype, bool has_bias,
     hipStream_t stream);
+void launch_dequant_q_to_fp8(
+    const uint8_t* src, uint8_t* dst,
+    int type_num, int nrows, int blocks_per_row, int n_per_row,
+    int block_size, int e5m2,
+    hipStream_t stream);
 } // extern "C"
 
 constexpr int HIP_QUANT_DTYPE_F32  = 0;
@@ -1247,6 +1252,101 @@ torch::Tensor fp8_linear_forward_v2_input_weight(
 }
 
 // ---------------------------------------------------------------------------
+// GGML Q-type -> FP8 direct dequantization (GPU-resident, zero copies)
+// ---------------------------------------------------------------------------
+constexpr int GGML_TYPE_Q4_0 = 2;
+constexpr int GGML_TYPE_Q4_1 = 3;
+constexpr int GGML_TYPE_Q5_0 = 6;
+constexpr int GGML_TYPE_Q5_1 = 7;
+constexpr int GGML_TYPE_Q8_0 = 8;
+constexpr int GGML_TYPE_Q8_1 = 9;
+constexpr int GGML_TYPE_Q2_K = 10;
+constexpr int GGML_TYPE_Q3_K = 11;
+constexpr int GGML_TYPE_Q4_K = 12;
+constexpr int GGML_TYPE_Q5_K = 13;
+constexpr int GGML_TYPE_Q6_K = 14;
+
+static inline int ggml_block_size(int type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q8_1:
+            return 32;
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return 256;
+        default: return 0;
+    }
+}
+
+static inline int ggml_type_block_bytes(int type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0: return 18;
+        case GGML_TYPE_Q4_1: return 20;
+        case GGML_TYPE_Q5_0: return 22;
+        case GGML_TYPE_Q5_1: return 24;
+        case GGML_TYPE_Q8_0: return 34;
+        case GGML_TYPE_Q8_1: return 36;
+        case GGML_TYPE_Q2_K: return 84;
+        case GGML_TYPE_Q3_K: return 110;
+        case GGML_TYPE_Q4_K: return 144;
+        case GGML_TYPE_Q5_K: return 176;
+        case GGML_TYPE_Q6_K: return 210;
+        default: return 0;
+    }
+}
+
+torch::Tensor dequantize_q_to_fp8(
+    torch::Tensor packed,
+    int64_t type_num,
+    int64_t n_per_row,
+    bool e5m2
+) {
+    TORCH_CHECK(packed.is_cuda(),       "dequantize_q_to_fp8: packed must be a HIP/CUDA tensor");
+    TORCH_CHECK(packed.is_contiguous(), "dequantize_q_to_fp8: packed must be contiguous");
+    TORCH_CHECK(packed.scalar_type() == torch::kUInt8,
+                "dequantize_q_to_fp8: packed must be uint8 (raw Q-type bytes)");
+
+    int type = (int)type_num;
+    int block_size = ggml_block_size(type);
+    int block_bytes = ggml_type_block_bytes(type);
+    TORCH_CHECK(block_size > 0 && block_bytes > 0,
+                "dequantize_q_to_fp8: unsupported GGML type ", type,
+                ". Supported: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14)");
+
+    int iN = (int)n_per_row;
+    TORCH_CHECK(iN > 0 && iN % block_size == 0,
+                "dequantize_q_to_fp8: n_per_row (", iN,
+                ") must be a positive multiple of block_size (", block_size, ")");
+
+    int blocks_per_row = iN / block_size;
+    int64_t row_bytes = (int64_t)blocks_per_row * block_bytes;
+    int64_t total = packed.numel();
+    TORCH_CHECK(total > 0 && total % row_bytes == 0,
+                "dequantize_q_to_fp8: packed size (", total,
+                ") must be a non-zero multiple of row size (", row_bytes, ")");
+    int nrows = (int)(total / row_bytes);
+
+    TORCH_CHECK((int64_t)nrows <= 65535,
+                "dequantize_q_to_fp8: nrows (", nrows, ") exceeds HIP grid limit 65535");
+    TORCH_CHECK((int64_t)blocks_per_row <= 65535,
+                "dequantize_q_to_fp8: blocks_per_row (", blocks_per_row, ") exceeds HIP grid limit 65535");
+
+    auto output = torch::empty({nrows, iN}, packed.options().dtype(torch::kUInt8));
+
+    launch_dequant_q_to_fp8(
+        packed.data_ptr<uint8_t>(),
+        output.data_ptr<uint8_t>(),
+        type, nrows, blocks_per_row, iN, block_size,
+        e5m2 ? 1 : 0,
+        current_stream()
+    );
+
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // Pybind11 module registration
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1351,4 +1451,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "FP8 linear backward weight using pre-quantized E5M2 grad_output",
           py::arg("grad_output_fp8"), py::arg("grad_output_dtype_source"),
           py::arg("input"), py::arg("input_scale"));
+
+    m.def("dequantize_q_to_fp8", &dequantize_q_to_fp8,
+          "Dequantize GGML Q-type packed bytes (on GPU) directly to FP8 uint8 (on GPU), zero copies.\n"
+          "Supported types: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14).",
+          py::arg("packed"), py::arg("type_num"), py::arg("n_per_row"),
+          py::arg("e5m2") = false);
 }

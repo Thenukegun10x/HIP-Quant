@@ -527,6 +527,59 @@ def adafactor_row_col_mean_square(
     return _load_extension().adafactor_row_col_mean_square(grad.contiguous(), float(eps))
 
 
+GGML_Q_TO_FP8_SUPPORTED = {
+    2: ("Q4_0", 32, 18),
+    3: ("Q4_1", 32, 20),
+    6: ("Q5_0", 32, 22),
+    7: ("Q5_1", 32, 24),
+    8: ("Q8_0", 32, 34),
+    9: ("Q8_1", 32, 36),
+    10: ("Q2_K", 256, 84),
+    11: ("Q3_K", 256, 110),
+    12: ("Q4_K", 256, 144),
+    13: ("Q5_K", 256, 176),
+    14: ("Q6_K", 256, 210),
+}
+
+
+def dequantize_q_to_fp8(
+    packed: "torch.Tensor",
+    type_num: int,
+    n_per_row: int,
+    e5m2: bool = False,
+) -> "torch.Tensor":
+    """Dequantize GGML Q-type packed bytes directly to FP8 on GPU (zero copies).
+
+    The input ``packed`` must be a contiguous uint8 CUDA tensor containing
+    raw GGML Q-block bytes already resident on the GPU.  The output is a
+    ``[nrows, n_per_row]`` uint8 CUDA tensor of raw FP8 bytes (E4M3 by
+    default, E5M2 if ``e5m2=True``).
+
+    Supported types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K..Q6_K.
+    """
+    return _load_extension().dequantize_q_to_fp8(
+        packed.contiguous(), int(type_num), int(n_per_row), bool(e5m2)
+    )
+
+
+def dequantize_q_to_e4m3(
+    packed: "torch.Tensor",
+    type_num: int,
+    n_per_row: int,
+) -> "torch.Tensor":
+    """Shortcut: Q-type -> FP8 E4M3 on GPU (zero copies)."""
+    return dequantize_q_to_fp8(packed, type_num, n_per_row, e5m2=False)
+
+
+def dequantize_q_to_e5m2(
+    packed: "torch.Tensor",
+    type_num: int,
+    n_per_row: int,
+) -> "torch.Tensor":
+    """Shortcut: Q-type -> FP8 E5M2 on GPU (zero copies)."""
+    return dequantize_q_to_fp8(packed, type_num, n_per_row, e5m2=True)
+
+
 # ===========================================================================
 # Phase 3: Autograd-safe FP8 linear
 # ===========================================================================

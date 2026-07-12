@@ -209,6 +209,31 @@ python -m hip_quant --help
 
 > **Requires:** `python setup_torch.py build_ext --inplace` first.
 
+#### Q → FP8 dequantization
+`dequantize_q_to_fp8` expands packed GGML Q blocks **directly** to raw FP8 bytes on the GPU. It reads packed PyTorch GPU bytes and writes `torch.uint8` directly into another GPU tensor, eliminating expensive PCI-e transfers and host CPU decoding.
+
+Supported source types: legacy `Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1` and K-quants `Q2_K` through `Q6_K`. I-quants and ternary quants are rejected.
+
+```python
+import torch
+import hip_quant.torch_api as hq
+from hip_quant import GGML_TYPE
+
+# Packed Q4_K bytes, residing on the GPU
+packed_q = torch.load("q4k_tensor.pt").cuda()
+
+# Direct GPU-to-GPU expansion -> torch.uint8
+e4m3 = hq.dequantize_q_to_fp8(packed_q, GGML_TYPE["Q4_K"], n_per_row=4096, e5m2=False)
+
+# Shortcuts
+e4m3 = hq.dequantize_q_to_e4m3(packed_q, GGML_TYPE["Q4_K"], 4096)
+e5m2 = hq.dequantize_q_to_e5m2(packed_q, GGML_TYPE["Q4_K"], 4096)
+```
+
+The output shape is `[nrows, n_per_row]`.
+
+---
+
 #### Element-wise FP8 quant / dequant (Phase 1 & 2)
 
 ```python

@@ -136,6 +136,7 @@ _MOCK_C = types.SimpleNamespace(
     fp8_linear_forward=_mock_fp8_linear_forward,
     fp8_linear_backward_input=_mock_fp8_linear_backward_input,
     fp8_linear_backward_weight=_mock_fp8_linear_backward_weight,
+    dequantize_q_to_fp8=lambda packed, type_num, n_per_row, e5m2=False: packed.clone(),
 )
 
 # ---------------------------------------------------------------------------
