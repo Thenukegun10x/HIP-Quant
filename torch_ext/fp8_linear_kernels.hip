@@ -98,7 +98,9 @@ void fp8_gemm_e4m3_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -111,6 +113,7 @@ void fp8_gemm_e4m3_kernel(
             store_float_output(C, c_dtype, row * N + col, value);
         }
     }
+    __threadfence_block();
 }
 
 // Same forward GEMM, but B is already E4M3 bytes produced from weight * weight_scale.
@@ -158,7 +161,9 @@ void fp8_gemm_e4m3_weight_fp8_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -171,6 +176,7 @@ void fp8_gemm_e4m3_weight_fp8_kernel(
             store_float_output(C, c_dtype, row * N + col, value);
         }
     }
+    __threadfence_block();
 }
 
 // Same forward GEMM, but A is already scaled E4M3 bytes and B is a master tensor.
@@ -218,7 +224,9 @@ void fp8_gemm_e4m3_input_fp8_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -231,6 +239,7 @@ void fp8_gemm_e4m3_input_fp8_kernel(
             store_float_output(C, c_dtype, row * N + col, value);
         }
     }
+    __threadfence_block();
 }
 
 // Correctness-first fused block-scaled FP8 linear:
@@ -323,7 +332,9 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -336,6 +347,7 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
             store_float_output(C, c_dtype, row * N + col, value);
         }
     }
+    __threadfence_block();
 }
 
 __global__
@@ -409,7 +421,9 @@ void fp8_gemm_backward_input_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -420,6 +434,7 @@ void fp8_gemm_backward_input_kernel(
             store_float_output(grad_input, grad_input_dtype, row * K + col, acc[i] * out_scale);
         }
     }
+    __threadfence_block();
 }
 
 // Backward input gradient with grad_output already quantized to E5M2/BF8 bytes.
@@ -466,7 +481,9 @@ void fp8_gemm_backward_input_fp8_grad_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -477,6 +494,7 @@ void fp8_gemm_backward_input_fp8_grad_kernel(
             store_float_output(grad_input, grad_input_dtype, row * K + col, acc[i] * out_scale);
         }
     }
+    __threadfence_block();
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +545,9 @@ void fp8_gemm_backward_weight_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -538,6 +558,7 @@ void fp8_gemm_backward_weight_kernel(
             store_float_output(grad_weight, grad_weight_dtype, row * K + col, acc[i] * out_scale);
         }
     }
+    __threadfence_block();
 }
 
 // Backward weight gradient with grad_output already quantized to E5M2/BF8 bytes.
@@ -584,7 +605,9 @@ void fp8_gemm_backward_weight_fp8_grad_kernel(
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
         v2i b_vec = (v2i){ b_packed[0], b_packed[1] };
+        #if defined(__gfx1200__) || defined(__gfx1201__)
         acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
     }
 
     #pragma unroll
@@ -595,6 +618,7 @@ void fp8_gemm_backward_weight_fp8_grad_kernel(
             store_float_output(grad_weight, grad_weight_dtype, row * K + col, acc[i] * out_scale);
         }
     }
+    __threadfence_block();
 }
 
 // ---------------------------------------------------------------------------

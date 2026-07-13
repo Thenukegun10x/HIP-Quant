@@ -67,6 +67,16 @@ def _configure_windows_toolchain():
             os.environ.setdefault("CXX", cl_short)
             _prepend_path(cl.parent)
 
+    # link.exe invokes rc.exe to embed the extension manifest. vcvars64.bat
+    # does not always add a Windows SDK bin directory in non-interactive
+    # shells, which otherwise makes an otherwise successful HIP build fail at
+    # the final link step with LNK1158.
+    resource_compilers = glob.glob(
+        r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe"
+    )
+    if resource_compilers:
+        _prepend_path(Path(sorted(resource_compilers)[-1]).parent)
+
     if os.environ.get("VSCMD_VER"):
         os.environ.setdefault("DISTUTILS_USE_SDK", "1")
 
@@ -86,6 +96,7 @@ ext = CUDAExtension(
     name="hip_quant._C",
     sources=[
         "torch_ext/pytorch_bindings.cpp",
+        "torch_ext/current_stream.hip",
         "torch_ext/fp8_quant_kernels.hip",
         "torch_ext/fp8_linear_kernels.hip",
         "torch_ext/fp8_linear_kernels_v2.hip",
@@ -93,11 +104,14 @@ ext = CUDAExtension(
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags
-        "cxx": ["-O3"],
+        "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],
         # Device (hipcc) flags; nvcc key is used by PyTorch even on ROCm
         "nvcc": [
             "-O3",
             "-mno-wavefrontsize64",
+            # One-pass FP8 conversion has no in-kernel reuse.  Clang lowers
+            # the guarded helpers to AMDGPU non-temporal memory operations.
+            "-DHIP_QUANT_ENABLE_NONTEMPORAL=1",
             "--offload-arch=gfx1200",
             "--offload-arch=gfx1201",
             # Allow device code to include project headers via relative paths
@@ -110,7 +124,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.5.9",
+    version="0.6.0",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

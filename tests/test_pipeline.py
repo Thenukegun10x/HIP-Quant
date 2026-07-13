@@ -147,6 +147,7 @@ _torch_api_module._C = _MOCK_C
 
 from hip_quant.torch_api import (  # noqa: E402
     quantize_e4m3, quantize_e5m2, dequantize_e4m3, dequantize_e5m2,
+    capture_hip_graph,
     Fp8LinearFunction, Fp8Linear,
     Fp8ScaledLinearFunction, Fp8ScaledLinear,
     Fp8ShadowLinearFunction, Fp8ShadowLinear,
@@ -241,6 +242,13 @@ class TestPhase2(unittest.TestCase):
         x   = torch.tensor([[1.1]])
         out = dequantize_e4m3(quantize_e4m3(x))
         self.assertNotAlmostEqual(out.item(), 1.1, places=6)
+
+
+class TestHipGraphValidation(unittest.TestCase):
+
+    def test_cpu_inputs_are_rejected_before_capture(self):
+        with self.assertRaisesRegex(ValueError, "HIP/CUDA tensor"):
+            capture_hip_graph(lambda x: x * 2, torch.ones(4))
 
 
 # ===========================================================================

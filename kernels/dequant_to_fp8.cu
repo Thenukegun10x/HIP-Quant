@@ -1,12 +1,27 @@
 #include <hip/hip_runtime.h>
 #include "../hip_quant_types.h"
 #include "../hip_quant_util.h"
+#include "../hip_iquant_util.h"
 
-// Direct GGML Q-type -> FP8 conversion kernels.
-//
-// The packed source blocks remain on the GPU throughout the conversion.  Each
-// thread reconstructs one scalar and immediately encodes it as E4M3 or E5M2,
-// avoiding a temporary float32 tensor and its associated device traffic.
+// IQ2_XXS / IQ3_XXS grid tables (declared in their quant kernels, in constant memory)
+extern __constant__ int8_t d_iq2xxs_grid[256][8];
+extern __constant__ int8_t d_iq3xxs_grid[256][4];
+
+// GGML-compatible sign lookup table for IQ2_XXS / IQ2_XS / IQ3_XXS
+// Maps 7-bit sign patterns to 8-bit expanded sign bytes.
+__device__ const uint8_t d_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+// Bit masks for testing sign bits (positions 0-7)
+__device__ const uint8_t d_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
 template <bool E5M2>
 __device__ inline uint8_t fp32_to_output_fp8(float value) {
@@ -229,4 +244,267 @@ void dequant_q6_k_to_fp8_kernel(
     const float scale = fp16_to_fp32(q.d) * (float)q.scales[i >> 4];
     dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
         scale * (float)value);
+}
+
+// =========================================================================
+// I-Quant dequant-to-FP8 kernels (GGML reference formulas)
+// =========================================================================
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq2_xxs_to_fp8_kernel(
+    const block_iq2_xxs * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq2_xxs q = src[row * blocks_per_row + block];
+
+    const int ib32 = i / 32;        // sub-block index (0..7)
+    const int l = (i % 32) / 8;     // group within sub-block (0..3)
+    const int j = i % 8;            // position within group (0..7)
+
+    const uint8_t *aux8 = (const uint8_t *)(q.qs + 4 * ib32);
+    const uint8_t *grid = (const uint8_t *)(d_iq2xxs_grid + aux8[l]);
+    const uint32_t aux32_1 = ((const uint32_t *)(q.qs + 4 * ib32))[1];
+    const uint8_t signs = d_ksigns_iq2xs[(aux32_1 >> (7 * l)) & 127];
+    const float db = fp16_to_fp32(q.d) * (0.5f + (float)(aux32_1 >> 28)) * 0.25f;
+
+    float val = db * (float)((int8_t)grid[j]);
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        (signs & d_kmask_iq2xs[j]) ? -val : val);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq2_xs_to_fp8_kernel(
+    const block_iq2_xs * __restrict__ src, uint8_t * __restrict__ dst,
+    const int8_t * __restrict__ grid,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq2_xs q = src[row * blocks_per_row + block];
+
+    const int ib32 = i / 32;
+    const int l = (i % 32) / 8;
+    const int j = i % 8;
+
+    const uint16_t qs_entry = q.qs[4 * ib32 + l];
+    const uint8_t *grid_row = (const uint8_t *)(grid + (qs_entry & 511));
+    const uint8_t signs = d_ksigns_iq2xs[qs_entry >> 9];
+
+    const int nibble = q.scales[ib32];
+    const float db_l = fp16_to_fp32(q.d) * (0.5f + (float)(nibble & 0xf)) * 0.25f;
+    const float db_h = fp16_to_fp32(q.d) * (0.5f + (float)(nibble >> 4)) * 0.25f;
+    const float db = (l / 2) == 0 ? db_l : db_h;
+
+    float val = db * (float)((int8_t)grid_row[j]);
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        (signs & d_kmask_iq2xs[j]) ? -val : val);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq3_xxs_to_fp8_kernel(
+    const block_iq3_xxs * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq3_xxs q = src[row * blocks_per_row + block];
+
+    const int ib32 = i / 32;
+    const int l = (i % 32) / 8;
+    const int j = i % 8;
+
+    const uint8_t *grid_qs = q.qs + 8 * ib32;
+    const uint8_t *scales_and_signs = q.qs + QK_K / 4;
+    const uint32_t aux32 = ((const uint32_t *)scales_and_signs)[ib32];
+    const float db = fp16_to_fp32(q.d) * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+    const uint8_t signs = d_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+
+    const int grid_idx = (j < 4)
+        ? (int)grid_qs[2 * l + 0]
+        : (int)grid_qs[2 * l + 1];
+    const int grid_pos = j & 3;
+
+    const uint8_t *grid_row = (const uint8_t *)(d_iq3xxs_grid + grid_idx);
+    float val = db * (float)((int8_t)grid_row[grid_pos]);
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        (signs & d_kmask_iq2xs[j]) ? -val : val);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(32, 8)
+void dequant_iq4_nl_to_fp8_kernel(
+    const block_iq4_nl * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK4_NL) return;
+    const block_iq4_nl q = src[row * blocks_per_row + block];
+    const uint8_t nibble = i < 16 ? (q.qs[i] & 0x0f) : (q.qs[i - 16] >> 4);
+    dst[row * n_per_row + block * QK4_NL + i] = fp32_to_output_fp8<E5M2>(
+        fp16_to_fp32(q.d) * (float)d_kvalues_iq4nl[nibble]);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq4_xs_to_fp8_kernel(
+    const block_iq4_xs * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq4_xs q = src[row * blocks_per_row + block];
+
+    const int ib = i / 32;          // sub-block (0..7)
+    const int pos_in_sub = i % 32;  // position (0..31)
+    const int nibble = (pos_in_sub < 16)
+        ? (q.qs[16 * ib + pos_in_sub] & 0x0f)
+        : (q.qs[16 * ib + (pos_in_sub - 16)] >> 4);
+
+    const int ls_low = (q.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+    const int ls_high = (q.scales_h >> (2 * ib)) & 3;
+    const int ls = ls_low | (ls_high << 4);
+    const float dl = fp16_to_fp32(q.d) * (float)(ls - 32);
+
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        dl * (float)d_kvalues_iq4nl[nibble]);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq1_s_to_fp8_kernel(
+    const block_iq1_s * __restrict__ src, uint8_t * __restrict__ dst,
+    const int8_t * __restrict__ iq1s_grid,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq1_s q = src[row * blocks_per_row + block];
+
+    const int ib = i / 32;
+    const int l = (i % 32) / 8;
+    const int j = i % 8;
+
+    const float d = fp16_to_fp32(q.d);
+    const uint16_t qh_entry = q.qh[ib];
+    const float dl = d * (float)(2 * ((qh_entry >> 12) & 7) + 1);
+    const float delta = (qh_entry & 0x8000) ? -0.125f : 0.125f;
+
+    const int grid_high = (qh_entry >> (3 * l)) & 7;
+    const int grid_idx = (int)q.qs[4 * ib + l] | (grid_high << 8);
+    const int8_t *grid_row = iq1s_grid + 8 * grid_idx;
+
+    float val = dl * ((float)grid_row[j] + delta);
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(val);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq3_s_to_fp8_kernel(
+    const block_iq3_s * __restrict__ src, uint8_t * __restrict__ dst,
+    const int8_t * __restrict__ grid,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq3_s q = src[row * blocks_per_row + block];
+
+    const int ib32 = i / 32;
+    const int l = (i % 32) / 8;
+    const int j = i % 8;
+
+    const int pair = ib32 / 2;
+    const int is_first = (ib32 % 2) == 0;
+    const float db = fp16_to_fp32(q.d) * (float)(1 + 2 * (
+        is_first ? (q.scales[pair] & 0xf) : (q.scales[pair] >> 4)));
+    const int qh_byte = q.qh[ib32];
+    const int grid_idx = (j < 4)
+        ? (int)(q.qs[8 * ib32 + 2 * l + 0] | (((qh_byte << (8 - 2 * l)) & 256)))
+        : (int)(q.qs[8 * ib32 + 2 * l + 1] | (((qh_byte << (7 - 2 * l)) & 256)));
+    const int grid_pos = j & 3;
+    const uint8_t signs_byte = q.signs[4 * ib32 + l];
+
+    const uint8_t *grid_row = (const uint8_t *)(grid + grid_idx);
+    float val = db * (float)((int8_t)grid_row[grid_pos]);
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        (signs_byte & d_kmask_iq2xs[j]) ? -val : val);
+}
+
+// =========================================================================
+// T-Quant dequant-to-FP8 kernels (GGML reference formulas)
+// =========================================================================
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_tq1_0_to_fp8_kernel(
+    const block_tq1_0 * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_tq1_0 q = src[row * blocks_per_row + block];
+
+    const float d = fp16_to_fp32(q.d);
+    // Unpack ternary values from 5-per-byte (qs) and 4-per-byte (qh) encoding
+    // qs stores 240 values (48 bytes × 5), qh stores remaining 16 (4 bytes × 4)
+    // Base-3 unpacking: digit = (byte * 3^n) * 3 / 256
+    float val;
+    if (i < 240) {
+        const int byte_idx = i / 5;
+        const int n = i % 5;
+        const uint8_t qb = q.qs[byte_idx];
+        const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+        int16_t xi = (int16_t)(((uint16_t)qb * pow3[n]) * 3) >> 8;
+        val = (float)(xi - 1) * d;
+    } else {
+        const int idx = i - 240;
+        const int byte_idx = idx / 4;
+        const int n = idx % 4;
+        const uint8_t qb = q.qh[byte_idx];
+        const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+        int16_t xi = (int16_t)(((uint16_t)qb * pow3[n]) * 3) >> 8;
+        val = (float)(xi - 1) * d;
+    }
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(val);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_tq2_0_to_fp8_kernel(
+    const block_tq2_0 * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_tq2_0 q = src[row * blocks_per_row + block];
+
+    const float d = fp16_to_fp32(q.d);
+    const int byte_idx = i / 4;
+    const int l = i % 4;
+    const int8_t qi = (q.qs[byte_idx] >> (2 * l)) & 3;
+
+    float val = (float)(qi - 1) * d;
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(val);
 }

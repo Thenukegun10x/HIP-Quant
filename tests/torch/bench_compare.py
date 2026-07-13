@@ -1,11 +1,10 @@
 r"""hipBLASLt vs custom WMMA FP8 kernel comparison benchmark.
 
 Run with:
-    $env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
     & "C:\venvs\medusa_rocm\Scripts\python.exe" tests\torch\bench_compare.py
 
 Flags:
-    HIP_QUANT_ENABLE_GFX12_WMMA=1  — enables custom WMMA to be tested
+    HIP_QUANT_DISABLE_WMMA=1       — suppresses custom WMMA measurements
     HIP_QUANT_BENCH_NO_FORCE_EXIT=1 — keep process alive after finish
 """
 
@@ -185,9 +184,13 @@ def main() -> None:
         and hasattr(torch, "float8_e5m2")
     )
 
+    hip_version = str(torch.version.hip or "0.0").split(".")
+    hip_major = int(hip_version[0]) if hip_version[0].isdigit() else 0
+    hip_minor = int(hip_version[1]) if len(hip_version) > 1 and hip_version[1].isdigit() else 0
     wmma_available = (
-        os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower()
-        in {"1", "true", "yes", "on"}
+        str(gcn).startswith("gfx12")
+        and (hip_major, hip_minor) >= (7, 2)
+        and os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() not in {"1", "true", "yes", "on"}
     )
 
     torch.manual_seed(1234)

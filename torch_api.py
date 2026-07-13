@@ -353,11 +353,6 @@ def _parse_rocm_version(value: Optional[str]) -> Tuple[int, int]:
 def _require_gfx12_fp8_wmma(tensor: "torch.Tensor") -> None:
     if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("hip_quant FP8/BF8 WMMA kernels are disabled by HIP_QUANT_DISABLE_WMMA.")
-    if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() not in ("1", "true", "yes", "on"):
-        raise RuntimeError(
-            "hip_quant FP8/BF8 WMMA kernels are disabled by default because unstable kernels can hang or reset the GPU. "
-            "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems."
-        )
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is not installed. Install torch with ROCm support first.")
     if not torch.cuda.is_available():
@@ -380,8 +375,7 @@ def _require_gfx12_fp8_wmma(tensor: "torch.Tensor") -> None:
         )
     if _parse_rocm_version(rocm_version) < (7, 2):
         raise RuntimeError(
-            f"hip_quant FP8/BF8 WMMA linear kernels require ROCm 7.2+; current torch.version.hip is {rocm_version}. "
-            "ROCm 7.1 and older have a gfx12 FP8 WMMA bug that can hang or zero GPU memory."
+            f"hip_quant FP8/BF8 WMMA linear kernels require ROCm 7.2+; current torch.version.hip is {rocm_version}."
         )
 
 
@@ -418,6 +412,125 @@ def quantize_e4m3(x: "torch.Tensor") -> "torch.Tensor":
 def quantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     """Quantize a float32/float16/bfloat16 GPU tensor to FP8 E5M2 uint8."""
     return _load_extension().quantize_e5m2(x.contiguous())
+
+
+def quantize_e4m3_transpose(x: "torch.Tensor") -> "torch.Tensor":
+    """Quantize a rank-2 tensor to E4M3 and transpose it in one GPU pass."""
+    return _load_extension().quantize_e4m3_transpose(x.contiguous())
+
+
+def quantize_e5m2_transpose(x: "torch.Tensor") -> "torch.Tensor":
+    """Quantize a rank-2 tensor to E5M2 and transpose it in one GPU pass."""
+    return _load_extension().quantize_e5m2_transpose(x.contiguous())
+
+
+# ===========================================================================
+# HIP Graph capture (PyTorch ROCm CUDAGraph frontend)
+# ===========================================================================
+
+def _graph_output_clone(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_graph_output_clone(item) for item in value)
+    if isinstance(value, list):
+        return [_graph_output_clone(item) for item in value]
+    raise TypeError("HIP graph callable must return a Tensor, tuple, or list of Tensors")
+
+
+class Fp8GraphRunner:
+    """Replay a fixed-shape FP8 inference callable through a HIP graph.
+
+    PyTorch exposes HIP graph capture through its ``torch.cuda.CUDAGraph`` API
+    on ROCm.  Inputs must keep the shape, dtype, device and contiguous layout
+    used for capture.  ``replay`` returns independent output tensors by
+    default; pass ``clone_output=False`` only when the result is consumed
+    before the next replay.
+    """
+
+    def __init__(
+        self,
+        fn,
+        *example_inputs: "torch.Tensor",
+        warmup_iters: int = 3,
+    ) -> None:
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch with ROCm support is required for HIP graph capture")
+        if not callable(fn):
+            raise TypeError("fn must be callable")
+        if not example_inputs:
+            raise ValueError("at least one example input is required for HIP graph capture")
+        if warmup_iters < 0:
+            raise ValueError("warmup_iters must be non-negative")
+
+        self._validate_inputs(example_inputs, reference=None)
+        self._fn = fn
+        self._device = example_inputs[0].device
+        self._static_inputs = tuple(x.detach().clone() for x in example_inputs)
+
+        # Keep allocations and lazy kernel setup outside the capture pool.
+        current = torch.cuda.current_stream(self._device)
+        warmup = torch.cuda.Stream(device=self._device)
+        warmup.wait_stream(current)
+        with torch.cuda.stream(warmup), torch.no_grad():
+            for _ in range(warmup_iters):
+                fn(*self._static_inputs)
+        current.wait_stream(warmup)
+        torch.cuda.synchronize(self._device)
+
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph), torch.no_grad():
+            self._static_output = fn(*self._static_inputs)
+        _graph_output_clone(self._static_output)  # validate result structure once
+
+    @staticmethod
+    def _validate_inputs(inputs, reference) -> None:
+        if reference is not None and len(inputs) != len(reference):
+            raise ValueError(f"expected {len(reference)} inputs, got {len(inputs)}")
+        for index, value in enumerate(inputs):
+            if not torch.is_tensor(value):
+                raise TypeError(f"input {index} must be a torch.Tensor")
+            if not value.is_cuda:
+                raise ValueError(f"input {index} must be a HIP/CUDA tensor")
+            if not value.is_contiguous():
+                raise ValueError(f"input {index} must be contiguous for HIP graph replay")
+            if value.requires_grad:
+                raise ValueError("HIP graph capture is inference-only; inputs must not require gradients")
+            if reference is not None:
+                expected = reference[index]
+                if (value.shape != expected.shape or value.dtype != expected.dtype
+                        or value.device != expected.device):
+                    raise ValueError(
+                        f"input {index} metadata changed; HIP graph replay requires "
+                        "the captured shape, dtype, and device"
+                    )
+
+    @property
+    def static_output(self):
+        """The graph-owned output storage, overwritten by each ``replay``."""
+        return self._static_output
+
+    def replay(self, *inputs: "torch.Tensor", clone_output: bool = True):
+        """Copy ``inputs`` into captured storage, launch the HIP graph, and return output."""
+        self._validate_inputs(inputs, self._static_inputs)
+        with torch.no_grad():
+            for static, value in zip(self._static_inputs, inputs):
+                static.copy_(value, non_blocking=True)
+            self._graph.replay()
+        return _graph_output_clone(self._static_output) if clone_output else self._static_output
+
+
+def capture_hip_graph(
+    fn,
+    *example_inputs: "torch.Tensor",
+    warmup_iters: int = 3,
+) -> Fp8GraphRunner:
+    """Capture ``fn(*example_inputs)`` into a replayable HIP graph on ROCm.
+
+    Use this for stable-shape inference only.  The callable must not allocate
+    conditionally or depend on CPU-visible tensor values while it is captured.
+    """
+    return Fp8GraphRunner(fn, *example_inputs, warmup_iters=warmup_iters)
 
 
 def quantize_e5m2_stochastic(x: "torch.Tensor", seed: Optional[int] = None) -> "torch.Tensor":

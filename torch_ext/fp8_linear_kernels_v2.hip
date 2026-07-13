@@ -20,7 +20,10 @@
 //   C     : [M, N]  float/half (output)
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
 #include "../hip_quant_util.h"
+
+namespace cg = cooperative_groups;
 
 #define TILE_M  16
 #define TILE_N  16
@@ -100,9 +103,10 @@ void fp8_gemm_v2_input_weight_fp8_kernel(
     float out_scale,
     int c_dtype, int bias_dtype, bool has_bias
 ) {
-    int wave = threadIdx.x >> 5;
-    int tid  = threadIdx.x & 31;
-    if (wave >= N_WAVES) return;
+    const cg::thread_block cta = cg::this_thread_block();
+    const cg::thread_group wmma_wave = cg::tiled_partition(cta, 32);
+    const int wave = cta.thread_rank() >> 5;
+    const int tid = wmma_wave.thread_rank();
 
     int m = blockIdx.y * (M_TILES * TILE_M);
     int n_tile = blockIdx.x * N_WAVES + wave;
@@ -162,10 +166,14 @@ void fp8_gemm_v2_input_weight_fp8_kernel(
             }
         }
 
-        __syncthreads();
+        // LDS is shared by every WMMA wave in the block, so this must be a
+        // CTA-wide barrier. The following tile barrier scopes the WMMA
+        // operand-consumption boundary to the 32 lanes of each wave.
+        cta.sync();
 
         // ---------- compute  8  WMMA tiles from LDS ----------
         if (valid_wave) {
+        wmma_wave.sync();
         for (int kt = 0; kt < K_TILES_PER_STAGE; kt++) {
             int word = kt * (TILE_K / 4) + lane_group * 2;
             v2i b_vec = (v2i){
@@ -180,14 +188,17 @@ void fp8_gemm_v2_input_weight_fp8_kernel(
                         (int)A_lds[mt * TILE_M + lane_wrapped][word],
                         (int)A_lds[mt * TILE_M + lane_wrapped][word + 1]
                     };
+                    #if defined(__gfx1200__) || defined(__gfx1201__)
                     acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
                         a_vec, b_vec, acc[mt]);
+                    #endif
                 }
             }
         }
+        wmma_wave.sync();
         }
 
-        __syncthreads();
+        cta.sync();
     }
 
     // ---------- store  C  ----------
@@ -206,6 +217,7 @@ void fp8_gemm_v2_input_weight_fp8_kernel(
         }
     }
     }
+    __threadfence_block();
 }
 
 
@@ -270,9 +282,10 @@ void fp8_gemm_v2_input_weight_fp8_packed_kernel(
     float out_scale,
     int c_dtype, int bias_dtype, bool has_bias
 ) {
-    int wave = threadIdx.x >> 5;
-    int tid = threadIdx.x & 31;
-    if (wave >= N_WAVES) return;
+    const cg::thread_block cta = cg::this_thread_block();
+    const cg::thread_group wmma_wave = cg::tiled_partition(cta, 32);
+    const int wave = cta.thread_rank() >> 5;
+    const int tid = wmma_wave.thread_rank();
 
     int m = blockIdx.y * (M_TILES * TILE_M);
     int n_tile = blockIdx.x * N_WAVES + wave;
@@ -304,9 +317,10 @@ void fp8_gemm_v2_input_weight_fp8_packed_kernel(
             A_lds[a_row][a_word] = a_val;
         }
 
-        __syncthreads();
+        cta.sync();
 
         if (valid_wave) {
+            wmma_wave.sync();
             int first_k_tile = k_start / TILE_K;
             // Keep the current A/B operands live while the next pair is
             // fetched.  The packed path already did this for B; retaining
@@ -353,8 +367,10 @@ void fp8_gemm_v2_input_weight_fp8_packed_kernel(
                 #pragma unroll
                 for (int mt = 0; mt < M_TILES; ++mt) {
                     if (m + mt * TILE_M < M) {
+                        #if defined(__gfx1200__) || defined(__gfx1201__)
                         acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
                             a_vec[mt], b_vec, acc[mt]);
+                        #endif
                     }
                 }
 
@@ -366,9 +382,10 @@ void fp8_gemm_v2_input_weight_fp8_packed_kernel(
                     b_vec = next_b_vec;
                 }
             }
+            wmma_wave.sync();
         }
 
-        __syncthreads();
+        cta.sync();
     }
 
     if (valid_wave) {
@@ -386,6 +403,7 @@ void fp8_gemm_v2_input_weight_fp8_packed_kernel(
             }
         }
     }
+    __threadfence_block();
 }
 
 template<int M_TILES, int N_WAVES>

@@ -40,32 +40,30 @@ __global__ void quantize_iq3_s_kernel(
     int nrows,
     int n_per_row
 ) {
-    if (threadIdx.x != 0) return;
-
+    const int n_sub_blocks = QK_K / IQ3S_BLOCK_SIZE;
     int row = blockIdx.x;
     int ibl = blockIdx.y;
+    int ib = threadIdx.x;
     if (row >= nrows) return;
     int nbl = n_per_row / QK_K;
     if (ibl >= nbl) return;
+    if (ib >= n_sub_blocks) return;
 
     const float * xbl = src + row * n_per_row + QK_K * ibl;
     block_iq3_s * y = (block_iq3_s *)(dst + (row * nbl + ibl) * sizeof(block_iq3_s));
 
-    y->d = 0;
-    for (int i = 0; i < QK_K / 4; ++i) y->qs[i] = 0;
-    for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
-    for (int i = 0; i < QK_K / 8; ++i) y->signs[i] = 0;
-    for (int i = 0; i < IQ3S_N_SCALE; ++i) y->scales[i] = 0;
+    __shared__ float s_scales[QK_K / IQ3S_BLOCK_SIZE];
+    __shared__ uint8_t s_qs[QK_K / 4];
+    __shared__ uint8_t s_qh_bytes[QK_K / IQ3S_BLOCK_SIZE];
+    __shared__ uint8_t s_signs[QK_K / 8];
+    __shared__ uint8_t s_scales_packed[IQ3S_N_SCALE];
 
-    float scales[QK_K / IQ3S_BLOCK_SIZE];
-    float max_scale = 0;
+    float local_scale;
     float sumx2 = 0;
     for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
     float sigma2 = 2.0f * sumx2 / QK_K;
 
-    int qs_pos = 0;
-    int signs_pos = 0;
-    for (int ib = 0; ib < QK_K / IQ3S_BLOCK_SIZE; ++ib) {
+    {
         const float * xb = xbl + IQ3S_BLOCK_SIZE * ib;
         const float * qw = imatrix ? imatrix + row * n_per_row + QK_K * ibl + IQ3S_BLOCK_SIZE * ib : NULL;
         float weight[IQ3S_BLOCK_SIZE], waux[IQ3S_BLOCK_SIZE], xval[IQ3S_BLOCK_SIZE];
@@ -93,7 +91,20 @@ __global__ void quantize_iq3_s_kernel(
         float max_v = xval[0];
         for (int i = 1; i < IQ3S_BLOCK_SIZE; ++i) if (xval[i] > max_v) max_v = xval[i];
         for (int i = 0; i < IQ3S_BLOCK_SIZE; ++i) L[i] = 0;
-        if (max_v == 0.0f) { scales[ib] = 0; continue; }
+        if (max_v == 0.0f) {
+            s_scales[ib] = 0;
+            for (int k = 0; k < IQ3S_BLOCK_SIZE / 4; ++k) s_qs[ib * (IQ3S_BLOCK_SIZE / 4) + k] = 0;
+            for (int k = 0; k < IQ3S_BLOCK_SIZE / 8; ++k) s_signs[ib * (IQ3S_BLOCK_SIZE / 8) + k] = 0;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                y->d = 0;
+                for (int i = 0; i < QK_K / 4; ++i) y->qs[i] = 0;
+                for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+                for (int i = 0; i < QK_K / 8; ++i) y->signs[i] = 0;
+                for (int i = 0; i < IQ3S_N_SCALE; ++i) y->scales[i] = 0;
+            }
+            return;
+        }
 
         float best = 0;
         float scale = max_v / 15.0f;
@@ -168,32 +179,51 @@ __global__ void quantize_iq3_s_kernel(
             for (int k = 0; k < IQ3S_BLOCK_SIZE / 8; ++k) block_signs[k] = ~block_signs[k];
         }
 
+        uint8_t s_qh_byte = 0;
         for (int k = 0; k < IQ3S_BLOCK_SIZE / 4; ++k) {
             uint16_t u = 0;
             for (int i = 0; i < 4; ++i) u |= ((uint16_t)L[4 * k + i] << (3 * i));
             int grid_index = map[u];
             if (grid_index < 0) { grid_index = 0; }
-            y->qs[qs_pos + k] = (uint8_t)(grid_index & 255);
-            y->qh[(ib * (IQ3S_BLOCK_SIZE / 4) + k) / 8] |= (uint8_t)((grid_index >> 8) << ((ib * (IQ3S_BLOCK_SIZE / 4) + k) % 8));
+            s_qs[ib * (IQ3S_BLOCK_SIZE / 4) + k] = (uint8_t)(grid_index & 255);
+            s_qh_byte |= (uint8_t)((grid_index >> 8) << k);
         }
-        qs_pos += IQ3S_BLOCK_SIZE / 4;
-        for (int k = 0; k < IQ3S_BLOCK_SIZE / 8; ++k) y->signs[signs_pos + k] = block_signs[k];
-        signs_pos += IQ3S_BLOCK_SIZE / 8;
-        scales[ib] = scale;
-        if (scale > max_scale) max_scale = scale;
+        s_qh_bytes[ib] = s_qh_byte;
+        for (int k = 0; k < IQ3S_BLOCK_SIZE / 8; ++k) s_signs[ib * (IQ3S_BLOCK_SIZE / 8) + k] = block_signs[k];
+        local_scale = scale;
     }
 
-    if (!max_scale) return;
-    float d = max_scale / 31.0f;
-    y->d = fp32_to_fp16(d * 1.033f);
-    float id = 1.0f / d;
-    for (int ib = 0; ib < QK_K / IQ3S_BLOCK_SIZE; ib += 2) {
-        int l1 = nearest_int(0.5f * (id * scales[ib + 0] - 1.0f));
-        if (l1 < 0) l1 = 0;
-        if (l1 > 15) l1 = 15;
-        int l2 = nearest_int(0.5f * (id * scales[ib + 1] - 1.0f));
-        if (l2 < 0) l2 = 0;
-        if (l2 > 15) l2 = 15;
-        y->scales[ib / 2] = (uint8_t)(l1 | (l2 << 4));
+    s_scales[ib] = local_scale;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float max_scale = 0;
+        for (int j = 0; j < n_sub_blocks; ++j)
+            if (s_scales[j] > max_scale) max_scale = s_scales[j];
+
+        if (max_scale == 0) {
+            y->d = 0;
+            for (int i = 0; i < QK_K / 4; ++i) y->qs[i] = 0;
+            for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+            for (int i = 0; i < QK_K / 8; ++i) y->signs[i] = 0;
+            for (int i = 0; i < IQ3S_N_SCALE; ++i) y->scales[i] = 0;
+        } else {
+            float d = max_scale / 31.0f;
+            y->d = fp32_to_fp16(d * 1.033f);
+            float id = 1.0f / d;
+            for (int j = 0; j < n_sub_blocks; j += 2) {
+                int l1 = nearest_int(0.5f * (id * s_scales[j + 0] - 1.0f));
+                if (l1 < 0) l1 = 0;
+                if (l1 > 15) l1 = 15;
+                int l2 = nearest_int(0.5f * (id * s_scales[j + 1] - 1.0f));
+                if (l2 < 0) l2 = 0;
+                if (l2 > 15) l2 = 15;
+                s_scales_packed[j / 2] = (uint8_t)(l1 | (l2 << 4));
+            }
+            for (int i = 0; i < QK_K / 4; ++i) y->qs[i] = s_qs[i];
+            for (int i = 0; i < QK_K / IQ3S_BLOCK_SIZE; ++i) y->qh[i] = s_qh_bytes[i];
+            for (int i = 0; i < QK_K / 8; ++i) y->signs[i] = s_signs[i];
+            for (int i = 0; i < IQ3S_N_SCALE; ++i) y->scales[i] = s_scales_packed[i];
+        }
     }
 }

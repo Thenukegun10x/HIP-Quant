@@ -3,7 +3,7 @@
 #include "../hip_quant_util.h"
 
 // Q4_1: 32-element blocks, asymmetric 4-bit with min
-// d = (max-min)/15, quant = (val-min)*id, clamped 0-15
+// Uses warp shuffle reduction (wave32-safe on gfx12/RDNA4)
 
 extern "C" __global__
 __launch_bounds__(32, 8)
@@ -21,29 +21,18 @@ void quantize_q4_1_kernel(
     int base = row * n_per_row + blk * 32 + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_min[32];
-    __shared__ float s_max[32];
-
     float val = src[base];
-    s_min[tid] = val;
-    s_max[tid] = val;
-    __syncthreads();
 
+    float v_min = val;
+    float v_max = val;
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            float v0 = s_min[tid];
-            float v1 = s_min[tid + s];
-            s_min[tid] = v0 < v1 ? v0 : v1;
-
-            v0 = s_max[tid];
-            v1 = s_max[tid + s];
-            s_max[tid] = v0 > v1 ? v0 : v1;
-        }
-        __syncthreads();
+        v_min = fminf(v_min, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v_min, s));
+        v_max = fmaxf(v_max, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v_max, s));
     }
 
-    float min_val = s_min[0];
-    float max_val = s_max[0];
+    float min_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v_min, 0);
+    float max_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v_max, 0);
     float d = (max_val - min_val) / 15.0f;
     float id = d != 0 ? 1.0f / d : 0.0f;
 

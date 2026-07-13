@@ -3,8 +3,7 @@
 #include "../hip_quant_util.h"
 
 // Q5_0: 32-element blocks, symmetric 5-bit
-// d = max/-16, values range [-16, 15], stored as unsigned nibble + 16 bias
-// 5th bit packed in qh[4] bitmask via shared memory reduction
+// Uses warp shuffle reduction (wave32-safe on gfx12/RDNA4)
 
 extern "C" __global__
 __launch_bounds__(32, 8)
@@ -22,24 +21,18 @@ void quantize_q5_0_kernel(
     int base = row * n_per_row + blk * 32 + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_vals[32];
-
     float val = src[base];
-    s_vals[tid] = val;
-    __syncthreads();
 
+    float v = val;
+    float va = fabsf(val);
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a0 = fabsf(s_vals[tid]);
-            float a1 = fabsf(s_vals[tid + s]);
-            if (a1 > a0) {
-                s_vals[tid] = s_vals[tid + s];
-            }
-        }
-        __syncthreads();
+        float other = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, s);
+        float other_a = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, va, s);
+        if (other_a > va) { v = other; va = other_a; }
     }
 
-    float max_val = s_vals[0];
+    float max_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
     float d = max_val / -16.0f;
     float id = d != 0 ? 1.0f / d : 0.0f;
 
@@ -63,23 +56,16 @@ void quantize_q5_0_kernel(
         blk_out->qs[tid] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
     }
 
-    // Tree reduction for qh bitmask
-    __shared__ uint32_t s_qh[32];
-    s_qh[tid] = 0;
-    if (tid < 16) {
-        if (s_q[tid] & 0x10) s_qh[tid] |= (1u << (tid + 0));
-        if (s_q[tid + 16] & 0x10) s_qh[tid] |= (1u << (tid + 16));
-    }
-    __syncthreads();
-
-    for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_qh[tid] |= s_qh[tid + s];
+    // QH stores the fifth bit for eight consecutive elements per byte.
+    // The previous cross-lane OR reduction produced an all-zero mask on
+    // Wave32 gfx12, silently turning every Q5 value into its low 4 bits.
+    // Pack the four bytes directly from the synchronised shared quants.
+    if (tid < 4) {
+        uint8_t high_bits = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            high_bits |= ((s_q[tid * 8 + j] >> 4) & 1u) << j;
         }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        *(uint32_t*)blk_out->qh = s_qh[0];
+        blk_out->qh[tid] = high_bits;
     }
 }

@@ -127,6 +127,21 @@ SUPPORTED = [
     ("Q6_K", 14),
 ]
 
+# These formats use the same direct Q-to-FP8 export but have intentionally
+# separate numerical references in test_dequant_fp8.py, where their packed
+# GGML layouts and codebooks are decoded independently on CPU.
+I_AND_T_SUPPORTED = [
+    ("IQ1_S", 19),
+    ("IQ2_XXS", 16),
+    ("IQ2_XS", 17),
+    ("IQ3_XXS", 18),
+    ("IQ3_S", 21),
+    ("IQ4_NL", 20),
+    ("IQ4_XS", 23),
+    ("TQ1_0", 34),
+    ("TQ2_0", 35),
+]
+
 
 @unittest.skipUnless(_Q is not None, "No hip_quant DLL / GPU available")
 class TestQToFp8(unittest.TestCase):
@@ -180,6 +195,18 @@ class TestQToFp8(unittest.TestCase):
             with self.subTest(type=name, fmt="E5M2"):
                 self._round_trip(name, t, "E5M2")
 
+    def test_iquant_and_tquant_direct_export(self):
+        """Every advertised I-/T-Quant kernel exports finite E4M3 bytes."""
+        x = (self.rng.standard_normal((1, 256)) * 0.5).astype(np.float32)
+        for name, type_num in I_AND_T_SUPPORTED:
+            with self.subTest(type=name):
+                packed = self.q.quantize_numpy(x, type_num)
+                fp8 = self.q.dequantize_to_e4m3(packed, type_num, 256)
+                dec = _vec_e4m3(fp8)
+                self.assertEqual(fp8.shape, x.shape)
+                self.assertTrue(np.isfinite(dec).all(), f"{name}: non-finite direct FP8 output")
+                self.assertGreater(np.abs(dec).max(), 0.0, f"{name}: all-zero direct FP8 output")
+
     def test_shortcuts(self):
         x = (self.rng.standard_normal((1, 256)) * 0.3).astype(np.float32)
         packed = self.q.quantize_numpy(x, hq.GGML_TYPE["Q4_0"])
@@ -215,14 +242,12 @@ class TestQToFp8(unittest.TestCase):
         np.testing.assert_array_equal(out, x.reshape(1, 256))
 
     def test_rejects_unsupported_type(self):
-        # IQ4_NL is intentionally not supported by the direct path.
+        # I-Quants and T-Quants are supported; use an invalid enum value to
+        # verify that the public wrapper still reports unsupported formats.
         x = (self.rng.standard_normal((1, 256)) * 0.3).astype(np.float32)
-        try:
-            packed = self.q.quantize_numpy(x, hq.GGML_TYPE["IQ4_NL"])
-        except Exception:
-            self.skipTest("IQ4_NL quantize not available in this DLL")
-        with self.assertRaises(RuntimeError):
-            self.q.dequantize_to_fp8(packed, hq.GGML_TYPE["IQ4_NL"], 256, "E4M3")
+        packed = self.q.quantize_numpy(x, hq.GGML_TYPE["Q4_0"])
+        with self.assertRaises(ValueError):
+            self.q.dequantize_to_fp8(packed, 999, 256, "E4M3")
 
     def test_bad_output_format(self):
         x = (self.rng.standard_normal((1, 256)) * 0.3).astype(np.float32)

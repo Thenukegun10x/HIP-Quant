@@ -3,7 +3,7 @@
 #include "../hip_quant_util.h"
 
 // Q5_1: 32-element blocks, asymmetric 5-bit with min
-// d = (max-min)/31, quant = (val-min)*id, 5-bit packed
+// Uses warp shuffle reduction (wave32-safe on gfx12/RDNA4)
 
 extern "C" __global__
 __launch_bounds__(32, 8)
@@ -21,29 +21,18 @@ void quantize_q5_1_kernel(
     int base = row * n_per_row + blk * 32 + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_min[32];
-    __shared__ float s_max[32];
-
     float val = src[base];
-    s_min[tid] = val;
-    s_max[tid] = val;
-    __syncthreads();
 
+    float v_min = val;
+    float v_max = val;
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            float v0 = s_min[tid];
-            float v1 = s_min[tid + s];
-            s_min[tid] = v0 < v1 ? v0 : v1;
-
-            v0 = s_max[tid];
-            v1 = s_max[tid + s];
-            s_max[tid] = v0 > v1 ? v0 : v1;
-        }
-        __syncthreads();
+        v_min = fminf(v_min, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v_min, s));
+        v_max = fmaxf(v_max, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v_max, s));
     }
 
-    float min_val = s_min[0];
-    float max_val = s_max[0];
+    float min_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v_min, 0);
+    float max_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v_max, 0);
     float d = (max_val - min_val) / 31.0f;
     float id = d != 0 ? 1.0f / d : 0.0f;
 
@@ -68,22 +57,15 @@ void quantize_q5_1_kernel(
         blk_out->qs[tid] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
     }
 
-    __shared__ uint32_t s_qh[32];
-    s_qh[tid] = 0;
-    if (tid < 16) {
-        if (s_q[tid] & 0x10) s_qh[tid] |= (1u << (tid + 0));
-        if (s_q[tid + 16] & 0x10) s_qh[tid] |= (1u << (tid + 16));
-    }
-    __syncthreads();
-
-    for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_qh[tid] |= s_qh[tid + s];
+    // QH stores the fifth bit for eight consecutive elements per byte.
+    // Pack it directly from the synchronised shared quants: the former
+    // Wave32 shuffle OR reduction could lose every fifth bit on gfx12.
+    if (tid < 4) {
+        uint8_t high_bits = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            high_bits |= ((s_q[tid * 8 + j] >> 4) & 1u) << j;
         }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        *(uint32_t*)blk_out->qh = s_qh[0];
+        blk_out->qh[tid] = high_bits;
     }
 }

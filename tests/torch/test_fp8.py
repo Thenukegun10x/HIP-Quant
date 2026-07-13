@@ -73,6 +73,26 @@ def _expanded_scales(scales, cols, block_size):
     return scales.repeat_interleave(block_size, dim=-1)[..., :cols]
 
 
+class TestStreamInterop:
+    def test_extension_uses_current_pytorch_stream(self, device):
+        """The binding must not silently launch on HIP's default stream."""
+        if not hasattr(_C, "_current_stream_handle"):
+            pytest.skip("extension must be rebuilt with current-stream bridge")
+
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            expected = int(torch.cuda.current_stream(device).cuda_stream)
+            assert _C._current_stream_handle() == expected
+
+            # Exercise both sides of the bridge on the selected stream.
+            from hip_quant.torch_api import dequantize_e4m3, quantize_e4m3
+            source = torch.tensor([1.0, -1.0, 0.0], device=device)
+            restored = dequantize_e4m3(quantize_e4m3(source))
+
+        stream.synchronize()
+        torch.testing.assert_close(restored, source, rtol=0, atol=0)
+
+
 # ===========================================================================
 # Phase 1 — quantize_e4m3
 # ===========================================================================
@@ -563,10 +583,9 @@ class TestBlockwiseFp8:
 
         torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
 
-    def test_packed_wmma_weight_matches_row_major_wmma(self, device, monkeypatch):
+    def test_packed_wmma_weight_matches_row_major_wmma(self, device):
         if not hasattr(_C, "pack_fp8_weight_for_wmma"):
             pytest.skip("extension must be rebuilt with packed WMMA weight op")
-        monkeypatch.setenv("HIP_QUANT_ENABLE_GFX12_WMMA", "1")
         from hip_quant.torch_api import (
             fp8_linear_forward_fp8_input_weight,
             fp8_linear_forward_fp8_input_weight_packed,
@@ -590,11 +609,10 @@ class TestBlockwiseFp8:
         )
         torch.testing.assert_close(packed, row_major, rtol=0, atol=0)
 
-    def test_v2_lds_staged_wmma_matches_v1(self, device, monkeypatch):
+    def test_v2_lds_staged_wmma_matches_v1(self, device):
         """V2 cooperative LDS-staged FP8 kernel matches V1 row-major output."""
         if not hasattr(_C, "fp8_linear_forward_v2_input_weight"):
             pytest.skip("extension must be rebuilt with V2 LDS-staged kernel")
-        monkeypatch.setenv("HIP_QUANT_ENABLE_GFX12_WMMA", "1")
         from hip_quant.torch_api import (
             fp8_linear_forward_fp8_input_weight,
             fp8_linear_forward_v2_input_weight,

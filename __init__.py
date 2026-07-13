@@ -3,11 +3,15 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.5.9"
+__version__ = "0.6.0"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
     "quantize_e5m2",
+    "quantize_e4m3_transpose",
+    "quantize_e5m2_transpose",
+    "Fp8GraphRunner",
+    "capture_hip_graph",
     "quantize_e5m2_stochastic",
     "quantize_e4m3_blockwise",
     "quantize_e5m2_blockwise",
@@ -299,6 +303,24 @@ class HipQuant:
         ]
         self._dll.quantize_reset.restype = None
         self._dll.quantize_reset.argtypes = []
+        try:
+            self._quantize_stochastic_e5m2 = self._dll.quantize_tensor_fp8_e5m2_stochastic
+            self._quantize_stochastic_e5m2.restype = ctypes.c_size_t
+            self._quantize_stochastic_e5m2.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_uint64,
+            ]
+        except AttributeError:
+            self._quantize_stochastic_e5m2 = None
+        try:
+            self._wmma_diag = self._dll.wmma_diag
+            self._wmma_diag.restype = ctypes.c_int
+            self._wmma_diag.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        except AttributeError:
+            self._wmma_diag = None
 
     @property
     def dll_path(self):
@@ -338,6 +360,28 @@ class HipQuant:
     def quantize_reset(self):
         self._dll.quantize_reset()
 
+    def quantize_e5m2_stochastic(self, arr, seed=0):
+        """Quantize float32 array to FP8 E5M2 with stochastic rounding.
+
+        Uses unbiased stochastic rounding between adjacent E5M2 bins
+        for better gradient convergence in training.
+        """
+        if self._quantize_stochastic_e5m2 is None:
+            raise RuntimeError("Stochastic E5M2 not available in loaded DLL")
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        nrows, n_per_row = arr.shape
+        dst = np.empty(nrows * n_per_row, dtype=np.uint8)
+        result = self._quantize_stochastic_e5m2(
+            arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            nrows, n_per_row, int(seed),
+        )
+        if result != dst.size:
+            raise RuntimeError(f"Stochastic E5M2 returned {result} bytes, expected {dst.size}")
+        return dst.reshape(nrows, n_per_row)
+
     def fp8_gemm_test_wmma(self, A_fp8, B_fp8, M, N, K, lda=None, ldb=None, ldc=None):
         """Micro FP8 GEMM via rocWMMA WMMA.
 
@@ -374,11 +418,6 @@ class HipQuant:
             raise ValueError("B_fp8 must have shape at least (K, ldb)")
         if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
             raise RuntimeError("FP8 WMMA is disabled by HIP_QUANT_DISABLE_WMMA.")
-        if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() not in ("1", "true", "yes", "on"):
-            raise RuntimeError(
-                "FP8 WMMA is disabled by default because unstable kernels can hang or reset the GPU. "
-                "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems."
-            )
         arch = self.gcn_arch
         if not arch.startswith("gfx12"):
             raise RuntimeError(
@@ -388,8 +427,7 @@ class HipQuant:
         runtime_version = self.hip_runtime_version
         if runtime_version and runtime_version < 70200000:
             raise RuntimeError(
-                f"FP8 WMMA test is disabled on ROCm/HIP runtime {runtime_version}. "
-                "Use the packaged ROCm 7.2.1 DLL/runtime; ROCm 7.1 and older can hang or zero GPU memory."
+                f"FP8 WMMA test requires ROCm/HIP 7.2+; current runtime is {runtime_version}."
             )
         A_fp8 = np.ascontiguousarray(a_arr[:M, :lda], dtype=np.uint8)
         B_fp8 = np.ascontiguousarray(b_arr[:K, :ldb], dtype=np.uint8)
@@ -403,6 +441,55 @@ class HipQuant:
         if ret != 0:
             return None
         return C[:, :N]
+
+    def wmma_diag(self):
+        """Run WMMA stability diagnostics on the GPU.
+
+        Executes four kernel tests to determine whether the
+        __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12 intrinsic
+        is functioning correctly. Detects hangs, zero outputs, and
+        register decay under repeated use.
+
+        Returns:
+            dict with keys:
+                test1_value: max WMMA output for known inputs (milliscale int,
+                             value/1000 ≈ expected K). Should be > 0.
+                test2_repeated_ok: 0 = pass (100 iterations OK),
+                                   < 0 = failed at iteration |value|.
+                test3_lds_value: max output from LDS-staged WMMA (milliscale).
+                test4_multiwave: number of waves (0-16) that produced non-zero
+                                 output. Should be 16 on healthy hardware.
+                ok: True if all four tests pass, False otherwise.
+            None on DLL error or missing diagnostic support.
+        """
+        if self._wmma_diag is None:
+            return None
+        results = (ctypes.c_int * 4)()
+        ret = self._wmma_diag(results)
+        if ret not in (0, 2, 3, 4):
+            return None
+        r = list(results)
+        t1_ok = r[0] > 0
+        t2_ok = r[1] == 0
+        t3_ok = r[2] > 0
+        t4_ok = r[3] == 16
+        return {
+            "test1_value": r[0],
+            "test1_ok": t1_ok,
+            "test2_repeated_ok": r[1],
+            "test2_ok": t2_ok,
+            "test3_lds_value": r[2],
+            "test3_ok": t3_ok,
+            "test4_multiwave": r[3],
+            "test4_ok": t4_ok,
+            "ok": t1_ok and t2_ok and t3_ok and t4_ok,
+            "gated": ret != 0,
+            "gate_reason": {
+                2: "not gfx12 device",
+                3: "ROCm < 7.2",
+                4: "WMMA disabled by env var",
+            }.get(ret, "None"),
+        }
 
     def quantize_numpy(self, arr, type_num, imatrix=None):
         """Quantize a float32 numpy array to the given GGML type.
@@ -532,10 +619,9 @@ class HipQuant:
         """Dequantize packed GGML Q blocks directly to raw FP8 bytes.
 
         The conversion and FP8 encode execute in one GPU kernel, so no F32
-        tensor is allocated or copied back to the host.  It supports legacy
-        Q4/Q5/Q8 formats and Q2_K through Q6_K.  I-Quants and ternary quants
-        are intentionally rejected because their table/codebook decoders are
-        not part of this direct conversion path yet.
+        tensor is allocated or copied back to the host.  Supports all legacy
+        Q4/Q5/Q8, K-Quant (Q2_K-Q6_K), I-Quant (IQ1_S-IQ4_XS), T-Quant
+        (TQ1_0, TQ2_0), and IQ4_NL formats.
 
         Args:
             packed: Flat packed ``uint8`` Q-type data, such as returned by

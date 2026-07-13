@@ -70,6 +70,15 @@ def _configure_windows_toolchain():
             os.environ.setdefault("CXX", cl_short)
             _prepend_path(cl.parent)
 
+    # link.exe invokes rc.exe to embed the extension manifest.  Ensure the
+    # Windows SDK resource compiler is available for an optional pip-time
+    # extension build as well as for setup_torch.py.
+    resource_compilers = glob.glob(
+        r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe"
+    )
+    if resource_compilers:
+        _prepend_path(Path(sorted(resource_compilers)[-1]).parent)
+
     if os.environ.get("VSCMD_VER"):
         os.environ.setdefault("DISTUTILS_USE_SDK", "1")
 
@@ -94,15 +103,18 @@ def _torch_extension_config():
         name="hip_quant._C",
         sources=[
             "torch_ext/pytorch_bindings.cpp",
+            "torch_ext/current_stream.hip",
             "torch_ext/fp8_quant_kernels.hip",
             "torch_ext/fp8_linear_kernels.hip",
             "torch_ext/fp8_linear_kernels_v2.hip",
+            "torch_ext/q_to_fp8_kernels.hip",
         ],
         extra_compile_args={
-            "cxx": ["-O3"],
+            "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],
             "nvcc": [
                 "-O3",
                 "-mno-wavefrontsize64",
+                "-DHIP_QUANT_ENABLE_NONTEMPORAL=1",
                 "--offload-arch=gfx1200",
                 "--offload-arch=gfx1201",
                 "-I.",

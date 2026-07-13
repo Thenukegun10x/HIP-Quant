@@ -3,7 +3,8 @@ r"""Microbenchmarks for hip_quant FP8 torch paths.
 Run with:
     C:\venvs\medusa_rocm\Scripts\python.exe tests\torch\bench_fp8.py
 
-Set HIP_QUANT_ENABLE_GFX12_WMMA=1 to include WMMA linear benchmarks.
+The custom WMMA measurements run automatically on a compatible ROCm 7.2+
+gfx12 device.  Set HIP_QUANT_DISABLE_WMMA=1 to suppress them explicitly.
 """
 
 from __future__ import annotations
@@ -93,13 +94,13 @@ def main() -> None:
     print(f"forward:          {_time_cuda(forward_only, warmup=5, iters=20):.3f} ms")
     print(f"forward+backward: {_time_cuda(forward_backward, warmup=3, iters=10):.3f} ms")
 
-    if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() in {"1", "true", "yes", "on"}:
-        with _temporary_env(HIP_QUANT_FP8_LINEAR_BACKEND="custom", HIP_QUANT_ENABLE_GFX12_WMMA="1"):
+    try:
+        with _temporary_env(HIP_QUANT_FP8_LINEAR_BACKEND="custom"):
             print("Fp8ShadowLinear custom WMMA backend, batch=32, in=4096, out=4096, dtype=bf16")
             print(f"forward:          {_time_cuda(forward_only, warmup=5, iters=20):.3f} ms")
             print(f"forward+backward: {_time_cuda(forward_backward, warmup=3, iters=10):.3f} ms")
-    else:
-        print("Skipping custom WMMA benchmark; set HIP_QUANT_ENABLE_GFX12_WMMA=1 to enable.")
+    except RuntimeError as exc:
+        print(f"Custom WMMA unavailable: {exc}")
 
     if hasattr(torch, "_scaled_mm") and hasattr(torch, "float8_e4m3fn"):
         weight = layer.weight_master.detach().contiguous()
@@ -135,7 +136,7 @@ def main() -> None:
         try:
             print(f"precast FP8:      {_time_cuda(hipblaslt_scaled_mm_precast, warmup=5, iters=20):.3f} ms")
             print(f"cast+matmul:      {_time_cuda(hipblaslt_scaled_mm_with_cast, warmup=3, iters=10):.3f} ms")
-            if os.environ.get("HIP_QUANT_ENABLE_GFX12_WMMA", "").lower() in {"1", "true", "yes", "on"}:
+            try:
                 input_fp8 = quantize_e4m3(inp_detached)
                 weight_fp8 = quantize_e4m3(weight)
                 weight_packed = pack_fp8_weight_for_wmma(weight_fp8)
@@ -168,6 +169,8 @@ def main() -> None:
                 print(f"custom WMMA prepacked: {_time_cuda(custom_wmma_prepacked, warmup=5, iters=20):.3f} ms")
                 print(f"custom pack weight: {_time_cuda(custom_pack_weight, warmup=3, iters=10):.3f} ms")
                 print(f"custom quant+WMMA:  {_time_cuda(custom_wmma_precast, warmup=3, iters=10):.3f} ms")
+            except RuntimeError as exc:
+                print(f"custom WMMA: {exc}")
         except RuntimeError as exc:
             print(f"hipBLASLt raw: {exc}")
     else:

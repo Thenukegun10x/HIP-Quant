@@ -267,10 +267,11 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 ```
 
 Extension build specifics:
-- Compiles `torch_ext/pytorch_bindings.cpp`, `torch_ext/fp8_quant_kernels.hip`, `torch_ext/fp8_linear_kernels.hip`
+- Compiles `torch_ext/pytorch_bindings.cpp`, `torch_ext/current_stream.hip`, `torch_ext/fp8_quant_kernels.hip`, `torch_ext/fp8_linear_kernels.hip`, `torch_ext/fp8_linear_kernels_v2.hip`, and `torch_ext/q_to_fp8_kernels.hip`
 - Uses `CUDAExtension` (the PyTorch name, even on ROCm/HIP)
 - Targets `--offload-arch=gfx1200` and `--offload-arch=gfx1201`
 - On Windows, uses `_short_path()` to wrap all include paths, preventing MSVC build failures when the project is in a path with spaces
+- Uses `c10::hip::getCurrentHIPStream()` for every extension launch, so work respects PyTorch stream ordering on Windows as well as Linux
 
 ### 4.3 `src/hip_quant/` Alternative Package Layout
 
@@ -299,14 +300,12 @@ python -m hip_quant.build --arch all --rocm-bin "C:\Program Files\AMD\ROCm\7.1\b
 | gfx1150 | RDNA3.5 | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ |
 | gfx1200/1201 | RDNA4 | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ |
 
-### 5.2 WMMA Safety Policy
+### 5.2 WMMA Runtime Requirements
 
-The gfx12 FP8/BF8 WMMA kernels (`__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` and `__builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12`) are **disabled by default** because ROCm 7.1 can hang or corrupt GPU memory when using them.
-
-**Enable:**
-```powershell
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
-```
+The gfx12 FP8/BF8 WMMA kernels
+(`__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` and
+`__builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12`) are enabled by
+default on a compatible gfx12 device with ROCm/HIP 7.2 or newer.
 
 **Force-disable:**
 ```powershell
@@ -316,7 +315,7 @@ $env:HIP_QUANT_DISABLE_WMMA = "1"
 Runtime guards (checked in both C++ and Python):
 1. Arch must be gfx12 (RDNA4)
 2. HIP runtime must be ≥ 7.2
-3. `HIP_QUANT_ENABLE_GFX12_WMMA` must be explicitly set to `1`
+3. `HIP_QUANT_DISABLE_WMMA` must not be set
 
 ---
 
@@ -446,7 +445,7 @@ All layers of the codebase include runtime safety checks:
 - `float_dtype_code()` — validates float32/float16/bfloat16 only, rejects float64
 - `checked_int()` — traps int64→int narrowing before it silently overflows
 - `check_grid_dim()` — validates gridDim ≤ 65535 per HIP hardware limit
-- `check_gfx12_fp8_wmma_runtime()` — multi-stage WMMA safety gate (arch, runtime version, env vars)
+- `check_gfx12_fp8_wmma_runtime()` — WMMA runtime gate (arch, runtime version, explicit disable flag)
 
 **`hip_quantize.cpp`:**
 - `ensure_initialized()` — auto-selects GPU with most CUs
@@ -459,14 +458,14 @@ All layers of the codebase include runtime safety checks:
 
 **Python layer:**
 - DLL resolution searches multiple locations; fails gracefully with clear error
-- WMMA operations gated behind `HIP_QUANT_ENABLE_GFX12_WMMA` env var
+- WMMA operations require gfx12 and ROCm/HIP 7.2+; `HIP_QUANT_DISABLE_WMMA=1` explicitly disables them
 - `quantize_numpy()` validates block size alignment, dtype, contiguity
 
 ---
 
 ## 9. Windows-Specific Fixes Applied
 
-Three critical Windows/RDNA4 fixes have been applied to this repository:
+Four critical Windows/RDNA4 fixes have been applied to this repository:
 
 ### 9.1 RDNA4 GPU Hang — `-mno-wavefrontsize64`
 
@@ -479,6 +478,12 @@ Moved `#include <hip/hip_runtime.h>` to the very top of the file, before `#inclu
 ### 9.3 Windows Path With Spaces — `_short_path()` Wrapping
 
 Added `_short_path()` wrapping around all PyTorch include paths in `setup_torch.py`. When a user clones the project into a directory path containing spaces (e.g., `C:\AI Pipeline\`), MSVC receives unquoted include paths and fails with `Cannot open include file: 'torch/all.h'`. The 8.3 short-path conversion (e.g., `C:\AIPIPE~1\`) bypasses this.
+
+### 9.4 Current PyTorch HIP Stream — `c10::hip::getCurrentHIPStream()`
+
+The compiled Windows binding retrieves the current PyTorch HIP stream for every
+kernel launch. This preserves ordering with caller work submitted to a
+non-default stream instead of silently launching on HIP's default stream.
 
 ---
 
@@ -502,8 +507,11 @@ python diagnose_fp8_crash.py       # 8-stage progressive diagnosis
 
 ### 10.4 WMMA Stress Test (gfx12 only)
 ```powershell
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
-python test_fp8_gemm.py
+pytest tests/test_wmma_diag.py -v
+
+# Include 512²/1024² and repeated-large coverage
+$env:HIP_QUANT_WMMA_STRESS = "1"
+pytest tests/test_wmma_diag.py -v
 ```
 
 ---
@@ -518,8 +526,8 @@ Resolution order: env vars → venv _rocm_sdk_core\bin → venv torch\lib → sy
 
 ### GPU hang with WMMA kernels
 ```
-Root cause: ROCm 7.1 + gfx12 WMMA bug
-Fix: Set HIP_QUANT_ENABLE_GFX12_WMMA only on ROCm 7.2+ systems
+Root cause: unsupported architecture or ROCm/HIP older than 7.2
+Fix: use a gfx12 ROCm/HIP 7.2+ environment, or set HIP_QUANT_DISABLE_WMMA=1
 Check: python diagnose_fp8_crash.py (Stage 5 isolates WMMA specifically)
 ```
 
@@ -531,6 +539,6 @@ Fix: Clone to a path without spaces, or the _short_path() fix handles it.
 
 ### "CUDA error: device-side assert triggered"
 ```
-Usually from the WMMA backward kernels — E5M2/BF8 path not fully validated.
-Set HIP_QUANT_DISABLE_WMMA=1 and use only the quantize/dequantize functions.
+Check that the active device is gfx12 and the HIP runtime is 7.2 or newer.
+Set HIP_QUANT_DISABLE_WMMA=1 to isolate the custom WMMA path while debugging.
 ```

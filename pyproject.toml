@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "0.5.9"
+version = "0.6.0"
 description = "HIP/ROCm quantization library for AMD GPUs"
 readme = "README.md"
 authors = [
@@ -25,6 +25,10 @@ hip-quant = "hip_quant.__main__:main"
 
 [tool.setuptools]
 packages = ["hip_quant"]
+# All runtime assets are declared explicitly below.  Avoid deriving package
+# data from MANIFEST.in: every asset directory is importable as a Python
+# namespace package, which otherwise produces ambiguous-package warnings.
+include-package-data = false
 
 [tool.setuptools.package-dir]
 "hip_quant" = "."
@@ -35,8 +39,11 @@ packages = ["hip_quant"]
     "hip_quantize_rocm721.dll",
     "libhip_quantize.so",
     "_C*.pyd",
-    "*.h",
+    "hip_quant_types.h",
+    "hip_quant_util.h",
+    "hip_iquant_util.h",
     "*.cpp",
+    "codebooks/*.bin",
     "build.ps1",
     "build.sh",
     "kernels/*.cu",

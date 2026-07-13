@@ -1,20 +1,19 @@
 include hip_quantize.dll
 include hip_quantize_rocm721.dll
-include libhip_quantize.so
 include _C*.pyd
 include _C.cp312-win_amd64.pyd
-include *.h
+include hip_quant_types.h
+include hip_quant_util.h
+include hip_iquant_util.h
 include *.cpp
 include build.ps1
 include build.sh
-recursive-include kernels *
-recursive-include torch_ext *
-recursive-include tests *
+recursive-include kernels *.cu
+recursive-include torch_ext *.cpp *.hip
+recursive-include tests *.py
+recursive-include codebooks *.bin
 include torch_api.py
 include device_info.py
 include cdna_compat.py
 include setup_torch.py
 include DOCUMENTATION.md
-global-exclude __pycache__/*
-global-exclude *.pyc
-global-exclude *.pyo

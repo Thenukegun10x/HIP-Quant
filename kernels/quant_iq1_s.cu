@@ -45,32 +45,32 @@ __global__ void quantize_iq1_s_kernel(
     int nrows,
     int n_per_row
 ) {
-    if (threadIdx.x != 0) return;
-
+    const int n_sub_blocks = QK_K / IQ1S_BLOCK_SIZE;
     int row = blockIdx.x;
     int ibl = blockIdx.y;
+    int ib = threadIdx.x;
     if (row >= nrows) return;
     int nbl = n_per_row / QK_K;
     if (ibl >= nbl) return;
+    if (ib >= n_sub_blocks) return;
 
     const float * xbl = src + row * n_per_row + QK_K * ibl;
     block_iq1_s * y = (block_iq1_s *)(dst + (row * nbl + ibl) * sizeof(block_iq1_s));
 
-    y->d = 0;
-    for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
-    for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+    __shared__ float s_scales[QK_K / IQ1S_BLOCK_SIZE];
+    __shared__ int8_t s_shifts[QK_K / IQ1S_BLOCK_SIZE];
+    __shared__ uint8_t s_qs[QK_K / 4];
+    __shared__ uint16_t s_qh[QK_K / 32];
 
+    float local_scale;
+    int8_t local_shift;
     const float x_p[3] = {-1.0f + IQ1S_DELTA, IQ1S_DELTA, 1.0f + IQ1S_DELTA};
     const float x_m[3] = {-1.0f - IQ1S_DELTA, -IQ1S_DELTA, 1.0f - IQ1S_DELTA};
-    float scales[QK_K / IQ1S_BLOCK_SIZE];
-    int8_t shifts[QK_K / IQ1S_BLOCK_SIZE];
-    float max_scale = 0;
-
     float sumx2 = 0;
     for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
     float sigma2 = 2.0f * sumx2 / QK_K;
 
-    for (int ib = 0; ib < QK_K / IQ1S_BLOCK_SIZE; ++ib) {
+    {
         const float * xb = xbl + IQ1S_BLOCK_SIZE * ib;
         const float * qw = imatrix ? imatrix + row * n_per_row + QK_K * ibl + IQ1S_BLOCK_SIZE * ib : NULL;
         float weight[IQ1S_BLOCK_SIZE];
@@ -91,10 +91,22 @@ __global__ void quantize_iq1_s_kernel(
             if (ax > max_v) max_v = ax;
         }
         if (max_v < GROUP_MAX_EPS_IQ1_S) {
-            scales[ib] = 0;
-            shifts[ib] = 1;
-            for (int i = 0; i < IQ1S_BLOCK_SIZE; ++i) L[i] = 1;
-            continue;
+            s_scales[ib] = 0;
+            s_shifts[ib] = 1;
+            s_qh[ib] = 0;
+            for (int k = 0; k < IQ1S_BLOCK_SIZE / 8; ++k) s_qs[ib * (IQ1S_BLOCK_SIZE / 8) + k] = 0;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float max_scale = 0;
+                for (int j = 0; j < n_sub_blocks; ++j)
+                    if (s_scales[j] > max_scale) max_scale = s_scales[j];
+                if (max_scale == 0) {
+                    y->d = 0;
+                    for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
+                    for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+                }
+            }
+            return;
         }
 
         for (int j = 0; j < IQ1S_BLOCK_SIZE; ++j) {
@@ -148,10 +160,22 @@ __global__ void quantize_iq1_s_kernel(
             }
         }
         if (besti1 < 0 || besti2 < 0 || best_shift == 0) {
-            scales[ib] = 0;
-            shifts[ib] = 1;
-            for (int i = 0; i < IQ1S_BLOCK_SIZE; ++i) L[i] = 1;
-            continue;
+            s_scales[ib] = 0;
+            s_shifts[ib] = 1;
+            s_qh[ib] = 0;
+            for (int k = 0; k < IQ1S_BLOCK_SIZE / 8; ++k) s_qs[ib * (IQ1S_BLOCK_SIZE / 8) + k] = 0;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float max_scale = 0;
+                for (int j = 0; j < n_sub_blocks; ++j)
+                    if (s_scales[j] > max_scale) max_scale = s_scales[j];
+                if (max_scale == 0) {
+                    y->d = 0;
+                    for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
+                    for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+                }
+            }
+            return;
         }
 
         for (int j = 0; j < besti1; ++j) L[idx[j]] = 0;
@@ -192,24 +216,40 @@ __global__ void quantize_iq1_s_kernel(
 
         uint16_t h = 0;
         for (int k = 0; k < IQ1S_BLOCK_SIZE / 8; ++k) {
-            y->qs[(IQ1S_BLOCK_SIZE / 8) * ib + k] = (uint8_t)(index[k] & 255);
+            s_qs[ib * (IQ1S_BLOCK_SIZE / 8) + k] = (uint8_t)(index[k] & 255);
             h |= (uint16_t)((index[k] >> 8) << (3 * k));
         }
-        y->qh[ib] = h;
-        scales[ib] = scale;
-        shifts[ib] = (int8_t)best_shift;
-        if (scale > max_scale) max_scale = scale;
+        s_qh[ib] = h;
+        local_scale = scale;
+        local_shift = (int8_t)best_shift;
     }
 
-    if (!max_scale) return;
-    float d = max_scale / 15.0f;
-    y->d = fp32_to_fp16(d * 1.125f);
-    float id = 1.0f / d;
-    for (int ib = 0; ib < QK_K / IQ1S_BLOCK_SIZE; ++ib) {
-        int l = nearest_int(0.5f * (id * scales[ib] - 1.0f));
-        if (l < 0) l = 0;
-        if (l > 7) l = 7;
-        if (shifts[ib] == -1) l |= 8;
-        y->qh[ib] |= (uint16_t)(l << 12);
+    s_scales[ib] = local_scale;
+    s_shifts[ib] = local_shift;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float max_scale = 0;
+        for (int j = 0; j < n_sub_blocks; ++j)
+            if (s_scales[j] > max_scale) max_scale = s_scales[j];
+
+        if (max_scale == 0) {
+            y->d = 0;
+            for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
+            for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = 0;
+        } else {
+            float d = max_scale / 15.0f;
+            y->d = fp32_to_fp16(d * 1.125f);
+            float id = 1.0f / d;
+            for (int j = 0; j < n_sub_blocks; ++j) {
+                int l = nearest_int(0.5f * (id * s_scales[j] - 1.0f));
+                if (l < 0) l = 0;
+                if (l > 7) l = 7;
+                if (s_shifts[j] == -1) l |= 8;
+                s_qh[j] |= (uint16_t)(l << 12);
+            }
+            for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = s_qs[i];
+            for (int i = 0; i < QK_K / 32; ++i) y->qh[i] = s_qh[i];
+        }
     }
 }

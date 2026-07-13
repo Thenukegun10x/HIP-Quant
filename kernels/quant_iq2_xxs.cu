@@ -118,10 +118,10 @@ __global__ void quantize_iq2_xxs_kernel(
     int nrows,
     int n_per_row
 ) {
-    if (threadIdx.x != 0) return;
-
+    const int n_sub_blocks = QK_K / 32;
     int row = blockIdx.x;
     int ibl = blockIdx.y;
+    int ib = threadIdx.x;
     if (row >= nrows) return;
     int nbl = n_per_row / QK_K;
     if (ibl >= nbl) return;
@@ -129,16 +129,21 @@ __global__ void quantize_iq2_xxs_kernel(
     const float * xbl = src + row * n_per_row + QK_K * ibl;
     block_iq2_xxs * y = (block_iq2_xxs *)(dst + (row * nbl + ibl) * sizeof(block_iq2_xxs));
 
-    float scales[QK_K / 32];
-    uint32_t q2[2 * (QK_K / 32)];
-    for (int i = 0; i < 2 * (QK_K / 32); ++i) q2[i] = 0;
+    __shared__ float s_scales[QK_K / 32];
+    __shared__ uint32_t s_q2[2 * (QK_K / 32)];
 
-    float max_scale = 0;
-    float sumx2 = 0;
-    for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
-    float sigma2 = sumx2 / QK_K;
+    if (threadIdx.x < 16) s_q2[threadIdx.x] = 0;
+    __syncthreads();
 
-    for (int ib = 0; ib < QK_K / 32; ++ib) {
+    // Inactive lanes must remain alive for both block-wide barriers below.
+    // Only the first eight lanes own the 32-element IQ2_XXS sub-blocks.
+    float local_scale = 0.0f;
+    if (ib < n_sub_blocks) {
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
+        float sigma2 = sumx2 / QK_K;
+
+        {
         const float * xb = xbl + 32 * ib;
         const float * qw = imatrix ? imatrix + row * n_per_row + QK_K * ibl + 32 * ib : NULL;
         float weight[32], waux[32], xval[32];
@@ -182,20 +187,11 @@ __global__ void quantize_iq2_xxs_kernel(
 
         float max_v = xval[0];
         for (int i = 1; i < 32; ++i) if (xval[i] > max_v) max_v = xval[i];
-        if (max_v < GROUP_MAX_EPS) {
-            scales[ib] = 0;
-            for (int i = 0; i < 32; ++i) L[i] = 0;
-            continue;
-        }
-
-        float scale = make_qp_quants_iq2xxs(32, 4, xval, Lu, weight);
-        for (int i = 0; i < 32; ++i) L[i] = (int8_t)Lu[i];
-        float eff_max = scale * 3.0f;
-        if (eff_max <= 0) {
-            scales[ib] = 0;
-            for (int i = 0; i < 32; ++i) L[i] = 0;
-            continue;
-        }
+        if (max_v >= GROUP_MAX_EPS) {
+            float scale = make_qp_quants_iq2xxs(32, 4, xval, Lu, weight);
+            for (int i = 0; i < 32; ++i) L[i] = (int8_t)Lu[i];
+            float eff_max = scale * 3.0f;
+            if (eff_max > 0) {
 
         float best = 0;
         for (int is = -6; is <= 6; ++is) {
@@ -270,30 +266,38 @@ __global__ void quantize_iq2_xxs_kernel(
             if (grid_index < 0) {
                 grid_index = 0;
             }
-            q2[2 * ib + 0] |= ((uint32_t)grid_index << (8 * k));
-            q2[2 * ib + 1] |= ((uint32_t)block_signs[k] << (7 * k));
+            s_q2[2 * ib + 0] |= ((uint32_t)grid_index << (8 * k));
+            s_q2[2 * ib + 1] |= ((uint32_t)block_signs[k] << (7 * k));
         }
-        scales[ib] = scale;
-        if (scale > max_scale) max_scale = scale;
+        local_scale = scale;
+            }
+        }
+        }
+        s_scales[ib] = local_scale;
     }
+    __syncthreads();
 
-    if (!max_scale) {
-        y->d = 0;
-        for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
-        return;
+    if (threadIdx.x == 0) {
+        float max_scale = 0;
+        for (int j = 0; j < n_sub_blocks; ++j)
+            if (s_scales[j] > max_scale) max_scale = s_scales[j];
+
+        if (max_scale == 0) {
+            y->d = 0;
+            for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = 0;
+        } else {
+            float d = max_scale / 31.0f;
+            y->d = fp32_to_fp16(d);
+            float id = 1.0f / d;
+            for (int j = 0; j < n_sub_blocks; ++j) {
+                int l = nearest_int(0.5f * (id * s_scales[j] - 1.0f));
+                if (l < 0) l = 0;
+                if (l > 15) l = 15;
+                s_q2[2 * j + 1] |= ((uint32_t)l << 28);
+            }
+            uint8_t * qs = (uint8_t *)y->qs;
+            const uint8_t * src_q2 = (const uint8_t *)s_q2;
+            for (int i = 0; i < QK_K / 4; ++i) qs[i] = src_q2[i];
+        }
     }
-
-    float d = max_scale / 31.0f;
-    y->d = fp32_to_fp16(d);
-    float id = 1.0f / d;
-    for (int ib = 0; ib < QK_K / 32; ++ib) {
-        int l = nearest_int(0.5f * (id * scales[ib] - 1.0f));
-        if (l < 0) l = 0;
-        if (l > 15) l = 15;
-        q2[2 * ib + 1] |= ((uint32_t)l << 28);
-    }
-
-    uint8_t * qs = (uint8_t *)y->qs;
-    const uint8_t * src_q2 = (const uint8_t *)q2;
-    for (int i = 0; i < QK_K / 4; ++i) qs[i] = src_q2[i];
 }

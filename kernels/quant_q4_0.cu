@@ -3,7 +3,7 @@
 #include "../hip_quant_util.h"
 
 // Q4_0: 32-element blocks, symmetric 4-bit
-// d = max/-8, values range [-8, 7], stored as unsigned nibble + 8 bias
+// Uses warp shuffle reduction (wave32-safe on gfx12/RDNA4)
 
 extern "C" __global__
 __launch_bounds__(32, 8)
@@ -21,24 +21,18 @@ void quantize_q4_0_kernel(
     int base = row * n_per_row + blk * 32 + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_vals[32];
-
     float val = src[base];
-    s_vals[tid] = val;
-    __syncthreads();
 
+    float v = val;
+    float va = fabsf(val);
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a0 = fabsf(s_vals[tid]);
-            float a1 = fabsf(s_vals[tid + s]);
-            if (a1 > a0) {
-                s_vals[tid] = s_vals[tid + s];
-            }
-        }
-        __syncthreads();
+        float other = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, s);
+        float other_a = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, va, s);
+        if (other_a > va) { v = other; va = other_a; }
     }
 
-    float max_val = s_vals[0];
+    float max_val = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
     float d = max_val / -8.0f;
     float id = d != 0 ? 1.0f / d : 0.0f;
 

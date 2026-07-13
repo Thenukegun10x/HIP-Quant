@@ -27,20 +27,18 @@ Runtime validation is currently on RDNA4. The PyTorch FP8 WMMA kernels target `g
 
 CDNA support is included for the offline NumPy/DLL quantization path and compatibility tooling. The default DLL build now emits one all-target DLL for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`. The gfx12 WMMA FP8 GEMM test is intentionally disabled on CDNA; CDNA can support FP8/BF16 through MFMA/rocBLASLt-style paths, but not this RDNA4-specific gfx12 WMMA builtin path.
 
-### ⚠️ gfx12 FP8 WMMA Safety (Windows RDNA4)
+### gfx12 FP8 WMMA (Windows RDNA4)
 
-The PyTorch FP8 training API (`Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`) uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` for the fused GEMM forward/backward pass. On **ROCm 7.1 with Windows gfx1201**, these WMMA intrinsics can trigger a GPU TDR (driver timeout) that corrupts GPU memory and may restart the PC.
+The PyTorch FP8 training API (`Fp8Linear`, `Fp8ScaledLinear`, and
+`Fp8ShadowLinear`) and the ctypes micro-GEMM use the gfx12 Wave32 FP8/BF8
+WMMA intrinsics. They are enabled by default on a `gfx1200`/`gfx1201` device
+with ROCm/HIP 7.2 or newer. Both the Python and native entry points reject
+other architectures or older runtimes before launch.
 
-**Root cause:** The ROCm 7.1 HIP runtime has a stability issue with `gfx12` WMMA instructions on RDNA4. The kernel launch succeeds but the GPU can hang asynchronously, causing subsequent `tensor.item()` calls to read back corrupted memory — typically manifesting as a `ZeroDivisionError` at `torch_api.py:495` (`1.0 / weight_inv_scale` with a zeroed GPU value).
-
-**Fix:** Wheels now package a ROCm 7.2.1-built DLL named `hip_quantize_rocm721.dll` next to the legacy `hip_quantize.dll`. On Windows, `HipQuant()` prefers `hip_quantize_rocm721.dll` when present and searches the active Python environment's ROCm/PyTorch DLL directories before the system ROCm 7.1 path. The legacy DLL can still be forced with `HIP_QUANT_DLL_VARIANT=legacy`.
-
-**Default safety policy:** gfx12 FP8/BF8 WMMA kernels are disabled by default because bad driver/compiler combinations can hang or reset the GPU. Enable them only for controlled testing:
-```powershell
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
-```
-
-Force-disable WMMA regardless of runtime/device:
+Windows wheels prefer the packaged ROCm 7.2.1-built
+`hip_quantize_rocm721.dll`; set `HIP_QUANT_DLL_VARIANT=legacy` only when the
+legacy DLL is deliberately required. To explicitly suppress the custom WMMA
+path on a compatible system:
 ```powershell
 $env:HIP_QUANT_DISABLE_WMMA = "1"
 ```
@@ -52,9 +50,10 @@ Validated local test system:
 - OS/toolchain: Windows, Visual Studio 2022 Build Tools, ROCm installed at `C:\Program Files\AMD\ROCm\7.1`
 - PyTorch venv: `C:\venvs\medusa_rocm\Scripts\python.exe`
 - PyTorch: `2.9.1+rocm7.2.1`, HIP runtime: `7.2.53211-158bd99533`
-- FP8 WMMA microtest verified with the packaged ROCm 7.2.1 DLL: 50 bounded launches through `fp8_gemm_test_wmma`
+- Full WMMA diagnostic/stress suite verified: native diagnostic, padded and uneven-K GEMMs, 512²/1024² matrices, and repeated launches. Every numeric check compares the GEMM result with the decoded E4M3 operands actually consumed by WMMA.
 
-> **Note:** The offline NumPy/DLL quantization path does **not** use WMMA and is unaffected. It works with both ROCm 7.1 and 7.2 runtimes. The packaged ROCm 7.2.1 DLL is preferred on Windows to avoid ROCm 7.1 gfx12 WMMA hazards when optional FP8 GEMM tests are enabled.
+> **Note:** The offline NumPy/DLL quantization path does not use WMMA. The
+> custom PyTorch and micro-GEMM WMMA paths require gfx12 and ROCm/HIP 7.2+.
 
 ---
 
@@ -124,6 +123,48 @@ extension can still be built locally with `setup_torch.py build_ext --inplace`.
 
 ---
 
+### Runtime codebooks and GPU execution features
+
+I-Quant lookup data is shipped as five versioned binary files under
+`codebooks/`, rather than being compiled into the DLL. The loader finds them
+next to the DLL; set `HIP_QUANT_CODEBOOK_DIR` when deliberately using a DLL
+outside its package directory. Regenerate and verify the checked-in assets with:
+
+```powershell
+& "C:\venvs\medusa_rocm\Scripts\python.exe" tools\export_iq_codebooks.py --check
+```
+
+The PyTorch extension also exposes `quantize_e4m3_transpose()` and
+`quantize_e5m2_transpose()` for a rank-2 tensor, avoiding a materialised
+full-precision transpose. For stable-shape inference, `capture_hip_graph()`
+captures a callable through PyTorch's ROCm `CUDAGraph` interface (HIP Graph):
+
+```python
+runner = hip_quant.capture_hip_graph(model, example_tokens)
+logits = runner.replay(next_tokens)
+```
+
+`replay()` returns independent outputs by default; use
+`clone_output=False` only when the graph-owned output will be consumed before
+the next replay.
+
+### Current release capabilities
+
+- WMMA diagnostics use Wave32-correct launch shapes, cooperative-group tiled
+  barriers for LDS staging, and decoded-FP8 GEMM references; the custom path
+  is enabled on supported gfx12 ROCm/HIP 7.2+ systems.
+- I-Quant quantizers are parallelized to 256 threads, and legacy quantizers
+  use Wave32-safe shuffle reductions. I-/T-Quant dequantization to E4M3/E5M2
+  and direct FP8-to-quant fused kernels are covered by byte-level tests.
+- The PyTorch extension uses PyTorch's current HIP stream, supports seeded
+  stochastic E5M2 conversion, non-temporal FP8 memory hints where supported,
+  and fused FP8 quantize-plus-transpose kernels.
+- I-Quant codebooks are external, versioned package assets verified by CRC;
+  the captured HIP Graph runner provides stable-shape replay without Python
+  launch overhead.
+
+---
+
 ## 📦 Installation
 
 ```powershell
@@ -174,8 +215,8 @@ grad_e5m2 = hq.quantize_numpy(grad, GGML_TYPE["F8_E5M2"])  # backward
 the GPU. Each thread reconstructs a scalar from the Q block and immediately
 encodes it as E4M3 or E5M2 in the same kernel, so no float32 buffer is
 allocated or transferred. Supported source types: legacy `Q4_0/Q4_1/Q5_0/Q5_1/
-Q8_0/Q8_1` and K-quants `Q2_K` through `Q6_K`. I-quants and ternary quants are
-rejected (their codebook decoders are not part of this direct path yet).
+Q8_0/Q8_1`, K-quants `Q2_K` through `Q6_K`, I-quants `IQ1_S` through
+`IQ4_XS` (including `IQ4_NL`), and ternary `TQ1_0`/`TQ2_0`.
 
 ```python
 from hip_quant import GGML_TYPE, get_hip_quant
@@ -212,7 +253,9 @@ python -m hip_quant --help
 #### Q → FP8 dequantization
 `dequantize_q_to_fp8` expands packed GGML Q blocks **directly** to raw FP8 bytes on the GPU. It reads packed PyTorch GPU bytes and writes `torch.uint8` directly into another GPU tensor, eliminating expensive PCI-e transfers and host CPU decoding.
 
-Supported source types: legacy `Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1` and K-quants `Q2_K` through `Q6_K`. I-quants and ternary quants are rejected.
+The PyTorch extension currently supports legacy `Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1`
+and K-quants `Q2_K` through `Q6_K`; I-quants and ternary quants remain
+offline-DLL-only for this particular API.
 
 ```python
 import torch
@@ -439,17 +482,13 @@ from hip_quant.torch_api import Fp8LinearFunction
 out = Fp8LinearFunction.apply(input, weight, bias)  # bias optional
 ```
 
-#### Fused FP8 Linear Fallback (gfx12 WMMA kernels)
+#### Fused FP8 Linear (gfx12 WMMA kernels)
 
 The high-level `Fp8Linear`, `Fp8ScaledLinear`, `Fp8ShadowLinear`, `Fp8Conv1d`,
 and `Fp8Conv2d` APIs try the hipBLASLt-backed PyTorch `_scaled_mm` route first.
-These direct custom WMMA entry points are the fallback/testing path.
-
-These kernels are disabled by default. Enable only after validating your ROCm
-runtime and GPU stability:
-```powershell
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
-```
+These direct custom WMMA entry points are the fallback/testing path on a
+compatible gfx12 ROCm/HIP 7.2+ device. Set `HIP_QUANT_DISABLE_WMMA=1` to
+explicitly disable them.
 
 ```python
 from hip_quant import (
@@ -484,10 +523,9 @@ These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
 #### gfx1201 FP8/BF16 Microbenchmark
 
 Measured on the validated local RX 9070 XT `gfx1201` system with PyTorch
-`2.9.1+rocm7.2.1` and `HIP_QUANT_ENABLE_GFX12_WMMA=1`:
+`2.9.1+rocm7.2.1`:
 
 ```powershell
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
 & "C:\venvs\medusa_rocm\Scripts\python.exe" tests\torch\bench_fp8.py
 ```
 
@@ -503,11 +541,11 @@ forward+backward: 5.622 ms
 total wall time: 0.86 s
 ```
 
-The benchmark is available at `tests/torch/bench_fp8.py`. Without
-`HIP_QUANT_ENABLE_GFX12_WMMA=1`, it reports only the elementwise FP8 timings and
-skips WMMA linear kernels.
+The benchmark is available at `tests/torch/bench_fp8.py`. It measures custom
+WMMA automatically on a compatible device and reports the runtime guard reason
+otherwise.
 
-The 0.4.8 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
+The 0.6.0 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
 improvement: it reuses pre-quantized FP8 activations/gradients, skips redundant
 output zeroing, fuses bias stores, vectorizes elementwise FP8 kernels, and caches
 offline FP8 temporary buffers. Persistent VRAM savings are still mainly provided
@@ -578,8 +616,6 @@ $env:HIP_VISIBLE_DEVICES = ""
 ```powershell
 # Build extension first (x64 VS toolchain)
 & "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
-
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/torch/test_fp8.py -v
 ```
 
@@ -594,16 +630,16 @@ $env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
 
 #### Optional gfx12 FP8 WMMA Stress Test
 
-Only run this on a stable ROCm 7.2+ gfx12 system. It can still reset the GPU on
-bad driver/runtime combinations.
+Requires a ROCm/HIP 7.2+ gfx12 system.
 ```powershell
-$env:PYTHONPATH = "C:\path\to\src"
-$env:HIP_QUANT_ENABLE_GFX12_WMMA = "1"
-& "C:\venvs\medusa_rocm\Scripts\python.exe" test_fp8_gemm.py
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests\test_wmma_diag.py -v
+
+# Include 512²/1024² and repeated-large coverage
+$env:HIP_QUANT_WMMA_STRESS = "1"
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests\test_wmma_diag.py -v
 ```
 
-The release DLL was locally checked with 50 bounded `fp8_gemm_test_wmma`
-launches on `gfx1201` and HIP runtime `70253211`.
+The release DLL was checked on `gfx1201` with HIP runtime `70253211`.
 
 ---
 
@@ -670,7 +706,7 @@ hip_quant/
 - **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
-- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`. hipBLASLt training paths keep delayed scales device-resident where possible; legacy custom WMMA launchers still take scalar float scales. Block-wise FP8 metadata stays in device FP32 scale tensors. Non-MSVC builds use PyTorch's current stream, while Windows/MSVC ROCm builds currently fall back to the default HIP stream because the PyTorch HIP stream headers do not compile cleanly under MSVC.
+- **Device-resident kernels** — FP8 tensor data stays on device through `tensor.data_ptr()`. hipBLASLt training paths keep delayed scales device-resident where possible; legacy custom WMMA launchers still take scalar float scales. Block-wise FP8 metadata stays in device FP32 scale tensors. All extension launches use PyTorch's current HIP stream, including the Windows/MSVC build.
 - **Phase 4 GEMM** includes gfx12 WMMA per-tensor-scale paths, packed-weight WMMA variants, and a correctness-first block-scaled FP8 linear path. Large training shapes prefer hipBLASLt via `torch._scaled_mm`; custom WMMA remains the fallback/small-shape path.
 - **Adafactor** provides a complete optimizer step in Python with nonfinite step skipping. GPU-side row/column mean-square reductions for 2-D gradients exist; a fully fused Adafactor update kernel is a future optimization target.
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly

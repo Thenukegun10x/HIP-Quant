@@ -21,9 +21,7 @@
 // tensor allocation.
 
 #include <hip/hip_runtime.h>
-#ifndef _MSC_VER
-#include <ATen/hip\HIPContext.h>
-#endif
+#include <c10/hip/HIPStream.h>
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
 #include <pybind11/pybind11.h>
@@ -53,6 +51,12 @@ void launch_quant_e4m3(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
 void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
+void launch_quant_e4m3_transpose(const void* src, uint8_t* dst,
+                                 int64_t rows, int64_t cols, int dtype,
+                                 hipStream_t stream);
+void launch_quant_e5m2_transpose(const void* src, uint8_t* dst,
+                                 int64_t rows, int64_t cols, int dtype,
+                                 hipStream_t stream);
 void launch_quant_e5m2_stochastic(const void* src, uint8_t* dst, int64_t numel,
                                   int dtype, uint64_t seed, hipStream_t stream);
 void launch_dequant_e4m3(const uint8_t* src, float* dst, int64_t numel,
@@ -159,11 +163,7 @@ static inline bool positive_finite_scale(double value) {
 // Helper: get current HIP stream from ATen
 // ---------------------------------------------------------------------------
 static hipStream_t current_stream() {
-#ifdef _MSC_VER
-    return nullptr;
-#else
-    return reinterpret_cast<hipStream_t>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream());
-#endif
+    return c10::hip::getCurrentHIPStream().stream();
 }
 
 static inline int float_dtype_code(c10::ScalarType dtype, const char* name) {
@@ -248,14 +248,6 @@ static inline void check_gfx12_fp8_wmma_runtime(const char* op_name) {
                     std::strcmp(disable_wmma, "yes") == 0 || std::strcmp(disable_wmma, "on") == 0)),
                 op_name, ": disabled by HIP_QUANT_DISABLE_WMMA");
 
-    const char* enable_wmma = std::getenv("HIP_QUANT_ENABLE_GFX12_WMMA");
-    TORCH_CHECK(enable_wmma != nullptr && (
-                    std::strcmp(enable_wmma, "1") == 0 || std::strcmp(enable_wmma, "true") == 0 ||
-                    std::strcmp(enable_wmma, "yes") == 0 || std::strcmp(enable_wmma, "on") == 0),
-                op_name,
-                ": disabled by default because unstable FP8/BF8 WMMA kernels can hang or reset the GPU. "
-                "Set HIP_QUANT_ENABLE_GFX12_WMMA=1 only for controlled testing on ROCm 7.2+ gfx12 systems.");
-
     int device = 0;
     hipError_t err = hipGetDevice(&device);
     TORCH_CHECK(err == hipSuccess, op_name, ": hipGetDevice failed");
@@ -273,7 +265,7 @@ static inline void check_gfx12_fp8_wmma_runtime(const char* op_name) {
     TORCH_CHECK(runtime_version == 0 || runtime_version >= 70200000,
                 op_name, ": ROCm/HIP 7.2+ is required for gfx12 FP8 WMMA; current runtime is ",
                 runtime_version,
-                ". ROCm 7.1 and older can hang or zero GPU memory.");
+                ".");
 }
 
 struct BiasLaunch {
@@ -338,6 +330,34 @@ torch::Tensor quantize_e5m2(torch::Tensor input) {
         current_stream()
     );
     return output;
+}
+
+static torch::Tensor quantize_transpose_impl(torch::Tensor input, bool e5m2) {
+    const char* op_name = e5m2 ? "quantize_e5m2_transpose" : "quantize_e4m3_transpose";
+    TORCH_CHECK(input.is_cuda(), op_name, ": input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), op_name, ": input must be contiguous");
+    TORCH_CHECK(input.dim() == 2, op_name, ": input must be a rank-2 tensor");
+    int input_dtype = float_dtype_code(input, op_name);
+
+    const int64_t rows = input.size(0);
+    const int64_t cols = input.size(1);
+    auto output = torch::empty({cols, rows}, input.options().dtype(torch::kUInt8));
+    if (e5m2) {
+        launch_quant_e5m2_transpose(input.data_ptr(), output.data_ptr<uint8_t>(),
+                                    rows, cols, input_dtype, current_stream());
+    } else {
+        launch_quant_e4m3_transpose(input.data_ptr(), output.data_ptr<uint8_t>(),
+                                    rows, cols, input_dtype, current_stream());
+    }
+    return output;
+}
+
+torch::Tensor quantize_e4m3_transpose(torch::Tensor input) {
+    return quantize_transpose_impl(input, false);
+}
+
+torch::Tensor quantize_e5m2_transpose(torch::Tensor input) {
+    return quantize_transpose_impl(input, true);
 }
 
 torch::Tensor quantize_e5m2_stochastic(torch::Tensor input, uint64_t seed) {
@@ -1201,6 +1221,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input"));
     m.def("quantize_e5m2",   &quantize_e5m2,
           "Quantize float32 tensor to FP8 E5M2 (uint8) on-device",
+          py::arg("input"));
+    m.def("quantize_e4m3_transpose", &quantize_e4m3_transpose,
+          "Fused quantize + transpose to FP8 E4M3 (uint8) on-device",
+          py::arg("input"));
+    m.def("quantize_e5m2_transpose", &quantize_e5m2_transpose,
+          "Fused quantize + transpose to FP8 E5M2 (uint8) on-device",
           py::arg("input"));
     m.def("quantize_e5m2_stochastic", &quantize_e5m2_stochastic,
           "Quantize tensor to FP8 E5M2 (uint8) with stochastic rounding on-device",

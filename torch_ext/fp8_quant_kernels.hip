@@ -18,21 +18,43 @@
 #define HIP_QUANT_DTYPE_BF16 2
 #define HIP_QUANT_ELEMS_PER_THREAD 4
 
+// Quantize buffers are normally consumed by a later kernel rather than by the
+// kernel that writes them.  Tell the compiler that these one-pass accesses do
+// not need to displace useful cache lines.  Define HIP_QUANT_DISABLE_NONTEMPORAL
+// for a target/compiler where profiling shows ordinary cached accesses win.
+template <typename T>
+static __device__ __forceinline__ T hip_quant_stream_load(const T* ptr) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(HIP_QUANT_ENABLE_NONTEMPORAL) && !defined(HIP_QUANT_DISABLE_NONTEMPORAL)
+    return __builtin_nontemporal_load(ptr);
+#else
+    return *ptr;
+#endif
+}
+
+template <typename T>
+static __device__ __forceinline__ void hip_quant_stream_store(T* ptr, T value) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(HIP_QUANT_ENABLE_NONTEMPORAL) && !defined(HIP_QUANT_DISABLE_NONTEMPORAL)
+    __builtin_nontemporal_store(value, ptr);
+#else
+    *ptr = value;
+#endif
+}
+
 template <int DTYPE>
 static __device__ inline float load_float_input_t(const void* src, int64_t idx) {
     if constexpr (DTYPE == HIP_QUANT_DTYPE_F16) {
-        return fp16_to_fp32(((const uint16_t*)src)[idx]);
+        return fp16_to_fp32(hip_quant_stream_load(((const uint16_t*)src) + idx));
     }
     if constexpr (DTYPE == HIP_QUANT_DTYPE_BF16) {
-        return bf16_to_fp32(((const uint16_t*)src)[idx]);
+        return bf16_to_fp32(hip_quant_stream_load(((const uint16_t*)src) + idx));
     }
-    return ((const float*)src)[idx];
+    return hip_quant_stream_load(((const float*)src) + idx);
 }
 
 template <int DTYPE>
 static __device__ inline uint8_t quant_input_e4m3_t(const void* src, int64_t idx) {
     if constexpr (DTYPE == HIP_QUANT_DTYPE_BF16) {
-        return bf16_to_fp8_e4m3(((const uint16_t*)src)[idx]);
+        return bf16_to_fp8_e4m3(hip_quant_stream_load(((const uint16_t*)src) + idx));
     }
     return fp32_to_fp8_e4m3(load_float_input_t<DTYPE>(src, idx));
 }
@@ -40,7 +62,7 @@ static __device__ inline uint8_t quant_input_e4m3_t(const void* src, int64_t idx
 template <int DTYPE>
 static __device__ inline uint8_t quant_input_e5m2_t(const void* src, int64_t idx) {
     if constexpr (DTYPE == HIP_QUANT_DTYPE_BF16) {
-        return bf16_to_fp8_e5m2(((const uint16_t*)src)[idx]);
+        return bf16_to_fp8_e5m2(hip_quant_stream_load(((const uint16_t*)src) + idx));
     }
     return fp32_to_fp8_e5m2(load_float_input_t<DTYPE>(src, idx));
 }
@@ -66,7 +88,7 @@ void quant_e4m3_kernel_t(
     for (int i = 0; i < HIP_QUANT_ELEMS_PER_THREAD; i++) {
         int64_t cur = idx + i;
         if (cur < numel) {
-            dst[cur] = quant_input_e4m3_t<DTYPE>(src, cur);
+            hip_quant_stream_store(dst + cur, quant_input_e4m3_t<DTYPE>(src, cur));
         }
     }
 }
@@ -87,7 +109,55 @@ void quant_e5m2_kernel_t(
     for (int i = 0; i < HIP_QUANT_ELEMS_PER_THREAD; i++) {
         int64_t cur = idx + i;
         if (cur < numel) {
-            dst[cur] = quant_input_e5m2_t<DTYPE>(src, cur);
+            hip_quant_stream_store(dst + cur, quant_input_e5m2_t<DTYPE>(src, cur));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused quantize + transpose: [rows, cols] floating point -> [cols, rows]
+// FP8.  The 32x32 shared-memory tile keeps source reads and transposed writes
+// coalesced, avoiding a materialised full-precision transpose.
+// ---------------------------------------------------------------------------
+template <int DTYPE, bool E5M2>
+__global__
+__launch_bounds__(256, 2)
+void quant_transpose_kernel_t(
+    const void* __restrict__ src,
+    uint8_t* __restrict__ dst,
+    int64_t rows,
+    int64_t cols
+) {
+    constexpr int TILE_DIM = 32;
+    constexpr int BLOCK_ROWS = 8;
+    __shared__ uint8_t tile[TILE_DIM][TILE_DIM + 1];
+
+    const int64_t input_col = (int64_t)blockIdx.x * TILE_DIM + threadIdx.x;
+    const int64_t input_row_base = (int64_t)blockIdx.y * TILE_DIM + threadIdx.y;
+
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        const int64_t input_row = input_row_base + j;
+        uint8_t value = 0;
+        if (input_row < rows && input_col < cols) {
+            const int64_t offset = input_row * cols + input_col;
+            value = E5M2 ? quant_input_e5m2_t<DTYPE>(src, offset)
+                         : quant_input_e4m3_t<DTYPE>(src, offset);
+        }
+        tile[threadIdx.y + j][threadIdx.x] = value;
+    }
+    __syncthreads();
+
+    // Swapping the tile indices makes adjacent lanes write adjacent columns
+    // of the transposed tensor. The +1 tile stride prevents LDS bank aliasing.
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        const int64_t output_row = (int64_t)blockIdx.x * TILE_DIM + threadIdx.y + j;
+        const int64_t output_col = (int64_t)blockIdx.y * TILE_DIM + threadIdx.x;
+        if (output_row < cols && output_col < rows) {
+            hip_quant_stream_store(
+                dst + output_row * rows + output_col,
+                tile[threadIdx.x][threadIdx.y + j]);
         }
     }
 }
@@ -418,6 +488,49 @@ void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
         hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e5m2_kernel_t<HIP_QUANT_DTYPE_F32>),
                            dim3(safe_blocks(numel)), dim3(256), 0, stream,
                            src, dst, numel);
+    }
+}
+
+static inline uint32_t safe_transpose_blocks(int64_t extent) {
+    assert(extent >= 0);
+    const int64_t blocks = (extent + 31) / 32;
+    assert(blocks <= (int64_t)0xFFFFFFFFu);
+    return (uint32_t)blocks;
+}
+
+void launch_quant_e4m3_transpose(const void* src, uint8_t* dst,
+                                 int64_t rows, int64_t cols, int dtype,
+                                 hipStream_t stream) {
+    if (rows == 0 || cols == 0) return;
+    const dim3 grid(safe_transpose_blocks(cols), safe_transpose_blocks(rows));
+    const dim3 block(32, 8);
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_F16, false>),
+                           grid, block, 0, stream, src, dst, rows, cols);
+    } else if (dtype == HIP_QUANT_DTYPE_BF16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_BF16, false>),
+                           grid, block, 0, stream, src, dst, rows, cols);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_F32, false>),
+                           grid, block, 0, stream, src, dst, rows, cols);
+    }
+}
+
+void launch_quant_e5m2_transpose(const void* src, uint8_t* dst,
+                                 int64_t rows, int64_t cols, int dtype,
+                                 hipStream_t stream) {
+    if (rows == 0 || cols == 0) return;
+    const dim3 grid(safe_transpose_blocks(cols), safe_transpose_blocks(rows));
+    const dim3 block(32, 8);
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_F16, true>),
+                           grid, block, 0, stream, src, dst, rows, cols);
+    } else if (dtype == HIP_QUANT_DTYPE_BF16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_BF16, true>),
+                           grid, block, 0, stream, src, dst, rows, cols);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_transpose_kernel_t<HIP_QUANT_DTYPE_F32, true>),
+                           grid, block, 0, stream, src, dst, rows, cols);
     }
 }
 

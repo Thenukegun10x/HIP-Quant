@@ -3,7 +3,7 @@
 #include "../hip_quant_util.h"
 
 // Q8_1: 32-element blocks, symmetric 8-bit with sum
-// d = amax/127, qs = round(val*id), s = d * sum(qs)
+// Uses warp shuffle reduction (wave32-safe on gfx12/RDNA4)
 
 extern "C" __global__
 __launch_bounds__(32, 8)
@@ -21,31 +21,20 @@ void quantize_q8_1_kernel(
     int base = row * n_per_row + blk * 32 + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_av[32];
-    __shared__ int s_sum[32];
-
     float val = src[base];
-    s_av[tid] = fabsf(val);
-    __syncthreads();
-
+    float v = fabsf(val);
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_av[tid] = fmaxf(s_av[tid], s_av[tid + s]);
-        }
-        __syncthreads();
+        v = fmaxf(v, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, s));
     }
+    float amax = __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 
-    float amax = s_av[0];
     float d = amax / 127.0f;
     float id = d > 0 ? 1.0f / d : 0.0f;
 
     int q = (int)roundf(val * id);
     if (q > 127) q = 127;
     if (q < -127) q = -127;
-
-    // Wait for d to be computed before writing output
-    // But we need d for sum calculation, and d doesn't depend on q
-    // The sum is of q values, so we can compute it in parallel
 
     block_q8_1 *blk_out = (block_q8_1*)(dst + (row * (n_per_row / 32) + blk) * sizeof(block_q8_1));
 
@@ -55,17 +44,13 @@ void quantize_q8_1_kernel(
 
     blk_out->qs[tid] = (int8_t)q;
 
-    s_sum[tid] = q;
-    __syncthreads();
-
+    int sum = q;
+    #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
+        sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, sum, s);
     }
 
     if (tid == 0) {
-        blk_out->s = fp32_to_fp16((float)s_sum[0] * d);
+        blk_out->s = fp32_to_fp16((float)__shfl_sync(0xFFFFFFFFFFFFFFFFull, sum, 0) * d);
     }
 }
