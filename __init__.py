@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",

@@ -1326,10 +1326,9 @@ torch::Tensor dequantize_q_to_fp8(
     TORCH_CHECK(total > 0 && total % row_bytes == 0,
                 "dequantize_q_to_fp8: packed size (", total,
                 ") must be a non-zero multiple of row size (", row_bytes, ")");
+    TORCH_CHECK(total / row_bytes <= INT_MAX,
+                "dequantize_q_to_fp8: nrows exceed supported int kernel range");
     int nrows = (int)(total / row_bytes);
-
-    TORCH_CHECK((int64_t)nrows <= 65535,
-                "dequantize_q_to_fp8: nrows (", nrows, ") exceeds HIP grid limit 65535");
     TORCH_CHECK((int64_t)blocks_per_row <= 65535,
                 "dequantize_q_to_fp8: blocks_per_row (", blocks_per_row, ") exceeds HIP grid limit 65535");
 
