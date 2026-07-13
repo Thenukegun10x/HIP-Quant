@@ -447,7 +447,11 @@ static int dispatch_dequantize_to_fp8_kernel(
     int type, const uint8_t *d_src, uint8_t *d_dst,
     int nrows, int n_per_row, int n_blocks_per_row
 ) {
-    dim3 gridDim((unsigned int)nrows, (unsigned int)n_blocks_per_row);
+    // AMD GPUs cap gridDim.x at 65535. Spread additional rows over z while
+    // keeping the row-major public API and the existing x/y block mapping.
+    const unsigned int row_grid = (unsigned int)((nrows < 65535) ? nrows : 65535);
+    const unsigned int row_layers = ((unsigned int)nrows + row_grid - 1u) / row_grid;
+    dim3 gridDim(row_grid, (unsigned int)n_blocks_per_row, row_layers);
 
     switch (type) {
         case 2:

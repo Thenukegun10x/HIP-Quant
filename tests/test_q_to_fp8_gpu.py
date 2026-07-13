@@ -67,10 +67,25 @@ _vec_e4m3 = np.vectorize(_fp8_e4m3_to_fp32, otypes=[np.float32])
 _vec_e5m2 = np.vectorize(_fp8_e5m2_to_fp32, otypes=[np.float32])
 
 
+def _cpu_q4_0_dequant(packed, nrows, n_per_row):
+    """Decode packed Q4_0 blocks without using the native library."""
+    blocks_per_row = n_per_row // 32
+    blocks = np.asarray(packed, dtype=np.uint8).reshape(nrows * blocks_per_row, 18)
+    d = blocks[:, :2].copy().view("<f2").astype(np.float32).reshape(-1, 1)
+    qs = blocks[:, 2:]
+    low = qs & 0x0F
+    high = qs >> 4
+    values = np.concatenate((low, high), axis=1).astype(np.float32) - 8.0
+    return (d * values).reshape(nrows, n_per_row)
+
+
 def _load():
     dll = os.environ.get("HIP_QUANT_TEST_DLL", "")
     if dll and os.path.isfile(dll):
         return dll
+    cand = os.path.join(_src, "hip_quantize.dll")
+    if os.path.isfile(cand):
+        return cand
     here = os.path.dirname(_src)
     cand = os.path.join(here, "hip_quantize_q_to_fp8_test.dll")
     if os.path.isfile(cand):
@@ -174,6 +189,24 @@ class TestQToFp8(unittest.TestCase):
         c = self.q.dequantize_to_e5m2(packed, hq.GGML_TYPE["Q4_0"], 256)
         d = self.q.dequantize_to_fp8(packed, hq.GGML_TYPE["Q4_0"], 256, "E5M2")
         np.testing.assert_array_equal(c, d)
+
+    def test_q4_0_row_counts_beyond_1d_grid_limit(self):
+        """Q4_0 dequantization must address every row past gridDim.x=65535."""
+        n_per_row = 32
+        nibble = np.arange(32, dtype=np.uint8) & 0x0F
+        packed_row = np.empty(18, dtype=np.uint8)
+        packed_row[:2] = np.frombuffer(np.float16(-0.125).tobytes(), dtype=np.uint8)
+        packed_row[2:] = nibble[:16] | (nibble[16:] << 4)
+
+        for nrows in (65535, 65536, 180224, 360448):
+            with self.subTest(nrows=nrows):
+                packed = np.broadcast_to(packed_row, (nrows, 18)).copy()
+                expected = _cpu_q4_0_dequant(packed, nrows, n_per_row)
+                actual_fp8 = self.q.dequantize_to_e4m3(
+                    packed.reshape(-1), hq.GGML_TYPE["Q4_0"], n_per_row
+                )
+                actual = _vec_e4m3(actual_fp8)
+                np.testing.assert_array_equal(actual, expected)
 
     def test_fp8_source_passthrough(self):
         # If source type IS the requested FP8 format, expect a byte copy.

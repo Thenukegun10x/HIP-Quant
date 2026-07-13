@@ -29,7 +29,7 @@ void dequant_q4_0_to_fp8_kernel(
     const block_q4_0 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -45,7 +45,7 @@ void dequant_q4_1_to_fp8_kernel(
     const block_q4_1 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -61,7 +61,7 @@ void dequant_q5_0_to_fp8_kernel(
     const block_q5_0 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -78,7 +78,7 @@ void dequant_q5_1_to_fp8_kernel(
     const block_q5_1 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -95,7 +95,7 @@ void dequant_q8_0_to_fp8_kernel(
     const block_q8_0 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -110,7 +110,7 @@ void dequant_q8_1_to_fp8_kernel(
     const block_q8_1 * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= 32) return;
@@ -125,7 +125,7 @@ void dequant_q2_k_to_fp8_kernel(
     const block_q2_K * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
@@ -146,7 +146,7 @@ void dequant_q3_k_to_fp8_kernel(
     const block_q3_K * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
@@ -170,7 +170,7 @@ void dequant_q4_k_to_fp8_kernel(
     const block_q4_K * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
@@ -190,7 +190,7 @@ void dequant_q5_k_to_fp8_kernel(
     const block_q5_K * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
@@ -214,7 +214,7 @@ void dequant_q6_k_to_fp8_kernel(
     const block_q6_K * __restrict__ src, uint8_t * __restrict__ dst,
     int nrows, int blocks_per_row, int n_per_row
 ) {
-    const int row = blockIdx.x;
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;

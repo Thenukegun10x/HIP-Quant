@@ -16,4 +16,5 @@ include cdna_compat.py
 include setup_torch.py
 include DOCUMENTATION.md
 global-exclude __pycache__/*
-global-exclude *.py[cod]
+global-exclude *.pyc
+global-exclude *.pyo
