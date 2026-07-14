@@ -210,6 +210,28 @@ x_e4m3    = hq.quantize_numpy(x,    GGML_TYPE["F8_E4M3"])  # forward
 grad_e5m2 = hq.quantize_numpy(grad, GGML_TYPE["F8_E5M2"])  # backward
 ```
 
+#### BF16 checkpoint tensors (CPU decode)
+
+The offline HIP DLL has GPU dequantizers for supported packed GGML Q formats;
+BF16 is not one of those formats and does not need a HIP kernel. Use the
+vectorized NumPy helper at the checkpoint/loader boundary instead. It converts
+raw IEEE BF16 bit patterns to FP32 exactly, without loading the HIP DLL or the
+PyTorch extension. The surrounding model loader remains responsible for its
+usual BF16 weight placement/casting policy.
+
+```python
+import numpy as np
+from hip_quant import bf16_to_fp32
+
+# BF16 tensor bytes read from a checkpoint, in little-endian IEEE BF16 order.
+raw_bf16 = np.frombuffer(checkpoint_bytes, dtype="<u2")
+weights_fp32 = bf16_to_fp32(raw_bf16, shape=(4096, 4096))
+```
+
+Continue to use `HipQuant.dequantize_to_fp8(...)` for packed GGML Q tensors;
+the BF16 helper intentionally does not route standard BF16 storage through the
+quantized HIP dequantization path.
+
 #### Q → FP8 dequantization (offline)
 `dequantize_to_fp8` expands packed GGML Q blocks **directly** to raw FP8 bytes on
 the GPU. Each thread reconstructs a scalar from the Q block and immediately
@@ -274,6 +296,67 @@ e5m2 = hq.dequantize_q_to_e5m2(packed_q, GGML_TYPE["Q4_K"], 4096)
 ```
 
 The output shape is `[nrows, n_per_row]`.
+
+#### MXFP4 compatibility bridge (FP8 hipBLASLt execution)
+
+`dequantize_mxfp4_to_fp8` and `mxfp4_linear_forward` accept OCP MXFP4 E2M1
+weights: two values per byte (even index in the low nibble) and one raw UE8M0
+scale byte per contiguous block of 32 values. They keep the source weights in
+that packed representation, expand the current layer to E4M3 on the GPU, and
+use PyTorch's hipBLASLt-backed `torch._scaled_mm` path when available.
+
+> **Warning:** This is an MXFP4 *emulation* path. RDNA4 does not execute
+> native FP4 instructions here. The API emits a `RuntimeWarning` on first use;
+> expect slower decode and higher transient VRAM use than native MXFP4. Set
+> `HIP_QUANT_SUPPRESS_EMULATED_MXFP4_WARNING=1` only after acknowledging it.
+
+```python
+from hip_quant.torch_api import mxfp4_linear_forward
+
+# values: [out_features, in_features // 2] uint8, two E2M1 nibbles per byte
+# scales: [out_features, in_features // 32] uint8, UE8M0 exponents
+output = mxfp4_linear_forward(activations, values, scales, bias)
+```
+
+#### Native CDNA4 MXFP4 (hipBLASLt)
+
+`native_mxfp4_linear_forward` is a separate **true MXFP4** path for CDNA4
+`gfx950` (MI350-class) hardware. It passes packed `HIP_R_4F_E2M1` operands
+and their raw `HIP_R_8F_UE8M0` Vec32 scale bytes directly to hipBLASLt: there
+is no FP8 expansion, software decoder, or custom WMMA kernel. It is therefore
+not a Radeon fallback and will deliberately raise on RDNA GPUs (including the
+RX 9070 XT) and earlier CDNA devices such as MI300.
+
+```python
+import torch
+from hip_quant.torch_api import (
+    native_mxfp4_capability,
+    native_mxfp4_linear_forward,
+)
+
+status = native_mxfp4_capability()
+if not status["available"]:
+    raise RuntimeError(status["reason"])
+
+# A values: [M, K // 2], B values: [N, K // 2], uint8 packed E2M1.
+# Low nibble is the even logical value. Scales are raw UE8M0 bytes, one per
+# contiguous 32 logical values: [M, K // 32] and [N, K // 32].
+output = native_mxfp4_linear_forward(
+    a_values, a_scales, b_values, b_scales, output_dtype=torch.bfloat16
+)  # output is [M, N] = A @ B.T
+```
+
+The native ABI is intentionally narrow because it maps to hipBLASLt's native
+MX contract: `M` and `N` must be multiples of 16, `K` a multiple of 128,
+batch count is one, and fused bias/activation epilogues are unavailable. Add
+bias or activation after this call. `native_mxfp4_contract()` exposes these
+requirements as a testable dictionary, while `native_mxfp4_capability()` is
+safe to call in CI without a CDNA GPU. The actual GPU test is opt-in:
+
+```powershell
+$env:HIP_QUANT_TEST_NATIVE_MXFP4='1'  # only on a gfx950 runner
+& 'C:\venvs\medusa_rocm\Scripts\python.exe' -m pytest tests\torch\test_mxfp4_native_contract_torch.py -q
+```
 
 ---
 
@@ -439,6 +522,14 @@ Training-path numerical guards:
 - Weight-gradient kernels can retain FP32 accumulation for master weights.
 - `Fp8ShadowLinear` caches the FP8 weight shadow between optimizer updates;
   hipBLASLt reuses pre-quantized E4M3 bytes instead of re-casting masters.
+- On CUDA/HIP tensors, `Fp8TensorMeta.quantize_e4m3_delayed(x)` streams the
+  next amax reduction while emitting E4M3 activation bytes; that observation
+  only selects the next call's scale. Shadow refresh writes directly into the
+  persistent `weight_fp8` buffer, without a temporary uint8 tensor.
+- `fp8_grouped_linear_forward_fp8_input(shared_input_fp8, weights_fp8, ...)`
+  runs multiple projections (for example Q/K/V) from one shared raw-E4M3
+  activation buffer. The custom backward materializes each E5M2 operand once
+  and reuses those raw bytes across WMMA tiles.
 
 #### FP8 Conv1d / Conv2d
 
@@ -545,7 +636,7 @@ The benchmark is available at `tests/torch/bench_fp8.py`. It measures custom
 WMMA automatically on a compatible device and reports the runtime guard reason
 otherwise.
 
-The 0.6.0 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
+The 0.6.1 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
 improvement: it reuses pre-quantized FP8 activations/gradients, skips redundant
 output zeroing, fuses bias stores, vectorizes elementwise FP8 kernels, and caches
 offline FP8 temporary buffers. Persistent VRAM savings are still mainly provided

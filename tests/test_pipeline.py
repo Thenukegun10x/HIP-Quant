@@ -152,6 +152,7 @@ from hip_quant.torch_api import (  # noqa: E402
     Fp8ScaledLinearFunction, Fp8ScaledLinear,
     Fp8ShadowLinearFunction, Fp8ShadowLinear,
     Fp8TensorMeta, convert_to_fp8, Adafactor,
+    fp8_grouped_linear_forward_fp8_input,
     _sim_fp8_e4m3, _sim_fp8_e5m2,
 )
 
@@ -718,6 +719,21 @@ class TestFp8TensorMeta(unittest.TestCase):
         back = meta.dequantize_e4m3(qx)    # dequantise and unscale
         self.assertAlmostEqual(back.item(), 1.0, places=1)
 
+    def test_delayed_quantization_uses_previous_scale_then_refreshes_next(self):
+        meta = Fp8TensorMeta(history_len=2, device="cpu")
+        meta.update(torch.tensor([2.0]))  # current scale = 224
+        before_ptr = meta._ptr
+
+        fp8, scale_used = meta.quantize_e4m3_delayed(torch.tensor([4.0]))
+
+        self.assertAlmostEqual(scale_used.item(), 224.0, places=4)
+        self.assertEqual(meta._ptr, before_ptr + 1)
+        self.assertAlmostEqual(meta.scale.item(), 112.0, places=4)
+        recovered = dequantize_e4m3(fp8).float() * scale_used.reciprocal()
+        # Delayed scaling intentionally uses the previous observation, so the
+        # larger second sample clips once and configures the next scale for it.
+        self.assertAlmostEqual(recovered.item(), 2.0, places=1)
+
     def test_nonfinite_update_preserves_valid_scale(self):
         meta = Fp8TensorMeta(history_len=4, device="cpu")
         meta.update(torch.tensor([2.0]))
@@ -734,6 +750,38 @@ class TestFp8TensorMeta(unittest.TestCase):
 
         meta.clear_nonfinite()
         self.assertFalse(meta.found_nonfinite.item())
+
+
+# ===========================================================================
+# 9b. Shared-input grouped FP8 linear
+# ===========================================================================
+
+class TestFp8GroupedLinear(unittest.TestCase):
+
+    def test_shared_raw_input_feeds_multiple_projections(self):
+        x = torch.tensor([[1.0, -0.5], [0.25, 2.0]])
+        w0 = torch.tensor([[1.0, 0.5], [-0.25, 2.0]])
+        w1 = torch.tensor([[0.5, -1.0]])
+        x_fp8 = quantize_e4m3(x)
+        w0_fp8 = quantize_e4m3(w0)
+        w1_fp8 = quantize_e4m3(w1)
+        source = torch.empty_like(x)
+
+        out0, out1 = fp8_grouped_linear_forward_fp8_input(
+            x_fp8, (w0_fp8, w1_fp8), source
+        )
+
+        decoded_x = dequantize_e4m3(x_fp8)
+        self.assertTrue(torch.allclose(out0, decoded_x @ dequantize_e4m3(w0_fp8).t()))
+        self.assertTrue(torch.allclose(out1, decoded_x @ dequantize_e4m3(w1_fp8).t()))
+
+    def test_grouped_projection_validates_per_weight_scales(self):
+        x_fp8 = quantize_e4m3(torch.ones(1, 2))
+        w_fp8 = quantize_e4m3(torch.ones(1, 2))
+        with self.assertRaises(ValueError):
+            fp8_grouped_linear_forward_fp8_input(
+                x_fp8, (w_fp8,), torch.ones(1, 2), weight_inv_scales=()
+            )
 
 
 # ===========================================================================
@@ -1056,6 +1104,7 @@ SUITES = [
     ("Fp8ShadowLinear (nn.Module)",    TestFp8ShadowLinear),
     ("convert_to_fp8",                 TestConvertToFp8),
     ("Fp8TensorMeta",                  TestFp8TensorMeta),
+    ("shared-input grouped FP8 linear", TestFp8GroupedLinear),
     ("Adafactor optimizer",            TestAdafactor),
     ("Full E2E pipeline",              TestFullPipeline),
 ]

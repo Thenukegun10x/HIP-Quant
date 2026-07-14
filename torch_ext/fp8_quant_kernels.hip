@@ -163,6 +163,132 @@ void quant_transpose_kernel_t(
 }
 
 // ---------------------------------------------------------------------------
+// Delayed-scaling E4M3 activation quantization.
+//
+// The current scale is intentionally consumed before the observed amax is
+// committed.  This is the usual delayed-scaling contract: the reduction feeds
+// the *next* invocation, while this invocation has one streaming read of the
+// activation and one streaming write of its FP8 bytes.  A tiny follow-up
+// kernel updates the ring-buffer-derived scale after all blocks have finished
+// their atomic amax reduction.
+// ---------------------------------------------------------------------------
+template <int DTYPE>
+__global__
+__launch_bounds__(256, 4)
+void quant_e4m3_delayed_amax_kernel_t(
+    const void  * __restrict__ src,
+    uint8_t      * __restrict__ dst,
+    const float  * __restrict__ quant_scale,
+    float        * __restrict__ amax_scratch,
+    int          * __restrict__ sample_nonfinite,
+    int64_t       numel
+) {
+    const int64_t idx = ((int64_t)blockIdx.x * 256 + threadIdx.x)
+                      * HIP_QUANT_ELEMS_PER_THREAD;
+    const float scale = quant_scale[0];
+    float local_amax = 0.0f;
+    bool nonfinite = false;
+
+    #pragma unroll
+    for (int i = 0; i < HIP_QUANT_ELEMS_PER_THREAD; ++i) {
+        const int64_t cur = idx + i;
+        if (cur >= numel) continue;
+        const float value = load_float_input_t<DTYPE>(src, cur);
+        const float abs_value = fabsf(value);
+        if (isfinite(abs_value)) {
+            if (abs_value > local_amax) local_amax = abs_value;
+        } else {
+            nonfinite = true;
+        }
+        hip_quant_stream_store(dst + cur, fp32_to_fp8_e4m3(value * scale));
+    }
+
+    // IEEE-positive floats retain their numerical order when reinterpreted as
+    // unsigned integers, so atomicMax supplies a fast global amax reduction.
+    if (local_amax > 0.0f) {
+        atomicMax(reinterpret_cast<unsigned int*>(amax_scratch),
+                  __float_as_uint(local_amax));
+    }
+    if (nonfinite) {
+        // ROCm 7.1 does not expose byte-sized atomics, so use an int32 scratch
+        // flag and let the single-block finalize kernel set the public bool.
+        atomicExch(sample_nonfinite, 1);
+    }
+}
+
+__global__
+__launch_bounds__(256, 1)
+void finalize_delayed_amax_kernel(
+    const float   * __restrict__ amax_scratch,
+    const int     * __restrict__ sample_nonfinite,
+    uint8_t       * __restrict__ found_nonfinite,
+    float         * __restrict__ scale,
+    float         * __restrict__ inv_scale,
+    float         * __restrict__ amax_history,
+    int            history_len,
+    int            history_slot
+) {
+    // A non-finite sample must not poison either the delayed history or the
+    // scale used by subsequent training steps. The sticky flag is already set
+    // by the streaming kernel for the caller to inspect.
+    if (sample_nonfinite[0] != 0) {
+        if (threadIdx.x == 0) found_nonfinite[0] = (uint8_t)1;
+        return;
+    }
+
+    __shared__ float partial_max[256];
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < history_len; i += blockDim.x) {
+        float value = amax_history[i];
+        if (i == history_slot) value = amax_scratch[0];
+        if (value > local_max) local_max = value;
+    }
+    partial_max[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other = partial_max[threadIdx.x + stride];
+            if (other > partial_max[threadIdx.x]) partial_max[threadIdx.x] = other;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float observed_max = fmaxf(partial_max[0], 1.0e-12f);
+        const float next_scale = 448.0f / observed_max;
+        amax_history[history_slot] = amax_scratch[0];
+        scale[0] = next_scale;
+        inv_scale[0] = 1.0f / next_scale;
+    }
+}
+
+// Quantize a scaled floating-point tensor directly into a persistent FP8
+// shadow. This avoids both the temporary uint8 allocation and the following
+// device-to-device copy used by the old refresh path.
+template <int DTYPE>
+__global__
+__launch_bounds__(256, 4)
+void refresh_e4m3_shadow_kernel_t(
+    const void  * __restrict__ src,
+    uint8_t      * __restrict__ shadow,
+    const float  * __restrict__ quant_scale,
+    int64_t       numel
+) {
+    const int64_t idx = ((int64_t)blockIdx.x * 256 + threadIdx.x)
+                      * HIP_QUANT_ELEMS_PER_THREAD;
+    const float scale = quant_scale[0];
+    #pragma unroll
+    for (int i = 0; i < HIP_QUANT_ELEMS_PER_THREAD; ++i) {
+        const int64_t cur = idx + i;
+        if (cur < numel) {
+            hip_quant_stream_store(shadow + cur,
+                                  fp32_to_fp8_e4m3(load_float_input_t<DTYPE>(src, cur) * scale));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Quantize: float32 -> FP8 E5M2 with stochastic rounding
 // ---------------------------------------------------------------------------
 template <int DTYPE>
@@ -488,6 +614,52 @@ void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
         hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e5m2_kernel_t<HIP_QUANT_DTYPE_F32>),
                            dim3(safe_blocks(numel)), dim3(256), 0, stream,
                            src, dst, numel);
+    }
+}
+
+void launch_quant_e4m3_delayed_amax(
+    const void* src, uint8_t* dst, const float* quant_scale,
+    float* amax_scratch, int* sample_nonfinite, uint8_t* found_nonfinite,
+    float* scale, float* inv_scale, float* amax_history,
+    int64_t numel, int history_len, int history_slot, int dtype,
+    hipStream_t stream
+) {
+    if (numel == 0) return;
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_delayed_amax_kernel_t<HIP_QUANT_DTYPE_F16>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, dst, quant_scale, amax_scratch, sample_nonfinite, numel);
+    } else if (dtype == HIP_QUANT_DTYPE_BF16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_delayed_amax_kernel_t<HIP_QUANT_DTYPE_BF16>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, dst, quant_scale, amax_scratch, sample_nonfinite, numel);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_delayed_amax_kernel_t<HIP_QUANT_DTYPE_F32>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, dst, quant_scale, amax_scratch, sample_nonfinite, numel);
+    }
+    hipLaunchKernelGGL(finalize_delayed_amax_kernel, dim3(1), dim3(256), 0, stream,
+                       amax_scratch, sample_nonfinite, found_nonfinite, scale, inv_scale,
+                       amax_history, history_len, history_slot);
+}
+
+void launch_refresh_e4m3_shadow(
+    const void* src, uint8_t* shadow, const float* quant_scale,
+    int64_t numel, int dtype, hipStream_t stream
+) {
+    if (numel == 0) return;
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(refresh_e4m3_shadow_kernel_t<HIP_QUANT_DTYPE_F16>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, shadow, quant_scale, numel);
+    } else if (dtype == HIP_QUANT_DTYPE_BF16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(refresh_e4m3_shadow_kernel_t<HIP_QUANT_DTYPE_BF16>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, shadow, quant_scale, numel);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(refresh_e4m3_shadow_kernel_t<HIP_QUANT_DTYPE_F32>),
+                           dim3(safe_blocks(numel)), dim3(256), 0, stream,
+                           src, shadow, quant_scale, numel);
     }
 }
 

@@ -267,7 +267,7 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 ```
 
 Extension build specifics:
-- Compiles `torch_ext/pytorch_bindings.cpp`, `torch_ext/current_stream.hip`, `torch_ext/fp8_quant_kernels.hip`, `torch_ext/fp8_linear_kernels.hip`, `torch_ext/fp8_linear_kernels_v2.hip`, and `torch_ext/q_to_fp8_kernels.hip`
+- Compiles `torch_ext/pytorch_bindings.cpp`, `torch_ext/current_stream.hip`, `torch_ext/fp8_quant_kernels.hip`, `torch_ext/fp8_linear_kernels.hip`, `torch_ext/fp8_linear_kernels_v2.hip`, `torch_ext/q_to_fp8_kernels.hip`, and `torch_ext/mxfp4_to_fp8_kernels.hip`
 - Uses `CUDAExtension` (the PyTorch name, even on ROCm/HIP)
 - Targets `--offload-arch=gfx1200` and `--offload-arch=gfx1201`
 - On Windows, uses `_short_path()` to wrap all include paths, preventing MSVC build failures when the project is in a path with spaces

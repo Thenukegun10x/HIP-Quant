@@ -621,6 +621,114 @@ void fp8_gemm_backward_weight_fp8_grad_kernel(
     __threadfence_block();
 }
 
+// Raw-FP8 backward reuse. Both operands have already been converted to E5M2
+// once per backward call, so the GEMM tiles only load and pack bytes. This
+// removes the repeated FP32/BF16/FP16 -> E5M2 conversions from the innermost
+// WMMA loop of the older *_fp8_grad kernels.
+__global__
+__launch_bounds__(32, 1)
+void fp8_gemm_backward_input_raw_fp8_kernel(
+    const uint8_t * __restrict__ grad_output_fp8, // [M, N] E5M2
+    const uint8_t * __restrict__ weight_fp8,      // [N, K] E5M2
+    void          * __restrict__ grad_input,      // [M, K]
+    int M, int N, int K,
+    float weight_inv_scale, int grad_input_dtype
+) {
+    const int m = blockIdx.y * TILE_M;
+    const int k_tile = blockIdx.x * TILE_N;
+    if (m >= M || k_tile >= K) return;
+
+    const int tid = threadIdx.x;
+    const int lane_wrapped = tid & 15;
+    const int lane_group = tid >> 4;
+    v8f acc = (v8f){};
+
+    for (int n_tile = 0; n_tile < N; n_tile += TILE_K) {
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int n_offset = lane_group * 8 + i;
+            const int a_row = m + lane_wrapped;
+            const int a_col = n_tile + n_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < M && a_col < N) ? grad_output_fp8[a_row * N + a_col] : 0;
+            const int b_row = n_tile + n_offset;
+            const int b_col = k_tile + lane_wrapped;
+            ((uint8_t*)b_packed)[i] =
+                (b_row < N && b_col < K) ? weight_fp8[b_row * K + b_col] : 0;
+        }
+        const v2i a_vec = (v2i){a_packed[0], a_packed[1]};
+        const v2i b_vec = (v2i){b_packed[0], b_packed[1]};
+        #if defined(__gfx1200__) || defined(__gfx1201__)
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = m + lane_group * 8 + i;
+        const int col = k_tile + lane_wrapped;
+        if (row < M && col < K) {
+            store_float_output(grad_input, grad_input_dtype, row * K + col,
+                               acc[i] * weight_inv_scale);
+        }
+    }
+    __threadfence_block();
+}
+
+__global__
+__launch_bounds__(32, 1)
+void fp8_gemm_backward_weight_raw_fp8_kernel(
+    const uint8_t * __restrict__ grad_output_fp8, // [M, N] E5M2
+    const uint8_t * __restrict__ input_fp8,       // [M, K] E5M2
+    void          * __restrict__ grad_weight,     // [N, K]
+    int M, int N, int K,
+    float input_inv_scale, int grad_weight_dtype
+) {
+    const int n = blockIdx.y * TILE_M;
+    const int k_tile = blockIdx.x * TILE_N;
+    if (n >= N || k_tile >= K) return;
+
+    const int tid = threadIdx.x;
+    const int lane_wrapped = tid & 15;
+    const int lane_group = tid >> 4;
+    v8f acc = (v8f){};
+
+    for (int m_tile = 0; m_tile < M; m_tile += TILE_K) {
+        int a_packed[2] = {0, 0};
+        int b_packed[2] = {0, 0};
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int m_offset = lane_group * 8 + i;
+            const int a_row = n + lane_wrapped;
+            const int a_col = m_tile + m_offset;
+            ((uint8_t*)a_packed)[i] =
+                (a_row < N && a_col < M) ? grad_output_fp8[a_col * N + a_row] : 0;
+            const int b_row = m_tile + m_offset;
+            const int b_col = k_tile + lane_wrapped;
+            ((uint8_t*)b_packed)[i] =
+                (b_row < M && b_col < K) ? input_fp8[b_row * K + b_col] : 0;
+        }
+        const v2i a_vec = (v2i){a_packed[0], a_packed[1]};
+        const v2i b_vec = (v2i){b_packed[0], b_packed[1]};
+        #if defined(__gfx1200__) || defined(__gfx1201__)
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec, b_vec, acc);
+        #endif
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = n + lane_group * 8 + i;
+        const int col = k_tile + lane_wrapped;
+        if (row < N && col < K) {
+            store_float_output(grad_weight, grad_weight_dtype, row * K + col,
+                               acc[i] * input_inv_scale);
+        }
+    }
+    __threadfence_block();
+}
+
 // ---------------------------------------------------------------------------
 // C-linkage launch helpers called from pytorch_bindings.cpp
 // ---------------------------------------------------------------------------
@@ -817,6 +925,30 @@ void launch_fp8_linear_backward_weight_fp8_grad(
     hipLaunchKernelGGL(fp8_gemm_backward_weight_fp8_grad_kernel, grid, block, 0, stream,
                        grad_output_fp8, input, grad_weight, M, N, K, input_scale, out_scale,
                        input_dtype, grad_weight_dtype);
+}
+
+void launch_fp8_linear_backward_input_raw_fp8(
+    const uint8_t* grad_output_fp8, const uint8_t* weight_fp8, void* grad_input,
+    int M, int N, int K, float weight_inv_scale, int grad_input_dtype,
+    hipStream_t stream
+) {
+    dim3 block(32);
+    dim3 grid((K + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+    hipLaunchKernelGGL(fp8_gemm_backward_input_raw_fp8_kernel, grid, block, 0, stream,
+                       grad_output_fp8, weight_fp8, grad_input, M, N, K,
+                       weight_inv_scale, grad_input_dtype);
+}
+
+void launch_fp8_linear_backward_weight_raw_fp8(
+    const uint8_t* grad_output_fp8, const uint8_t* input_fp8, void* grad_weight,
+    int M, int N, int K, float input_inv_scale, int grad_weight_dtype,
+    hipStream_t stream
+) {
+    dim3 block(32);
+    dim3 grid((K + TILE_N - 1) / TILE_N, (N + TILE_M - 1) / TILE_M);
+    hipLaunchKernelGGL(fp8_gemm_backward_weight_raw_fp8_kernel, grid, block, 0, stream,
+                       grad_output_fp8, input_fp8, grad_weight, M, N, K,
+                       input_inv_scale, grad_weight_dtype);
 }
 
 } // extern "C"

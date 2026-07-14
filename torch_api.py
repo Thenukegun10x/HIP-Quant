@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, Optional, Set, Tuple, Union
+import warnings
+from typing import Dict, Optional, Sequence, Set, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Lazy imports — file remains importable without torch or the _C extension
@@ -37,10 +38,31 @@ except ImportError:
 _C = None
 _WMMA_GUARD_CACHE: Dict[int, Tuple[str, str]] = {}
 _STOCHASTIC_E5M2_COUNTER = 0
+_MXFP4_EMULATION_WARNING_EMITTED = False
+
+MXFP4_BLOCK_SIZE = 32
+MXFP4_PACKED_VALUE_BYTES_PER_BLOCK = 16
+MXFP4_SCALE_BYTES_PER_BLOCK = 1
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _warn_mxfp4_emulation() -> None:
+    """Emit the one-time, user-visible warning required for the MXFP4 bridge."""
+    global _MXFP4_EMULATION_WARNING_EMITTED
+    if _MXFP4_EMULATION_WARNING_EMITTED or _env_flag("HIP_QUANT_SUPPRESS_EMULATED_MXFP4_WARNING"):
+        return
+    warnings.warn(
+        "MXFP4 is running through hip_quant's emulation path: packed E2M1 + UE8M0 "
+        "weights are expanded to FP8 E4M3 and executed through hipBLASLt. This GPU "
+        "does not use native MXFP4 instructions; expect slower speeds and higher "
+        "transient VRAM use than a native MXFP4 implementation.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    _MXFP4_EMULATION_WARNING_EMITTED = True
 
 
 def _scale_to_float(scale: Union["torch.Tensor", float]) -> float:
@@ -414,6 +436,17 @@ def quantize_e5m2(x: "torch.Tensor") -> "torch.Tensor":
     return _load_extension().quantize_e5m2(x.contiguous())
 
 
+def refresh_e4m3_shadow(
+    x: "torch.Tensor",
+    shadow: "torch.Tensor",
+    quant_scale: "torch.Tensor",
+) -> "torch.Tensor":
+    """Refresh an existing E4M3 shadow buffer without an intermediate tensor."""
+    return _load_extension().refresh_e4m3_shadow(
+        x.contiguous(), shadow, quant_scale.contiguous()
+    )
+
+
 def quantize_e4m3_transpose(x: "torch.Tensor") -> "torch.Tensor":
     """Quantize a rank-2 tensor to E4M3 and transpose it in one GPU pass."""
     return _load_extension().quantize_e4m3_transpose(x.contiguous())
@@ -693,6 +726,219 @@ def dequantize_q_to_e5m2(
     return dequantize_q_to_fp8(packed, type_num, n_per_row, e5m2=True)
 
 
+def dequantize_mxfp4_to_fp8(
+    packed_values: "torch.Tensor",
+    block_scales: "torch.Tensor",
+    n_per_row: int,
+) -> "torch.Tensor":
+    """Expand OCP MXFP4 E2M1 + UE8M0 weights to E4M3 bytes on the GPU.
+
+    ``packed_values`` contains two E2M1 values per byte, with the even value
+    in the low nibble. ``block_scales`` contains one raw UE8M0 byte per 32
+    values. Both tensors must be contiguous ``torch.uint8`` GPU tensors.
+
+    This is deliberately an emulation bridge: it enables MXFP4 checkpoints to
+    execute through hipBLASLt's supported FP8 kernels, but does not provide
+    native FP4 compute or native-MXFP4 throughput.
+    """
+    _warn_mxfp4_emulation()
+    return _load_extension().dequantize_mxfp4_to_fp8(
+        packed_values.contiguous(), block_scales.contiguous(), int(n_per_row)
+    )
+
+
+def _mxfp4_input_scale(input_2d: "torch.Tensor") -> "torch.Tensor":
+    """Create a device-resident E4M3 quantization multiplier for activations."""
+    amax = input_2d.detach().abs().amax().to(dtype=torch.float32)
+    valid = torch.isfinite(amax) & (amax > 0)
+    return torch.where(valid, torch.full_like(amax, 448.0) / amax, torch.ones_like(amax))
+
+
+def mxfp4_linear_forward(
+    input: "torch.Tensor",
+    packed_weight: "torch.Tensor",
+    block_scales: "torch.Tensor",
+    bias: Optional["torch.Tensor"] = None,
+    n_per_row: Optional[int] = None,
+    input_scale: Optional[Union["torch.Tensor", float]] = None,
+) -> "torch.Tensor":
+    """Inference-only MXFP4 linear through the standard hipBLASLt FP8 path.
+
+    MXFP4 remains the persistent weight storage. Every invocation expands the
+    current weight matrix to a temporary E4M3 buffer before calling
+    ``torch._scaled_mm`` (hipBLASLt). Set ``n_per_row`` for flat packed input;
+    for a ``[out_features, in_features / 2]`` packed tensor it is inferred.
+
+    If the installed hipBLASLt FP8 path declines the GEMM, the function falls
+    back to a normal BF16/FP16/FP32 ``F.linear`` operation. It never selects
+    hip_quant's experimental custom WMMA kernel.
+    """
+    if input.ndim < 1:
+        raise ValueError("mxfp4_linear_forward: input must have at least one dimension")
+    if n_per_row is None:
+        if packed_weight.ndim != 2:
+            raise ValueError(
+                "mxfp4_linear_forward: n_per_row is required when packed_weight is not 2-D"
+            )
+        n_per_row = int(packed_weight.shape[1]) * 2
+    n_per_row = int(n_per_row)
+    if n_per_row <= 0 or n_per_row % MXFP4_BLOCK_SIZE:
+        raise ValueError("mxfp4_linear_forward: n_per_row must be a positive multiple of 32")
+    if input.shape[-1] != n_per_row:
+        raise ValueError(
+            f"mxfp4_linear_forward: input last dimension ({input.shape[-1]}) "
+            f"does not match n_per_row ({n_per_row})"
+        )
+
+    _warn_mxfp4_emulation()
+    original_shape = input.shape
+    input_2d = input.reshape(-1, n_per_row).contiguous()
+    weight_fp8 = dequantize_mxfp4_to_fp8(packed_weight, block_scales, n_per_row)
+
+    if input_scale is None:
+        input_scale_t = _mxfp4_input_scale(input_2d)
+    else:
+        input_scale_t = _fp8_scale_tensor(input_scale, "input_scale", input_2d.device)
+    input_fp8 = quantize_e4m3((input_2d * input_scale_t).contiguous())
+
+    result = _hipblaslt_fp8_linear_forward_prequant(
+        input_fp8,
+        weight_fp8,
+        bias,
+        input_scale_t.reciprocal(),
+        1.0,
+        input_2d.dtype,
+    )
+    if result is None:
+        # Correctness fallback for installations whose hipBLASLt does not
+        # expose FP8 _scaled_mm. This remains deliberately outside the custom
+        # WMMA path requested by the caller.
+        expanded_weight = dequantize_e4m3(weight_fp8).to(dtype=input_2d.dtype)
+        result = F.linear(input_2d, expanded_weight, bias)
+    return result.reshape(*original_shape[:-1], result.shape[-1])
+
+
+def native_mxfp4_contract() -> Dict[str, Union[str, int]]:
+    """Return the fixed native CDNA4 MXFP4 hipBLASLt ABI contract.
+
+    This query is useful in CI and does not launch a GEMM, so it can be used
+    on Radeon hardware or a development machine without a GPU of its own.
+    """
+    return dict(_load_extension().native_mxfp4_contract())
+
+
+def native_mxfp4_capability() -> Dict[str, Union[str, bool]]:
+    """Report whether the current device can execute native MXFP4.
+
+    ``available`` is true only for CDNA4 ``gfx950`` with a usable hipBLASLt
+    runtime. It is intentionally false on RDNA and earlier CDNA devices; use
+    :func:`mxfp4_linear_forward` there for the explicitly warned FP8 bridge.
+    """
+    return dict(_load_extension().native_mxfp4_capability())
+
+
+def _native_mxfp4_output_dtype_code(output_dtype: "torch.dtype") -> int:
+    if output_dtype == torch.float32:
+        return 0
+    if output_dtype == torch.float16:
+        return 1
+    if output_dtype == torch.bfloat16:
+        return 2
+    raise TypeError(
+        "native_mxfp4_linear_forward: output_dtype must be torch.float32, "
+        "torch.float16, or torch.bfloat16"
+    )
+
+
+def _validate_native_mxfp4_operands(
+    a_values: "torch.Tensor",
+    a_scales: "torch.Tensor",
+    b_values: "torch.Tensor",
+    b_scales: "torch.Tensor",
+) -> Tuple[int, int, int]:
+    """Validate the hardware-independent portion of the native MXFP4 ABI."""
+    operands = {
+        "a_values": a_values,
+        "a_scales": a_scales,
+        "b_values": b_values,
+        "b_scales": b_scales,
+    }
+    for name, tensor in operands.items():
+        if tensor.ndim != 2:
+            raise ValueError(f"native_mxfp4_linear_forward: {name} must be rank 2")
+        if tensor.dtype != torch.uint8:
+            raise TypeError(
+                f"native_mxfp4_linear_forward: {name} must be torch.uint8 raw storage"
+            )
+
+    m = int(a_values.shape[0])
+    k = int(a_values.shape[1]) * 2
+    n = int(b_values.shape[0])
+    if m <= 0 or n <= 0 or k <= 0:
+        raise ValueError("native_mxfp4_linear_forward: M, N, and K must be positive")
+    if m % 16 or n % 16 or k % 128:
+        raise ValueError(
+            "native_mxfp4_linear_forward: native hipBLASLt MXFP4 requires "
+            "M and N multiples of 16 and K a multiple of 128"
+        )
+    if int(b_values.shape[1]) * 2 != k:
+        raise ValueError(
+            "native_mxfp4_linear_forward: a_values and b_values must have the same logical K"
+        )
+    if tuple(a_scales.shape) != (m, k // MXFP4_BLOCK_SIZE):
+        raise ValueError(
+            "native_mxfp4_linear_forward: a_scales must have shape [M, K / 32]"
+        )
+    if tuple(b_scales.shape) != (n, k // MXFP4_BLOCK_SIZE):
+        raise ValueError(
+            "native_mxfp4_linear_forward: b_scales must have shape [N, K / 32]"
+        )
+    return m, n, k
+
+
+def native_mxfp4_linear_forward(
+    a_values: "torch.Tensor",
+    a_scales: "torch.Tensor",
+    b_values: "torch.Tensor",
+    b_scales: "torch.Tensor",
+    output_dtype: "torch.dtype" = None,
+) -> "torch.Tensor":
+    """Run a true native MXFP4 E2M1 GEMM on CDNA4 ``gfx950`` only.
+
+    All four storage tensors are raw ``uint8`` GPU tensors. ``a_values`` and
+    ``b_values`` have logical shapes ``[M, K]`` and ``[N, K]`` packed as
+    ``[M, K / 2]`` and ``[N, K / 2]`` (low nibble is the even E2M1 value).
+    Their matching UE8M0 scale tensors have shapes ``[M, K / 32]`` and
+    ``[N, K / 32]``. The result is ``A @ B.T`` with shape ``[M, N]``.
+
+    This invokes hipBLASLt with ``HIP_R_4F_E2M1`` and Vec32 UE8M0 scale
+    attributes; it does not decode, upcast, or route through the FP8 bridge.
+    The native library imposes ``M % 16 == N % 16 == 0``, ``K % 128 == 0``,
+    batch size one, and no fused bias/activation epilogue. It deliberately
+    raises on every non-``gfx950`` architecture rather than emulating.
+    """
+    _validate_native_mxfp4_operands(a_values, a_scales, b_values, b_scales)
+    if output_dtype is None:
+        output_dtype = torch.bfloat16
+    output_dtype_code = _native_mxfp4_output_dtype_code(output_dtype)
+
+    # c10's device-guard headers are not currently MSVC-clean in the Windows
+    # ROCm wheel. Establish the corresponding PyTorch device guard here so the
+    # C++ binding can safely use the current stream without mutating device
+    # state itself. CPU tensors still reach mocked extensions in CPU contract
+    # tests; the real binding then gives the GPU-specific error.
+    if a_values.is_cuda:
+        with torch.cuda.device(a_values.device):
+            return _load_extension().native_mxfp4_linear_forward(
+                a_values.contiguous(), a_scales.contiguous(),
+                b_values.contiguous(), b_scales.contiguous(), output_dtype_code,
+            )
+    return _load_extension().native_mxfp4_linear_forward(
+        a_values.contiguous(), a_scales.contiguous(),
+        b_values.contiguous(), b_scales.contiguous(), output_dtype_code,
+    )
+
+
 # ===========================================================================
 # Phase 3: Autograd-safe FP8 linear
 # ===========================================================================
@@ -715,6 +961,59 @@ def _prepare_e5m2_backward_grad_output(
     grad_output_fp8 = quantize_e5m2_stochastic(grad_output)
     grad_output_e5m2 = dequantize_e5m2(grad_output_fp8).to(grad_output.dtype).contiguous()
     return grad_output_e5m2, grad_output_fp8
+
+
+def _quantize_e5m2_for_backward(x: "torch.Tensor") -> "torch.Tensor":
+    """Apply the configured E5M2 rounding mode without dequantizing again."""
+    return quantize_e5m2_stochastic(x) if _stochastic_e5m2_enabled() else quantize_e5m2(x)
+
+
+def _raw_fp8_linear_backward(
+    grad_output: "torch.Tensor",
+    weight: "torch.Tensor",
+    input_f32: "torch.Tensor",
+    weight_scale: Union["torch.Tensor", float] = 1.0,
+    input_scale: Union["torch.Tensor", float] = 1.0,
+    grad_output_fp8: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Run the custom backward with each E5M2 operand materialized once.
+
+    The older WMMA path converted the weight/input values inside every output
+    tile.  Keeping raw E5M2 buffers gives both gradient GEMMs the same
+    pre-quantized grad-output and turns those inner-loop conversions into
+    coalesced, one-pass conversion kernels.
+    """
+    if grad_output_fp8 is None:
+        grad_output_fp8 = _quantize_e5m2_for_backward(grad_output.contiguous())
+
+    ext = _load_extension()
+    if hasattr(ext, "fp8_linear_backward_input_raw_fp8") and hasattr(
+        ext, "fp8_linear_backward_weight_raw_fp8"
+    ):
+        weight_scale_t = _fp8_scale_tensor(weight_scale, "weight_scale", weight.device)
+        input_scale_t = _fp8_scale_tensor(input_scale, "input_scale", input_f32.device)
+        weight_fp8 = _quantize_e5m2_for_backward((weight.contiguous() * weight_scale_t).contiguous())
+        input_fp8 = _quantize_e5m2_for_backward((input_f32.contiguous() * input_scale_t).contiguous())
+        grad_input = fp8_linear_backward_input_raw_fp8(
+            grad_output_fp8, weight_fp8, grad_output,
+            _scale_to_float(weight_scale_t.reciprocal()),
+        )
+        grad_weight = fp8_linear_backward_weight_raw_fp8(
+            grad_output_fp8, input_fp8, grad_output,
+            _scale_to_float(input_scale_t.reciprocal()),
+        )
+        return grad_input, grad_weight
+
+    # Compatibility with an already-installed extension that predates the raw
+    # two-operand ABI. It still reuses grad-output bytes, just not the other
+    # repeated casts, so source-only upgrades remain safe.
+    grad_input = fp8_linear_backward_input_fp8_grad(
+        grad_output_fp8, grad_output, weight, _scale_to_float(weight_scale)
+    )
+    grad_weight = fp8_linear_backward_weight_fp8_grad(
+        grad_output_fp8, grad_output, input_f32, _scale_to_float(input_scale)
+    )
+    return grad_input, grad_weight
 
 
 def _cpu_fp8_linear_forward(
@@ -858,13 +1157,8 @@ class Fp8LinearFunction(torch.autograd.Function):
             grad_bias = grad_output.sum(0) if bias is not None else None
             return grad_input, grad_weight, grad_bias
 
-        if grad_output_fp8 is None:
-            grad_output_fp8 = quantize_e5m2(grad_output_c)
-        grad_input = fp8_linear_backward_input_fp8_grad(
-            grad_output_fp8, grad_output_c, weight, 1.0
-        )
-        grad_weight = fp8_linear_backward_weight_fp8_grad(
-            grad_output_fp8, grad_output_c, input_f32, 1.0
+        grad_input, grad_weight = _raw_fp8_linear_backward(
+            grad_output_c, weight, input_f32, 1.0, 1.0, grad_output_fp8
         )
         if grad_weight.dtype != weight.dtype:
             grad_weight = grad_weight.to(weight.dtype)
@@ -898,6 +1192,7 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         bias:         Optional["torch.Tensor"],
         input_scale:  float,
         weight_scale: float,
+        input_fp8:    Optional["torch.Tensor"] = None,
     ) -> "torch.Tensor":
 
         # Snapshot mutable delayed-scale metadata for this autograd context
@@ -910,9 +1205,14 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         input_c = input.contiguous()
         weight_c = weight.contiguous()
 
-        # One scaled quant pass for both GEMM operands. Activation FP8 is also
-        # the compressed save-for-backward tensor.
-        input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        # A module using delayed amax may already have produced this activation
+        # in the fused scan+quantize kernel. Direct callers retain the original
+        # quantization behavior through the optional argument.
+        ctx._num_inputs = len(ctx.needs_input_grad)
+        if input_fp8 is None:
+            input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        else:
+            input_fp8 = input_fp8.contiguous()
         weight_fp8 = quantize_e4m3((weight_c * weight_scale).contiguous())
 
         ctx.has_bias    = bias is not None
@@ -961,7 +1261,7 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
                 weight_scale=ctx.weight_scale, input_scale=1.0
             )
             grad_bias = grad_output.sum(0) if bias is not None else None
-            return grad_input, grad_weight, grad_bias, None, None
+            return (grad_input, grad_weight, grad_bias, None, None, None)[:ctx._num_inputs]
 
         grad_output_for_backward, grad_output_fp8 = _prepare_e5m2_backward_grad_output(grad_output_c)
 
@@ -973,21 +1273,17 @@ class Fp8ScaledLinearFunction(torch.autograd.Function):
         if hipblaslt_result is not None:
             grad_input, grad_weight = hipblaslt_result
             grad_bias = grad_output.sum(0) if bias is not None else None
-            return grad_input, grad_weight, grad_bias, None, None
+            return (grad_input, grad_weight, grad_bias, None, None, None)[:ctx._num_inputs]
 
-        if grad_output_fp8 is None:
-            grad_output_fp8 = quantize_e5m2(grad_output_c)
-        grad_input = fp8_linear_backward_input_fp8_grad(
-            grad_output_fp8, grad_output_c, weight, _scale_to_float(ctx.weight_scale)
-        )
-        grad_weight = fp8_linear_backward_weight_fp8_grad(
-            grad_output_fp8, grad_output_c, input_f32, 1.0
+        grad_input, grad_weight = _raw_fp8_linear_backward(
+            grad_output_c, weight, input_f32,
+            ctx.weight_scale, 1.0, grad_output_fp8,
         )
         if grad_weight.dtype != weight.dtype:
             grad_weight = grad_weight.to(weight.dtype)
         grad_bias   = grad_output.sum(0) if bias is not None else None
 
-        return grad_input, grad_weight, grad_bias, None, None
+        return (grad_input, grad_weight, grad_bias, None, None, None)[:ctx._num_inputs]
 
 
 # ---------------------------------------------------------------------------
@@ -1156,19 +1452,30 @@ class Fp8ScaledLinear(nn.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features).contiguous()
 
+        fused_input_fp8 = None
+        input_scale_for_forward = None
         with torch.no_grad():
             if self.input_meta.scale.device != x_2d.device:
                 self.input_meta.to(x_2d.device)
             if self.weight_meta.scale.device != self.weight.device:
                 self.weight_meta.to(self.weight.device)
-            self.input_meta.update(x_2d)
+            ext = _load_extension()
+            if x_2d.is_cuda and hasattr(ext, "quantize_e4m3_delayed_amax"):
+                fused_input_fp8, input_scale_for_forward = self.input_meta.quantize_e4m3_delayed(x_2d)
+            else:
+                self.input_meta.update(x_2d)
             self.weight_meta.update(self.weight)
 
-        out = Fp8ScaledLinearFunction.apply(
-            x_2d, self.weight, self.bias,
-            self.input_meta.scale,
-            self.weight_meta.scale,
-        )
+        if fused_input_fp8 is None:
+            out = Fp8ScaledLinearFunction.apply(
+                x_2d, self.weight, self.bias,
+                self.input_meta.scale, self.weight_meta.scale,
+            )
+        else:
+            out = Fp8ScaledLinearFunction.apply(
+                x_2d, self.weight, self.bias,
+                input_scale_for_forward, self.weight_meta.scale, fused_input_fp8,
+            )
         return out.reshape(*orig_shape[:-1], self.out_features)
 
     def extra_repr(self) -> str:
@@ -1604,6 +1911,7 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         weight_inv_scale: float,                   # 1 / weight_scale
         input_scale:     float,                    # 448 / amax(input)
         bias:            Optional["torch.Tensor"], # [N] or None
+        input_fp8:       Optional["torch.Tensor"] = None,
     ) -> "torch.Tensor":
 
         # Metadata tensors are updated in-place on later forwards, so retain
@@ -1615,9 +1923,13 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
 
         input_c = input.contiguous()
 
-        # Compress activation for backward. Reuse the cached E4M3 weight shadow
-        # for hipBLASLt so the master weight is not re-cast every forward.
-        input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        # A fused delayed-amax caller has already emitted input_fp8. Preserve
+        # the standalone Function contract by quantizing when it is omitted.
+        ctx._num_inputs = len(ctx.needs_input_grad)
+        if input_fp8 is None:
+            input_fp8 = quantize_e4m3((input_c * input_scale).contiguous())
+        else:
+            input_fp8 = input_fp8.contiguous()
         weight_fp8_c = weight_fp8.contiguous()
 
         ctx.has_bias       = bias is not None
@@ -1671,7 +1983,7 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
                 weight_scale=ctx.weight_scale, input_scale=1.0
             )
             grad_bias = grad_output.sum(0) if bias is not None else None
-            return grad_input, grad_weight_master, None, None, None, grad_bias
+            return (grad_input, grad_weight_master, None, None, None, grad_bias, None)[:ctx._num_inputs]
 
         grad_output_for_backward, grad_output_fp8 = _prepare_e5m2_backward_grad_output(grad_output_c)
 
@@ -1683,24 +1995,19 @@ class Fp8ShadowLinearFunction(torch.autograd.Function):
         if hipblaslt_result is not None:
             grad_input, grad_weight_master = hipblaslt_result
             grad_bias = grad_output.sum(0) if bias is not None else None
-            return grad_input, grad_weight_master, None, None, None, grad_bias
+            return (grad_input, grad_weight_master, None, None, None, grad_bias, None)[:ctx._num_inputs]
 
-        if grad_output_fp8 is None:
-            grad_output_fp8 = quantize_e5m2(grad_output_c)
-        grad_input = fp8_linear_backward_input_fp8_grad(
-            grad_output_fp8, grad_output_c, weight_master,
-            _scale_to_float(ctx.weight_scale)
-        )
-        grad_weight_master = fp8_linear_backward_weight_fp8_grad(
-            grad_output_fp8, grad_output_c, input_f32, 1.0
+        grad_input, grad_weight_master = _raw_fp8_linear_backward(
+            grad_output_c, weight_master, input_f32,
+            ctx.weight_scale, 1.0, grad_output_fp8,
         )
         if grad_weight_master.dtype != weight_master.dtype:
             grad_weight_master = grad_weight_master.to(weight_master.dtype)
         grad_bias          = grad_output.sum(0) if bias is not None else None
 
-        # Returns align with forward args:
-        # input, weight_master, weight_fp8, weight_inv_scale, input_scale, bias
-        return grad_input, grad_weight_master, None, None, None, grad_bias
+        # Returns align with forward args; the optional final activation is a
+        # non-differentiable raw storage tensor.
+        return (grad_input, grad_weight_master, None, None, None, grad_bias, None)[:ctx._num_inputs]
 
 
 class Fp8ShadowLinear(nn.Module):
@@ -1795,9 +2102,13 @@ class Fp8ShadowLinear(nn.Module):
         if self.weight_meta.scale.device != self.weight_master.device:
             self.weight_meta.to(self.weight_master.device)
         self.weight_meta.update(self.weight_master)
-        self.weight_fp8.copy_(
-            quantize_e4m3((self.weight_master * self.weight_meta.scale).contiguous())
-        )
+        ext = _load_extension()
+        if self.weight_master.is_cuda and hasattr(ext, "refresh_e4m3_shadow"):
+            refresh_e4m3_shadow(self.weight_master, self.weight_fp8, self.weight_meta.scale)
+        else:
+            self.weight_fp8.copy_(
+                quantize_e4m3((self.weight_master * self.weight_meta.scale).contiguous())
+            )
         self._shadow_version = current_version
 
     # ------------------------------------------------------------------
@@ -1805,20 +2116,29 @@ class Fp8ShadowLinear(nn.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features).contiguous()
 
+        fused_input_fp8 = None
+        input_scale_for_forward = None
         with torch.no_grad():
             self._sync_shadow()
             if self.input_meta.scale.device != x_2d.device:
                 self.input_meta.to(x_2d.device)
-            self.input_meta.update(x_2d)
+            ext = _load_extension()
+            if x_2d.is_cuda and hasattr(ext, "quantize_e4m3_delayed_amax"):
+                fused_input_fp8, input_scale_for_forward = self.input_meta.quantize_e4m3_delayed(x_2d)
+            else:
+                self.input_meta.update(x_2d)
 
-        out = Fp8ShadowLinearFunction.apply(
-            x_2d,
-            self.weight_master,
-            self.weight_fp8,
-            self.weight_meta.inv_scale,
-            self.input_meta.scale,
-            self.bias,
-        )
+        if fused_input_fp8 is None:
+            out = Fp8ShadowLinearFunction.apply(
+                x_2d, self.weight_master, self.weight_fp8,
+                self.weight_meta.inv_scale, self.input_meta.scale, self.bias,
+            )
+        else:
+            out = Fp8ShadowLinearFunction.apply(
+                x_2d, self.weight_master, self.weight_fp8,
+                self.weight_meta.inv_scale, input_scale_for_forward, self.bias,
+                fused_input_fp8,
+            )
         return out.reshape(*orig_shape[:-1], self.out_features)
 
     # ------------------------------------------------------------------
@@ -2025,6 +2345,90 @@ def fp8_linear_forward_fp8_input_weight(
     )
 
 
+def fp8_grouped_linear_forward_fp8_input(
+    shared_input_fp8:      "torch.Tensor",
+    weights_fp8:           Sequence["torch.Tensor"],
+    output_dtype_source:   "torch.Tensor",
+    input_inv_scale:       Union["torch.Tensor", float] = 1.0,
+    weight_inv_scales:     Optional[Sequence[Union["torch.Tensor", float]]] = None,
+    biases:                 Optional[Sequence[Optional["torch.Tensor"]]] = None,
+) -> Tuple["torch.Tensor", ...]:
+    """Run multiple FP8 projections from one shared E4M3 activation buffer.
+
+    ``shared_input_fp8`` is raw ``uint8`` E4M3 storage with shape ``[M, K]``.
+    Each grouped weight is likewise raw E4M3 ``[N_i, K]`` storage. This API
+    deliberately does not re-quantize the input per projection, which is
+    useful for Q/K/V and gated-MLP projection groups.
+
+    ``*_inv_scale`` values are FP32 dequant scales: ``real ~= fp8 * scale``.
+    The result is a tuple in the same order as ``weights_fp8``.
+    """
+    if shared_input_fp8.dtype != torch.uint8 or shared_input_fp8.ndim != 2:
+        raise TypeError("shared_input_fp8 must be a rank-2 torch.uint8 E4M3 tensor")
+    weights = tuple(weights_fp8)
+    if not weights:
+        raise ValueError("weights_fp8 must contain at least one projection")
+    if weight_inv_scales is None:
+        inv_scales: Tuple[Union["torch.Tensor", float], ...] = (1.0,) * len(weights)
+    else:
+        inv_scales = tuple(weight_inv_scales)
+        if len(inv_scales) != len(weights):
+            raise ValueError("weight_inv_scales must have one entry per weight")
+    if biases is None:
+        group_biases: Tuple[Optional["torch.Tensor"], ...] = (None,) * len(weights)
+    else:
+        group_biases = tuple(biases)
+        if len(group_biases) != len(weights):
+            raise ValueError("biases must have one entry per weight")
+
+    input_inv_scale_t = _fp8_scale_tensor(
+        input_inv_scale, "input_inv_scale", shared_input_fp8.device
+    )
+    outputs = []
+    fallback_input_f32 = None
+    for index, (weight_fp8, weight_inv_scale, bias) in enumerate(
+        zip(weights, inv_scales, group_biases)
+    ):
+        if weight_fp8.dtype != torch.uint8 or weight_fp8.ndim != 2:
+            raise TypeError(f"weights_fp8[{index}] must be a rank-2 torch.uint8 E4M3 tensor")
+        if weight_fp8.device != shared_input_fp8.device or weight_fp8.shape[1] != shared_input_fp8.shape[1]:
+            raise ValueError(f"weights_fp8[{index}] must share the input device and K dimension")
+        weight_inv_scale_t = _fp8_scale_tensor(
+            weight_inv_scale, f"weight_inv_scales[{index}]", shared_input_fp8.device
+        )
+        out = _hipblaslt_fp8_linear_forward_prequant(
+            shared_input_fp8, weight_fp8, bias,
+            input_inv_scale_t, weight_inv_scale_t, output_dtype_source.dtype,
+        )
+        if out is None and shared_input_fp8.is_cuda:
+            # The custom kernel takes a quantization multiplier for input but
+            # an inverse multiplier for the FP8 shadow weight.
+            try:
+                out = fp8_linear_forward_fp8_input_weight(
+                    shared_input_fp8, weight_fp8, output_dtype_source,
+                    _scale_to_float(weight_inv_scale_t),
+                    _scale_to_float(input_inv_scale_t.reciprocal()), bias,
+                )
+            except RuntimeError:
+                # A portable decode+matmul fallback keeps the grouped API
+                # usable on non-gfx12 systems where hipBLASLt declines FP8.
+                out = None
+        if out is None:
+            if fallback_input_f32 is None:
+                fallback_input_f32 = dequantize_e4m3(shared_input_fp8) * input_inv_scale_t
+            weight_f32 = dequantize_e4m3(weight_fp8) * weight_inv_scale_t
+            out = fallback_input_f32.matmul(weight_f32.t())
+            if bias is not None:
+                out = out + bias
+            out = out.to(output_dtype_source.dtype)
+        outputs.append(out)
+    return tuple(outputs)
+
+
+# Short name for callers that already know the input is raw FP8.
+fp8_grouped_linear = fp8_grouped_linear_forward_fp8_input
+
+
 def pack_fp8_weight_for_wmma(weight_fp8: "torch.Tensor") -> "torch.Tensor":
     """Pack E4M3 weights into the lane-native ``[NT, KT, 2, 16, 8]`` WMMA layout."""
     return _load_extension().pack_fp8_weight_for_wmma(weight_fp8.contiguous())
@@ -2171,6 +2575,34 @@ def fp8_linear_backward_weight_fp8_grad(
     )
 
 
+def fp8_linear_backward_input_raw_fp8(
+    grad_output_fp8:      "torch.Tensor",
+    weight_fp8:           "torch.Tensor",
+    output_dtype_source:  "torch.Tensor",
+    weight_inv_scale:     float = 1.0,
+) -> "torch.Tensor":
+    """grad-input from already-quantized E5M2 grad-output and weight bytes."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_backward_input_raw_fp8(
+        grad_output_fp8.contiguous(), weight_fp8.contiguous(), output_dtype_source,
+        float(weight_inv_scale),
+    )
+
+
+def fp8_linear_backward_weight_raw_fp8(
+    grad_output_fp8:      "torch.Tensor",
+    input_fp8:            "torch.Tensor",
+    output_dtype_source:  "torch.Tensor",
+    input_inv_scale:      float = 1.0,
+) -> "torch.Tensor":
+    """grad-weight from already-quantized E5M2 grad-output and input bytes."""
+    _require_gfx12_fp8_wmma(output_dtype_source)
+    return _load_extension().fp8_linear_backward_weight_raw_fp8(
+        grad_output_fp8.contiguous(), input_fp8.contiguous(), output_dtype_source,
+        float(input_inv_scale),
+    )
+
+
 # ===========================================================================
 # Phase 4 preview: Fp8TensorMeta — delayed-scaling amax tracker
 # ===========================================================================
@@ -2209,6 +2641,10 @@ class Fp8TensorMeta:
         self.amax_history = torch.zeros(history_len,
                                         dtype=torch.float32, device=dev)
         self.found_nonfinite = torch.zeros(1, dtype=torch.bool, device=dev)
+        # Persistent scratch buffers keep the fused GPU path allocation-free
+        # after construction. They are intentionally not checkpoint state.
+        self._amax_scratch = torch.zeros(1, dtype=torch.float32, device=dev)
+        self._sample_nonfinite = torch.zeros(1, dtype=torch.int32, device=dev)
         self._history_len = history_len
         self._ptr         = 0
 
@@ -2240,6 +2676,32 @@ class Fp8TensorMeta:
         """Scale then quantize to FP8 E4M3."""
         return quantize_e4m3((x * self.scale).contiguous())
 
+    def quantize_e4m3_delayed(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """Quantize with the current scale and asynchronously collect next amax.
+
+        Returns raw E4M3 bytes and the immutable scale snapshot consumed for
+        those bytes. The GPU implementation fuses the activation scan with
+        quantization, commits amax history on-device, and only affects scale
+        for the following call. CPU and older-extension fallbacks retain the
+        same delayed ordering with the existing reference operations.
+        """
+        if self.scale.device != x.device:
+            self.to(x.device)
+        slot = self._ptr % self._history_len
+        ext = _load_extension()
+        if x.is_cuda and hasattr(ext, "quantize_e4m3_delayed_amax"):
+            fp8, scale_snapshot = ext.quantize_e4m3_delayed_amax(
+                x.contiguous(), self.scale, self.inv_scale, self.amax_history,
+                self._amax_scratch, self._sample_nonfinite, self.found_nonfinite,
+                int(slot),
+            )
+            self._ptr += 1
+        else:
+            scale_snapshot = self.scale.detach().clone()
+            fp8 = quantize_e4m3((x * scale_snapshot).contiguous())
+            self.update(x)
+        return fp8, scale_snapshot
+
     def dequantize_e4m3(self, x: "torch.Tensor") -> "torch.Tensor":
         """Dequantize FP8 E4M3 then apply inverse scale."""
         return dequantize_e4m3(x) * self.inv_scale
@@ -2250,6 +2712,8 @@ class Fp8TensorMeta:
         self.inv_scale    = self.inv_scale.to(device)
         self.amax_history = self.amax_history.to(device)
         self.found_nonfinite = self.found_nonfinite.to(device)
+        self._amax_scratch = self._amax_scratch.to(device)
+        self._sample_nonfinite = self._sample_nonfinite.to(device)
         return self
 
     def state_dict(self) -> Dict[str, "torch.Tensor"]:
@@ -2271,6 +2735,8 @@ class Fp8TensorMeta:
             "found_nonfinite",
             torch.zeros(1, dtype=torch.bool, device=self.scale.device),
         )
+        self._amax_scratch = torch.zeros(1, dtype=torch.float32, device=self.scale.device)
+        self._sample_nonfinite = torch.zeros(1, dtype=torch.int32, device=self.scale.device)
         self._ptr         = int(state["ptr"].item())
         self._history_len = len(self.amax_history)
 

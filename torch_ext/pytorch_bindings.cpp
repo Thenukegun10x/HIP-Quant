@@ -21,6 +21,7 @@
 // tensor allocation.
 
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
 #include <pybind11/pybind11.h>
@@ -28,9 +29,17 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 #include <tuple>
 #include <vector>
 #include <stdexcept>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #ifdef TORCH_CHECK
 #undef TORCH_CHECK
@@ -50,6 +59,15 @@ void launch_quant_e4m3(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
 void launch_quant_e5m2(const void* src, uint8_t* dst, int64_t numel,
                        int dtype, hipStream_t stream);
+void launch_quant_e4m3_delayed_amax(
+    const void* src, uint8_t* dst, const float* quant_scale,
+    float* amax_scratch, int* sample_nonfinite, uint8_t* found_nonfinite,
+    float* scale, float* inv_scale, float* amax_history,
+    int64_t numel, int history_len, int history_slot, int dtype,
+    hipStream_t stream);
+void launch_refresh_e4m3_shadow(
+    const void* src, uint8_t* shadow, const float* quant_scale,
+    int64_t numel, int dtype, hipStream_t stream);
 void launch_quant_e4m3_transpose(const void* src, uint8_t* dst,
                                  int64_t rows, int64_t cols, int dtype,
                                  hipStream_t stream);
@@ -148,6 +166,14 @@ void launch_fp8_linear_backward_weight_fp8_grad(
     const uint8_t* grad_output_fp8, const void* input, void* grad_weight,
     int M, int N, int K, float input_scale, int input_dtype,
     int grad_weight_dtype, hipStream_t stream);
+void launch_fp8_linear_backward_input_raw_fp8(
+    const uint8_t* grad_output_fp8, const uint8_t* weight_fp8, void* grad_input,
+    int M, int N, int K, float weight_inv_scale, int grad_input_dtype,
+    hipStream_t stream);
+void launch_fp8_linear_backward_weight_raw_fp8(
+    const uint8_t* grad_output_fp8, const uint8_t* input_fp8, void* grad_weight,
+    int M, int N, int K, float input_inv_scale, int grad_weight_dtype,
+    hipStream_t stream);
 void launch_fp8_linear_forward_v2_input_weight(
     const uint8_t* A_fp8, const uint8_t* B_fp8, void* C, const void* bias,
     int M, int N, int K,
@@ -159,6 +185,9 @@ void launch_dequant_q_to_fp8(
     int type_num, int nrows, int blocks_per_row, int n_per_row,
     int block_size, int e5m2,
     hipStream_t stream);
+void launch_dequant_mxfp4_to_fp8(
+    const uint8_t* packed_values, const uint8_t* block_scales, uint8_t* output,
+    int64_t nrows, int n_per_row, hipStream_t stream);
 
 // Kept in a HIP-compiled translation unit because the current Windows PyTorch
 // wheel's c10 HIP headers are not MSVC-clean.
@@ -196,6 +225,397 @@ static inline int float_dtype_code(c10::ScalarType dtype, const char* name) {
 
 static inline int float_dtype_code(const torch::Tensor& tensor, const char* name) {
     return float_dtype_code(tensor.scalar_type(), name);
+}
+
+// ---------------------------------------------------------------------------
+// Native CDNA4 MXFP4 support through hipBLASLt.
+//
+// Unlike the compatibility decoder below, this path does not unpack E2M1 into
+// another format.  hipBLASLt receives HIP_R_4F_E2M1 operands and raw UE8M0
+// Vec32 scale bytes directly.  The small dynamic-loader layer intentionally
+// avoids a platform-specific import library dependency for this Python
+// extension (notably on Windows ROCm), while still using the real hipBLASLt
+// implementation at runtime.
+// ---------------------------------------------------------------------------
+struct HipblasLtApi {
+    using CreateFn = hipblasStatus_t (*)(hipblasLtHandle_t*);
+    using DestroyFn = hipblasStatus_t (*)(const hipblasLtHandle_t);
+    using MatrixLayoutCreateFn = hipblasStatus_t (*)(
+        hipblasLtMatrixLayout_t*, hipDataType, uint64_t, uint64_t, int64_t);
+    using MatrixLayoutDestroyFn = hipblasStatus_t (*)(const hipblasLtMatrixLayout_t);
+    using MatrixLayoutSetAttributeFn = hipblasStatus_t (*)(
+        hipblasLtMatrixLayout_t, hipblasLtMatrixLayoutAttribute_t, const void*, size_t);
+    using MatmulDescCreateFn = hipblasStatus_t (*)(
+        hipblasLtMatmulDesc_t*, hipblasComputeType_t, hipDataType);
+    using MatmulDescDestroyFn = hipblasStatus_t (*)(const hipblasLtMatmulDesc_t);
+    using MatmulDescSetAttributeFn = hipblasStatus_t (*)(
+        hipblasLtMatmulDesc_t, hipblasLtMatmulDescAttributes_t, const void*, size_t);
+    using PreferenceCreateFn = hipblasStatus_t (*)(hipblasLtMatmulPreference_t*);
+    using PreferenceDestroyFn = hipblasStatus_t (*)(const hipblasLtMatmulPreference_t);
+    using PreferenceSetAttributeFn = hipblasStatus_t (*)(
+        hipblasLtMatmulPreference_t, hipblasLtMatmulPreferenceAttributes_t, const void*, size_t);
+    using HeuristicFn = hipblasStatus_t (*)(
+        hipblasLtHandle_t, hipblasLtMatmulDesc_t, hipblasLtMatrixLayout_t,
+        hipblasLtMatrixLayout_t, hipblasLtMatrixLayout_t, hipblasLtMatrixLayout_t,
+        hipblasLtMatmulPreference_t, int, hipblasLtMatmulHeuristicResult_t*, int*);
+    using MatmulFn = hipblasStatus_t (*)(
+        hipblasLtHandle_t, hipblasLtMatmulDesc_t, const void*, const void*,
+        hipblasLtMatrixLayout_t, const void*, hipblasLtMatrixLayout_t, const void*,
+        const void*, hipblasLtMatrixLayout_t, void*, hipblasLtMatrixLayout_t,
+        const hipblasLtMatmulAlgo_t*, void*, size_t, hipStream_t);
+
+    CreateFn create = nullptr;
+    DestroyFn destroy = nullptr;
+    MatrixLayoutCreateFn matrix_layout_create = nullptr;
+    MatrixLayoutDestroyFn matrix_layout_destroy = nullptr;
+    MatrixLayoutSetAttributeFn matrix_layout_set_attribute = nullptr;
+    MatmulDescCreateFn matmul_desc_create = nullptr;
+    MatmulDescDestroyFn matmul_desc_destroy = nullptr;
+    MatmulDescSetAttributeFn matmul_desc_set_attribute = nullptr;
+    PreferenceCreateFn preference_create = nullptr;
+    PreferenceDestroyFn preference_destroy = nullptr;
+    PreferenceSetAttributeFn preference_set_attribute = nullptr;
+    HeuristicFn heuristic = nullptr;
+    MatmulFn matmul = nullptr;
+
+    bool load() {
+        std::call_once(load_once, [this]() { load_impl(); });
+        return loaded;
+    }
+
+    std::string error;
+
+private:
+    std::once_flag load_once;
+    bool loaded = false;
+
+    template <typename T>
+    bool load_symbol(T& target, const char* name) {
+#ifdef _WIN32
+        target = reinterpret_cast<T>(GetProcAddress(module, name));
+#else
+        target = reinterpret_cast<T>(dlsym(module, name));
+#endif
+        if (target == nullptr) {
+            error = std::string("libhipblaslt is missing symbol ") + name;
+            return false;
+        }
+        return true;
+    }
+
+    void load_impl() {
+#ifdef _WIN32
+        module = LoadLibraryA("libhipblaslt.dll");
+        if (module == nullptr) {
+            module = LoadLibraryA("hipblaslt.dll");
+        }
+#else
+        module = dlopen("libhipblaslt.so", RTLD_NOW | RTLD_LOCAL);
+        if (module == nullptr) {
+            module = dlopen("libhipblaslt.so.0", RTLD_NOW | RTLD_LOCAL);
+        }
+#endif
+        if (module == nullptr) {
+            error = "could not load libhipblaslt; ensure the ROCm library directory is on PATH/LD_LIBRARY_PATH";
+            return;
+        }
+
+        loaded =
+            load_symbol(create, "hipblasLtCreate") &&
+            load_symbol(destroy, "hipblasLtDestroy") &&
+            load_symbol(matrix_layout_create, "hipblasLtMatrixLayoutCreate") &&
+            load_symbol(matrix_layout_destroy, "hipblasLtMatrixLayoutDestroy") &&
+            load_symbol(matrix_layout_set_attribute, "hipblasLtMatrixLayoutSetAttribute") &&
+            load_symbol(matmul_desc_create, "hipblasLtMatmulDescCreate") &&
+            load_symbol(matmul_desc_destroy, "hipblasLtMatmulDescDestroy") &&
+            load_symbol(matmul_desc_set_attribute, "hipblasLtMatmulDescSetAttribute") &&
+            load_symbol(preference_create, "hipblasLtMatmulPreferenceCreate") &&
+            load_symbol(preference_destroy, "hipblasLtMatmulPreferenceDestroy") &&
+            load_symbol(preference_set_attribute, "hipblasLtMatmulPreferenceSetAttribute") &&
+            load_symbol(heuristic, "hipblasLtMatmulAlgoGetHeuristic") &&
+            load_symbol(matmul, "hipblasLtMatmul");
+    }
+
+#ifdef _WIN32
+    HMODULE module = nullptr;
+#else
+    void* module = nullptr;
+#endif
+};
+
+static HipblasLtApi& hipblaslt_api() {
+    // Keep the module loaded for the lifetime of the Python process so cached
+    // function pointers and thread-local handles cannot become stale.
+    static HipblasLtApi api;
+    return api;
+}
+
+static std::string native_mxfp4_current_arch() {
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) {
+        return "unavailable";
+    }
+    hipDeviceProp_t props{};
+    if (hipGetDeviceProperties(&props, device) != hipSuccess) {
+        return "unavailable";
+    }
+    return std::string(props.gcnArchName);
+}
+
+static bool native_mxfp4_is_supported_arch(const std::string& arch) {
+    // gfx950 is CDNA4. Suffixes such as ":sramecc+" are valid.
+    return arch.rfind("gfx950", 0) == 0;
+}
+
+static void native_mxfp4_check_status(hipblasStatus_t status, const char* stage) {
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            std::string("native_mxfp4_linear_forward: hipBLASLt ") + stage +
+            " failed with status " + std::to_string(static_cast<int>(status)));
+    }
+}
+
+struct NativeMxFp4Descriptors {
+    explicit NativeMxFp4Descriptors(HipblasLtApi& api) : api(api) {}
+    ~NativeMxFp4Descriptors() {
+        if (preference) api.preference_destroy(preference);
+        if (d_layout) api.matrix_layout_destroy(d_layout);
+        if (c_layout) api.matrix_layout_destroy(c_layout);
+        if (b_layout) api.matrix_layout_destroy(b_layout);
+        if (a_layout) api.matrix_layout_destroy(a_layout);
+        if (matmul_desc) api.matmul_desc_destroy(matmul_desc);
+    }
+
+    HipblasLtApi& api;
+    hipblasLtMatmulDesc_t matmul_desc = nullptr;
+    hipblasLtMatrixLayout_t a_layout = nullptr;
+    hipblasLtMatrixLayout_t b_layout = nullptr;
+    hipblasLtMatrixLayout_t c_layout = nullptr;
+    hipblasLtMatrixLayout_t d_layout = nullptr;
+    hipblasLtMatmulPreference_t preference = nullptr;
+};
+
+static hipblasLtHandle_t native_mxfp4_handle(HipblasLtApi& api, int device) {
+    // hipBLASLt documents that destroying a handle synchronizes the device.
+    // A thread-local, process-lifetime handle avoids a hidden sync per GEMM
+    // while keeping each handle bound to the current device.
+    struct ThreadHandle {
+        int device = -1;
+        hipblasLtHandle_t handle = nullptr;
+    };
+    static thread_local ThreadHandle state;
+    if (state.handle == nullptr || state.device != device) {
+        hipblasLtHandle_t handle = nullptr;
+        native_mxfp4_check_status(api.create(&handle), "handle creation");
+        state.device = device;
+        state.handle = handle;
+    }
+    return state.handle;
+}
+
+static c10::ScalarType native_mxfp4_output_dtype(int output_dtype) {
+    switch (output_dtype) {
+        case HIP_QUANT_DTYPE_F32:  return torch::kFloat32;
+        case HIP_QUANT_DTYPE_F16:  return torch::kFloat16;
+        case HIP_QUANT_DTYPE_BF16: return torch::kBFloat16;
+        default:
+            throw std::runtime_error(
+                "native_mxfp4_linear_forward: output_dtype must be 0 (float32), "
+                "1 (float16), or 2 (bfloat16)");
+    }
+}
+
+static hipDataType native_mxfp4_output_hip_dtype(c10::ScalarType dtype) {
+    switch (dtype) {
+        case torch::kFloat32:  return HIP_R_32F;
+        case torch::kFloat16:  return HIP_R_16F;
+        case torch::kBFloat16: return HIP_R_16BF;
+        default: break;
+    }
+    throw std::runtime_error("native_mxfp4_linear_forward: unsupported output dtype");
+}
+
+static py::dict native_mxfp4_contract() {
+    py::dict result;
+    result["a_type"] = "HIP_R_4F_E2M1";
+    result["b_type"] = "HIP_R_4F_E2M1";
+    result["scale_type"] = "HIP_R_8F_UE8M0";
+    result["scale_mode"] = "HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0";
+    result["trans_a"] = "HIPBLAS_OP_T";
+    result["trans_b"] = "HIPBLAS_OP_N";
+    result["m_multiple"] = 16;
+    result["n_multiple"] = 16;
+    result["k_multiple"] = 128;
+    result["batch_count"] = 1;
+    result["epilogue"] = "none";
+    result["required_arch"] = "gfx950";
+    return result;
+}
+
+static py::dict native_mxfp4_capability() {
+    auto& api = hipblaslt_api();
+    const bool library_loaded = api.load();
+    const std::string arch = native_mxfp4_current_arch();
+    const bool device_is_gfx950 = native_mxfp4_is_supported_arch(arch);
+
+    py::dict result;
+    result["compiled"] = true;
+    result["library_loaded"] = library_loaded;
+    result["device_arch"] = arch;
+    result["device_is_gfx950"] = device_is_gfx950;
+    result["available"] = library_loaded && device_is_gfx950;
+    result["required_arch"] = "gfx950";
+    result["reason"] = library_loaded
+        ? (device_is_gfx950 ? "native MXFP4 is available" : "native MXFP4 requires a CDNA4 gfx950 device")
+        : api.error;
+    return result;
+}
+
+torch::Tensor native_mxfp4_linear_forward(
+    torch::Tensor a_values,
+    torch::Tensor a_scales,
+    torch::Tensor b_values,
+    torch::Tensor b_scales,
+    int output_dtype
+) {
+    constexpr int64_t kValuesPerScale = 32;
+    constexpr int64_t kValuesPerByte = 2;
+    constexpr int64_t kWorkspaceLimitBytes = 64LL * 1024 * 1024;
+
+    const c10::ScalarType out_dtype = native_mxfp4_output_dtype(output_dtype);
+    const auto validate_storage = [](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be a HIP/CUDA tensor");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.scalar_type() == torch::kUInt8,
+                    name, " must contain raw uint8 bytes");
+        TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+    };
+    validate_storage(a_values, "native_mxfp4_linear_forward: a_values");
+    validate_storage(a_scales, "native_mxfp4_linear_forward: a_scales");
+    validate_storage(b_values, "native_mxfp4_linear_forward: b_values");
+    validate_storage(b_scales, "native_mxfp4_linear_forward: b_scales");
+    TORCH_CHECK(a_values.device() == a_scales.device() &&
+                a_values.device() == b_values.device() &&
+                a_values.device() == b_scales.device(),
+                "native_mxfp4_linear_forward: all operands must share a device");
+
+    const int64_t M = a_values.size(0);
+    const int64_t K = a_values.size(1) * kValuesPerByte;
+    const int64_t N = b_values.size(0);
+    TORCH_CHECK(M > 0 && N > 0 && K > 0,
+                "native_mxfp4_linear_forward: M, N, and K must be positive");
+    TORCH_CHECK(M % 16 == 0 && N % 16 == 0 && K % 128 == 0,
+                "native_mxfp4_linear_forward: native hipBLASLt MXFP4 requires "
+                "M and N multiples of 16 and K a multiple of 128");
+    TORCH_CHECK(b_values.size(1) * kValuesPerByte == K,
+                "native_mxfp4_linear_forward: A and B must have the same logical K");
+    TORCH_CHECK(a_scales.size(0) == M && a_scales.size(1) == K / kValuesPerScale,
+                "native_mxfp4_linear_forward: a_scales must have shape [M, K / 32]");
+    TORCH_CHECK(b_scales.size(0) == N && b_scales.size(1) == K / kValuesPerScale,
+                "native_mxfp4_linear_forward: b_scales must have shape [N, K / 32]");
+
+    int current_device = -1;
+    if (hipGetDevice(&current_device) != hipSuccess || current_device != a_values.get_device()) {
+        throw std::runtime_error(
+            "native_mxfp4_linear_forward: the MXFP4 tensors' device must be PyTorch's current HIP device");
+    }
+    const std::string arch = native_mxfp4_current_arch();
+    if (!native_mxfp4_is_supported_arch(arch)) {
+        throw std::runtime_error(
+            "native_mxfp4_linear_forward: native MXFP4 requires a CDNA4 gfx950 device; current arch is " + arch);
+    }
+
+    auto& api = hipblaslt_api();
+    if (!api.load()) {
+        throw std::runtime_error("native_mxfp4_linear_forward: " + api.error);
+    }
+
+    // The packed tensors are logical row-major [M,K] and [N,K].  Presenting
+    // their exact bytes as column-major [K,M] and [K,N] respectively lets
+    // hipBLASLt consume the canonical per-row Vec32 scale layout without a
+    // transpose/copy: op(A)=A^T and op(B)=B are [M,K] and [K,N].
+    NativeMxFp4Descriptors descriptors(api);
+    native_mxfp4_check_status(
+        api.matmul_desc_create(&descriptors.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+        "matmul descriptor creation");
+    const hipblasOperation_t trans_a = HIPBLAS_OP_T;
+    const hipblasOperation_t trans_b = HIPBLAS_OP_N;
+    const hipblasLtMatmulMatrixScale_t vec32_ue8m0 =
+        HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    const void* a_scale_ptr = a_scales.data_ptr<uint8_t>();
+    const void* b_scale_ptr = b_scales.data_ptr<uint8_t>();
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)),
+        "setting transpose A");
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)),
+        "setting transpose B");
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
+        &vec32_ue8m0, sizeof(vec32_ue8m0)), "setting A scale mode");
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
+        &vec32_ue8m0, sizeof(vec32_ue8m0)), "setting B scale mode");
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &a_scale_ptr, sizeof(a_scale_ptr)), "setting A scale pointer");
+    native_mxfp4_check_status(api.matmul_desc_set_attribute(
+        descriptors.matmul_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &b_scale_ptr, sizeof(b_scale_ptr)), "setting B scale pointer");
+
+    native_mxfp4_check_status(api.matrix_layout_create(
+        &descriptors.a_layout, HIP_R_4F_E2M1, K, M, K), "A layout creation");
+    native_mxfp4_check_status(api.matrix_layout_create(
+        &descriptors.b_layout, HIP_R_4F_E2M1, K, N, K), "B layout creation");
+    const hipDataType output_hip_dtype = native_mxfp4_output_hip_dtype(out_dtype);
+    native_mxfp4_check_status(api.matrix_layout_create(
+        &descriptors.c_layout, output_hip_dtype, M, N, N), "C layout creation");
+    native_mxfp4_check_status(api.matrix_layout_create(
+        &descriptors.d_layout, output_hip_dtype, M, N, N), "D layout creation");
+    const int32_t row_order = HIPBLASLT_ORDER_ROW;
+    native_mxfp4_check_status(api.matrix_layout_set_attribute(
+        descriptors.c_layout, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)),
+        "setting C row-major layout");
+    native_mxfp4_check_status(api.matrix_layout_set_attribute(
+        descriptors.d_layout, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)),
+        "setting D row-major layout");
+
+    native_mxfp4_check_status(api.preference_create(&descriptors.preference),
+                              "preference creation");
+    const uint64_t workspace_limit = kWorkspaceLimitBytes;
+    native_mxfp4_check_status(api.preference_set_attribute(
+        descriptors.preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_limit, sizeof(workspace_limit)), "setting workspace limit");
+
+    hipblasLtMatmulHeuristicResult_t heuristic{};
+    int algorithm_count = 0;
+    native_mxfp4_check_status(api.heuristic(
+        native_mxfp4_handle(api, current_device), descriptors.matmul_desc,
+        descriptors.a_layout, descriptors.b_layout, descriptors.c_layout, descriptors.d_layout,
+        descriptors.preference, 1, &heuristic, &algorithm_count), "heuristic search");
+    if (algorithm_count != 1 || heuristic.state != HIPBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "native_mxfp4_linear_forward: hipBLASLt did not provide a native MXFP4 algorithm for this shape");
+    }
+
+    auto output = torch::empty({M, N}, a_values.options().dtype(out_dtype));
+    torch::Tensor workspace;
+    void* workspace_ptr = nullptr;
+    if (heuristic.workspaceSize > 0) {
+        workspace = torch::empty(
+            {static_cast<int64_t>(heuristic.workspaceSize)}, a_values.options().dtype(torch::kUInt8));
+        workspace_ptr = workspace.data_ptr<uint8_t>();
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    native_mxfp4_check_status(api.matmul(
+        native_mxfp4_handle(api, current_device), descriptors.matmul_desc, &alpha,
+        a_values.data_ptr<uint8_t>(), descriptors.a_layout,
+        b_values.data_ptr<uint8_t>(), descriptors.b_layout, &beta,
+        output.data_ptr(), descriptors.c_layout, output.data_ptr(), descriptors.d_layout,
+        &heuristic.algo, workspace_ptr, heuristic.workspaceSize, current_stream()),
+        "matmul");
+    return output;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +770,105 @@ torch::Tensor quantize_e5m2(torch::Tensor input) {
         current_stream()
     );
     return output;
+}
+
+// Quantize with the scale selected by the previous delayed-amax observation,
+// then update the FP8 metadata asynchronously for the next invocation. The
+// returned scalar is an immutable device-side snapshot of the scale consumed
+// by this quantization, which is needed by autograd after metadata advances.
+std::tuple<torch::Tensor, torch::Tensor> quantize_e4m3_delayed_amax(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor inv_scale,
+    torch::Tensor amax_history,
+    torch::Tensor amax_scratch,
+    torch::Tensor sample_nonfinite,
+    torch::Tensor found_nonfinite,
+    int64_t history_slot
+) {
+    constexpr const char* kOp = "quantize_e4m3_delayed_amax";
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
+                kOp, ": input must be a contiguous HIP/CUDA tensor");
+    const int input_dtype = float_dtype_code(input, kOp);
+    TORCH_CHECK(input.numel() > 0, kOp, ": input must be non-empty");
+
+    const auto check_scalar_f32 = [&](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
+                    kOp, ": ", name, " must be a contiguous HIP/CUDA tensor");
+        TORCH_CHECK(tensor.scalar_type() == torch::kFloat32 && tensor.numel() == 1,
+                    kOp, ": ", name, " must be one float32 value");
+        TORCH_CHECK(tensor.device() == input.device(),
+                    kOp, ": ", name, " must be on input's device");
+    };
+    check_scalar_f32(scale, "scale");
+    check_scalar_f32(inv_scale, "inv_scale");
+    check_scalar_f32(amax_scratch, "amax_scratch");
+    TORCH_CHECK(amax_history.is_cuda() && amax_history.is_contiguous() &&
+                amax_history.scalar_type() == torch::kFloat32 &&
+                amax_history.dim() == 1 && amax_history.numel() > 0,
+                kOp, ": amax_history must be a non-empty contiguous float32 vector");
+    TORCH_CHECK(amax_history.device() == input.device(),
+                kOp, ": amax_history must be on input's device");
+    TORCH_CHECK(history_slot >= 0 && history_slot < amax_history.numel(),
+                kOp, ": history_slot is out of range");
+
+    const auto check_bool_flag = [&](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
+                    tensor.scalar_type() == torch::kBool && tensor.numel() == 1,
+                    kOp, ": ", name, " must be one contiguous bool value");
+        TORCH_CHECK(tensor.device() == input.device(),
+                    kOp, ": ", name, " must be on input's device");
+    };
+    TORCH_CHECK(sample_nonfinite.is_cuda() && sample_nonfinite.is_contiguous() &&
+                sample_nonfinite.scalar_type() == torch::kInt32 && sample_nonfinite.numel() == 1,
+                kOp, ": sample_nonfinite must be one contiguous int32 value");
+    TORCH_CHECK(sample_nonfinite.device() == input.device(),
+                kOp, ": sample_nonfinite must be on input's device");
+    check_bool_flag(found_nonfinite, "found_nonfinite");
+
+    const int history_len = checked_int(amax_history.numel(), "amax_history length");
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kUInt8));
+    auto scale_snapshot = torch::empty_like(scale);
+    const hipStream_t stream = current_stream();
+    if (hipMemcpyAsync(scale_snapshot.data_ptr<float>(), scale.data_ptr<float>(),
+                       sizeof(float), hipMemcpyDeviceToDevice, stream) != hipSuccess ||
+        hipMemsetAsync(amax_scratch.data_ptr<float>(), 0, sizeof(float), stream) != hipSuccess ||
+        hipMemsetAsync(sample_nonfinite.data_ptr<int>(), 0, sizeof(int), stream) != hipSuccess) {
+        throw std::runtime_error("quantize_e4m3_delayed_amax: failed to initialize metadata scratch buffers");
+    }
+
+    launch_quant_e4m3_delayed_amax(
+        input.data_ptr(), output.data_ptr<uint8_t>(), scale.data_ptr<float>(),
+        amax_scratch.data_ptr<float>(), sample_nonfinite.data_ptr<int>(),
+        reinterpret_cast<uint8_t*>(found_nonfinite.data_ptr<bool>()),
+        scale.data_ptr<float>(), inv_scale.data_ptr<float>(), amax_history.data_ptr<float>(),
+        input.numel(), history_len, static_cast<int>(history_slot), input_dtype, stream);
+    return std::make_tuple(output, scale_snapshot);
+}
+
+torch::Tensor refresh_e4m3_shadow(
+    torch::Tensor input,
+    torch::Tensor shadow,
+    torch::Tensor quant_scale
+) {
+    constexpr const char* kOp = "refresh_e4m3_shadow";
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
+                kOp, ": input must be a contiguous HIP/CUDA tensor");
+    const int input_dtype = float_dtype_code(input, kOp);
+    TORCH_CHECK(shadow.is_cuda() && shadow.is_contiguous() &&
+                shadow.scalar_type() == torch::kUInt8,
+                kOp, ": shadow must be a contiguous uint8 HIP/CUDA tensor");
+    TORCH_CHECK(shadow.sizes() == input.sizes(),
+                kOp, ": shadow shape must match input shape");
+    TORCH_CHECK(quant_scale.is_cuda() && quant_scale.is_contiguous() &&
+                quant_scale.scalar_type() == torch::kFloat32 && quant_scale.numel() == 1,
+                kOp, ": quant_scale must be one contiguous float32 value");
+    TORCH_CHECK(input.device() == shadow.device() && input.device() == quant_scale.device(),
+                kOp, ": input, shadow, and quant_scale must share a device");
+    launch_refresh_e4m3_shadow(input.data_ptr(), shadow.data_ptr<uint8_t>(),
+                               quant_scale.data_ptr<float>(), input.numel(), input_dtype,
+                               current_stream());
+    return shadow;
 }
 
 static torch::Tensor quantize_transpose_impl(torch::Tensor input, bool e5m2) {
@@ -1229,6 +1748,90 @@ torch::Tensor fp8_linear_backward_weight_fp8_grad(
     return grad_weight;
 }
 
+torch::Tensor fp8_linear_backward_input_raw_fp8(
+    torch::Tensor grad_output_fp8,
+    torch::Tensor weight_fp8,
+    torch::Tensor output_dtype_source,
+    double weight_inv_scale
+) {
+    constexpr const char* kOp = "fp8_linear_backward_input_raw_fp8";
+    TORCH_CHECK(grad_output_fp8.is_cuda() && grad_output_fp8.is_contiguous() &&
+                grad_output_fp8.scalar_type() == torch::kUInt8 && grad_output_fp8.dim() == 2,
+                kOp, ": grad_output_fp8 must be a contiguous rank-2 uint8 CUDA tensor");
+    TORCH_CHECK(weight_fp8.is_cuda() && weight_fp8.is_contiguous() &&
+                weight_fp8.scalar_type() == torch::kUInt8 && weight_fp8.dim() == 2,
+                kOp, ": weight_fp8 must be a contiguous rank-2 uint8 CUDA tensor");
+    TORCH_CHECK(output_dtype_source.is_cuda(),
+                kOp, ": output_dtype_source must be a CUDA tensor");
+    const int output_dtype = float_dtype_code(output_dtype_source, kOp);
+    TORCH_CHECK(positive_finite_scale(weight_inv_scale),
+                kOp, ": weight_inv_scale must be finite and positive");
+
+    const int64_t M = grad_output_fp8.size(0);
+    const int64_t N = grad_output_fp8.size(1);
+    const int64_t K = weight_fp8.size(1);
+    TORCH_CHECK(weight_fp8.size(0) == N,
+                kOp, ": grad_output_fp8 and weight_fp8 N dimensions must match");
+    TORCH_CHECK(grad_output_fp8.device() == weight_fp8.device() &&
+                grad_output_fp8.device() == output_dtype_source.device(),
+                kOp, ": all tensors must share a device");
+    const int iM = checked_int(M, "M");
+    const int iN = checked_int(N, "N");
+    const int iK = checked_int(K, "K");
+    check_grid_dim(M, 16, "M (rows)");
+    check_grid_dim(K, 16, "K (cols)");
+    check_gfx12_fp8_wmma_runtime(kOp);
+
+    auto grad_input = torch::empty({M, K}, output_dtype_source.options());
+    launch_fp8_linear_backward_input_raw_fp8(
+        grad_output_fp8.data_ptr<uint8_t>(), weight_fp8.data_ptr<uint8_t>(),
+        grad_input.data_ptr(), iM, iN, iK, static_cast<float>(weight_inv_scale),
+        output_dtype, current_stream());
+    return grad_input;
+}
+
+torch::Tensor fp8_linear_backward_weight_raw_fp8(
+    torch::Tensor grad_output_fp8,
+    torch::Tensor input_fp8,
+    torch::Tensor output_dtype_source,
+    double input_inv_scale
+) {
+    constexpr const char* kOp = "fp8_linear_backward_weight_raw_fp8";
+    TORCH_CHECK(grad_output_fp8.is_cuda() && grad_output_fp8.is_contiguous() &&
+                grad_output_fp8.scalar_type() == torch::kUInt8 && grad_output_fp8.dim() == 2,
+                kOp, ": grad_output_fp8 must be a contiguous rank-2 uint8 CUDA tensor");
+    TORCH_CHECK(input_fp8.is_cuda() && input_fp8.is_contiguous() &&
+                input_fp8.scalar_type() == torch::kUInt8 && input_fp8.dim() == 2,
+                kOp, ": input_fp8 must be a contiguous rank-2 uint8 CUDA tensor");
+    TORCH_CHECK(output_dtype_source.is_cuda(),
+                kOp, ": output_dtype_source must be a CUDA tensor");
+    const int output_dtype = float_dtype_code(output_dtype_source, kOp);
+    TORCH_CHECK(positive_finite_scale(input_inv_scale),
+                kOp, ": input_inv_scale must be finite and positive");
+
+    const int64_t M = grad_output_fp8.size(0);
+    const int64_t N = grad_output_fp8.size(1);
+    const int64_t K = input_fp8.size(1);
+    TORCH_CHECK(input_fp8.size(0) == M,
+                kOp, ": grad_output_fp8 and input_fp8 M dimensions must match");
+    TORCH_CHECK(grad_output_fp8.device() == input_fp8.device() &&
+                grad_output_fp8.device() == output_dtype_source.device(),
+                kOp, ": all tensors must share a device");
+    const int iM = checked_int(M, "M");
+    const int iN = checked_int(N, "N");
+    const int iK = checked_int(K, "K");
+    check_grid_dim(N, 16, "N (rows)");
+    check_grid_dim(K, 16, "K (cols)");
+    check_gfx12_fp8_wmma_runtime(kOp);
+
+    auto grad_weight = torch::empty({N, K}, output_dtype_source.options().dtype(torch::kFloat32));
+    launch_fp8_linear_backward_weight_raw_fp8(
+        grad_output_fp8.data_ptr<uint8_t>(), input_fp8.data_ptr<uint8_t>(),
+        grad_weight.data_ptr(), iM, iN, iK, static_cast<float>(input_inv_scale),
+        HIP_QUANT_DTYPE_F32, current_stream());
+    return grad_weight;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4 v2 — Cooperative LDS-staged FP8 GEMM
 // ---------------------------------------------------------------------------
@@ -1375,6 +1978,58 @@ torch::Tensor dequantize_q_to_fp8(
 }
 
 // ---------------------------------------------------------------------------
+// OCP MXFP4 E2M1 + UE8M0 -> FP8 E4M3 compatibility expansion.
+//
+// This API is intentionally separate from GGML Q-types: an MXFP4 nibble is a
+// floating-point E2M1 encoding, not a signed four-bit integer.  Treating it
+// as Q4 would silently produce incorrect weights.
+// ---------------------------------------------------------------------------
+torch::Tensor dequantize_mxfp4_to_fp8(
+    torch::Tensor packed_values,
+    torch::Tensor block_scales,
+    int64_t n_per_row
+) {
+    constexpr int kValuesPerBlock = 32;
+    constexpr int kValuesPerByte = 2;
+
+    TORCH_CHECK(packed_values.is_cuda(),
+                "dequantize_mxfp4_to_fp8: packed_values must be a HIP/CUDA tensor");
+    TORCH_CHECK(packed_values.is_contiguous(),
+                "dequantize_mxfp4_to_fp8: packed_values must be contiguous");
+    TORCH_CHECK(packed_values.scalar_type() == torch::kUInt8,
+                "dequantize_mxfp4_to_fp8: packed_values must be uint8");
+    TORCH_CHECK(block_scales.is_cuda() && block_scales.is_contiguous(),
+                "dequantize_mxfp4_to_fp8: block_scales must be a contiguous HIP/CUDA tensor");
+    TORCH_CHECK(block_scales.scalar_type() == torch::kUInt8,
+                "dequantize_mxfp4_to_fp8: block_scales must be raw UE8M0 uint8 bytes");
+    TORCH_CHECK(packed_values.device() == block_scales.device(),
+                "dequantize_mxfp4_to_fp8: packed_values and block_scales must share a device");
+    TORCH_CHECK(n_per_row > 0 && n_per_row % kValuesPerBlock == 0,
+                "dequantize_mxfp4_to_fp8: n_per_row must be a positive multiple of 32");
+    TORCH_CHECK(n_per_row <= INT_MAX,
+                "dequantize_mxfp4_to_fp8: n_per_row exceeds the supported kernel range");
+
+    const int iN = (int)n_per_row;
+    const int64_t packed_bytes_per_row = iN / kValuesPerByte;
+    const int64_t scales_per_row = iN / kValuesPerBlock;
+    TORCH_CHECK(packed_values.numel() > 0 && packed_values.numel() % packed_bytes_per_row == 0,
+                "dequantize_mxfp4_to_fp8: packed_values size must be a non-zero multiple of ",
+                packed_bytes_per_row, " bytes per row");
+    const int64_t nrows = packed_values.numel() / packed_bytes_per_row;
+    TORCH_CHECK(nrows <= INT_MAX,
+                "dequantize_mxfp4_to_fp8: nrows exceeds the supported kernel range");
+    TORCH_CHECK(block_scales.numel() == nrows * scales_per_row,
+                "dequantize_mxfp4_to_fp8: block_scales must contain exactly ",
+                nrows * scales_per_row, " UE8M0 bytes (one per 32 values)");
+
+    auto output = torch::empty({nrows, iN}, packed_values.options().dtype(torch::kUInt8));
+    launch_dequant_mxfp4_to_fp8(
+        packed_values.data_ptr<uint8_t>(), block_scales.data_ptr<uint8_t>(),
+        output.data_ptr<uint8_t>(), nrows, iN, current_stream());
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // Pybind11 module registration
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1390,6 +2045,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_e5m2",   &quantize_e5m2,
           "Quantize float32 tensor to FP8 E5M2 (uint8) on-device",
           py::arg("input"));
+    m.def("quantize_e4m3_delayed_amax", &quantize_e4m3_delayed_amax,
+          "Fused delayed-amax tracking and E4M3 activation quantization",
+          py::arg("input"), py::arg("scale"), py::arg("inv_scale"),
+          py::arg("amax_history"), py::arg("amax_scratch"),
+          py::arg("sample_nonfinite"), py::arg("found_nonfinite"),
+          py::arg("history_slot"));
+    m.def("refresh_e4m3_shadow", &refresh_e4m3_shadow,
+          "Quantize a floating master tensor directly into an E4M3 shadow buffer",
+          py::arg("input"), py::arg("shadow"), py::arg("quant_scale"));
     m.def("quantize_e4m3_transpose", &quantize_e4m3_transpose,
           "Fused quantize + transpose to FP8 E4M3 (uint8) on-device",
           py::arg("input"));
@@ -1488,10 +2152,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "FP8 linear backward weight using pre-quantized E5M2 grad_output",
           py::arg("grad_output_fp8"), py::arg("grad_output_dtype_source"),
           py::arg("input"), py::arg("input_scale"));
+    m.def("fp8_linear_backward_input_raw_fp8", &fp8_linear_backward_input_raw_fp8,
+          "FP8 linear backward input using raw E5M2 grad_output and weight",
+          py::arg("grad_output_fp8"), py::arg("weight_fp8"),
+          py::arg("output_dtype_source"), py::arg("weight_inv_scale"));
+    m.def("fp8_linear_backward_weight_raw_fp8", &fp8_linear_backward_weight_raw_fp8,
+          "FP8 linear backward weight using raw E5M2 grad_output and input",
+          py::arg("grad_output_fp8"), py::arg("input_fp8"),
+          py::arg("output_dtype_source"), py::arg("input_inv_scale"));
 
     m.def("dequantize_q_to_fp8", &dequantize_q_to_fp8,
           "Dequantize GGML Q-type packed bytes (on GPU) directly to FP8 uint8 (on GPU), zero copies.\n"
           "Supported types: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14).",
           py::arg("packed"), py::arg("type_num"), py::arg("n_per_row"),
           py::arg("e5m2") = false);
+    m.def("dequantize_mxfp4_to_fp8", &dequantize_mxfp4_to_fp8,
+          "Emulate OCP MXFP4 E2M1 + UE8M0 storage by expanding it to E4M3 FP8 on GPU. "
+          "This is a compatibility path, not native FP4 execution.",
+          py::arg("packed_values"), py::arg("block_scales"), py::arg("n_per_row"));
+    m.def("native_mxfp4_contract", &native_mxfp4_contract,
+          "Return the fixed native CDNA4 hipBLASLt MXFP4 contract; hardware is not required.");
+    m.def("native_mxfp4_capability", &native_mxfp4_capability,
+          "Report whether native hipBLASLt MXFP4 is usable on the current HIP device.");
+    m.def("native_mxfp4_linear_forward", &native_mxfp4_linear_forward,
+          "Native CDNA4 MXFP4 E2M1 + UE8M0 hipBLASLt GEMM. Requires gfx950, M/N % 16 == 0, K % 128 == 0, and no epilogue.",
+          py::arg("a_values"), py::arg("a_scales"), py::arg("b_values"), py::arg("b_scales"),
+          py::arg("output_dtype"));
 }

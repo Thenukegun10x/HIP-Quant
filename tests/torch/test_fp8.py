@@ -837,6 +837,33 @@ class TestFp8TensorMeta:
         assert back.dtype == torch.float32
         assert back.device.type == device.type
 
+    def test_fused_delayed_amax_quantizes_then_refreshes_next_scale(self, device):
+        if not hasattr(_C, "quantize_e4m3_delayed_amax"):
+            pytest.skip("extension must be rebuilt with fused delayed-amax quantization")
+        from hip_quant.torch_api import Fp8TensorMeta
+
+        meta = Fp8TensorMeta(history_len=2, device=str(device))
+        x = torch.tensor([1.0, -4.0], device=device)
+        fp8, scale_used = meta.quantize_e4m3_delayed(x)
+        torch.cuda.synchronize(device)
+
+        assert fp8.dtype == torch.uint8
+        assert scale_used.item() == pytest.approx(1.0)
+        assert meta.amax_history.max().item() == pytest.approx(4.0)
+        assert meta.scale.item() == pytest.approx(112.0)
+
+    def test_direct_shadow_refresh_matches_temporary_quantization(self, device):
+        if not hasattr(_C, "refresh_e4m3_shadow"):
+            pytest.skip("extension must be rebuilt with direct FP8 shadow refresh")
+        from hip_quant.torch_api import quantize_e4m3, refresh_e4m3_shadow
+
+        weight = torch.tensor([[1.0, -2.0]], device=device)
+        scale = torch.tensor([2.0], device=device)
+        shadow = torch.empty_like(weight, dtype=torch.uint8)
+        refresh_e4m3_shadow(weight, shadow, scale)
+        torch.cuda.synchronize(device)
+        assert torch.equal(shadow, quantize_e4m3((weight * scale).contiguous()))
+
 
 # ===========================================================================
 # FP8 Conv2d — unfold + hipBLASLt-backed FP8 linear

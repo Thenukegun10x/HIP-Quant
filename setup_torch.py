@@ -101,6 +101,7 @@ ext = CUDAExtension(
         "torch_ext/fp8_linear_kernels.hip",
         "torch_ext/fp8_linear_kernels_v2.hip",
         "torch_ext/q_to_fp8_kernels.hip",
+        "torch_ext/mxfp4_to_fp8_kernels.hip",
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags
@@ -120,11 +121,15 @@ ext = CUDAExtension(
     },
     # Ensure headers shipped with the package are visible to hipcc
     include_dirs=["."] + torch_includes,
+    # The native MXFP4 binding resolves hipBLASLt dynamically on Windows to
+    # avoid requiring an MSVC import library. POSIX builds need libdl for the
+    # equivalent dlopen/dlsym path.
+    extra_link_args=[] if os.name == "nt" else ["-ldl"],
 )
 
 setup(
     name="hip_quant_torch",
-    version="0.6.0",
+    version="0.6.1",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

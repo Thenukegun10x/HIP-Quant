@@ -108,6 +108,7 @@ def _torch_extension_config():
             "torch_ext/fp8_linear_kernels.hip",
             "torch_ext/fp8_linear_kernels_v2.hip",
             "torch_ext/q_to_fp8_kernels.hip",
+            "torch_ext/mxfp4_to_fp8_kernels.hip",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],

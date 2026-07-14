@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -40,6 +40,14 @@ _TORCH_EXPORTS = {
     "dequantize_q_to_fp8",
     "dequantize_q_to_e4m3",
     "dequantize_q_to_e5m2",
+    "dequantize_mxfp4_to_fp8",
+    "mxfp4_linear_forward",
+    "native_mxfp4_contract",
+    "native_mxfp4_capability",
+    "native_mxfp4_linear_forward",
+    "MXFP4_BLOCK_SIZE",
+    "MXFP4_PACKED_VALUE_BYTES_PER_BLOCK",
+    "MXFP4_SCALE_BYTES_PER_BLOCK",
     "GGML_Q_TO_FP8_SUPPORTED",
     "Fp8LinearFunction",
     "Fp8Linear",
@@ -63,6 +71,7 @@ __all__ = [
     "HipQuant",
     "get_hip_quant",
     "quantize",
+    "bf16_to_fp32",
     # Compatibility / device info
     "probe_device",
     "report_device",
@@ -707,6 +716,65 @@ def get_hip_quant(dll_path=None):
 
 def quantize(arr, type_num):
     return get_hip_quant().quantize_numpy(arr, type_num)
+
+
+def bf16_to_fp32(values, *, shape=None):
+    """Vectorized CPU conversion of raw IEEE bfloat16 values to ``float32``.
+
+    ``hip_quant`` has GPU kernels for its supported packed GGML quantization
+    formats, but BF16 is an ordinary 16-bit floating-point storage format, not
+    one of those packed Q formats. Decode a BF16 tensor on the CPU at a model
+    loader boundary with this helper, then leave the loader's BF16 weight policy
+    unchanged. No HIP runtime, DLL, or PyTorch extension is loaded here.
+
+    Args:
+        values: A ``numpy.uint16`` array containing raw BF16 bit patterns, or
+            a bytes-like buffer in little-endian BF16 order.
+        shape: Optional logical output shape when ``values`` is a flat buffer.
+
+    Returns:
+        A new ``numpy.float32`` array. Conversion is exact: the BF16 bits are
+        placed in the upper 16 bits of each FP32 value, preserving signed zero,
+        infinities, and NaN payload bits.
+    """
+    if isinstance(values, (bytes, bytearray, memoryview)):
+        try:
+            if memoryview(values).nbytes % 2:
+                raise ValueError("BF16 byte buffer length must be a multiple of 2")
+            words = np.frombuffer(values, dtype="<u2")
+        except (BufferError, TypeError) as exc:
+            raise TypeError(
+                "bf16_to_fp32: values must be a contiguous bytes-like BF16 buffer"
+            ) from exc
+    else:
+        words = np.asarray(values)
+        if words.dtype.kind != "u" or words.dtype.itemsize != 2:
+            raise TypeError(
+                "bf16_to_fp32: values must be a numpy.uint16 array of raw BF16 bit patterns"
+            )
+        # Convert non-native-endian uint16 arrays by numeric value before the
+        # bit shift. Native uint16 input remains zero-copy until the required
+        # FP32 output allocation below.
+        words = words.astype(np.uint16, copy=False)
+
+    fp32_bits = words.astype(np.uint32, copy=False) << np.uint32(16)
+    result = fp32_bits.view(np.float32)
+
+    if shape is None:
+        return result
+    try:
+        shape = tuple(int(dim) for dim in shape)
+    except TypeError as exc:
+        raise TypeError("bf16_to_fp32: shape must be an iterable of dimensions") from exc
+    if any(dim < 0 for dim in shape):
+        raise ValueError("bf16_to_fp32: shape dimensions must be non-negative")
+    expected_size = int(np.prod(shape, dtype=np.int64))
+    if expected_size != result.size:
+        raise ValueError(
+            f"bf16_to_fp32: shape {shape} requires {expected_size} values, "
+            f"but the input contains {result.size}"
+        )
+    return result.reshape(shape)
 
 
 # =========================================================================
