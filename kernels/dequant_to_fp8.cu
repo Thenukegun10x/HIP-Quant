@@ -508,3 +508,24 @@ void dequant_tq2_0_to_fp8_kernel(
     float val = (float)(qi - 1) * d;
     dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(val);
 }
+
+// =========================================================================
+// HQ2 dequant-to-FP8 (TurboQuant-style learned-codebook 2-bit weight quant)
+// =========================================================================
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_hq2_to_fp8_kernel(
+    const block_hq2 * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= HQ2_K) return;
+    const block_hq2 q = src[row * blocks_per_row + block];
+
+    const int c = (q.qs[i >> 2] >> (2 * (i & 3))) & 3;
+    const float val = fp16_to_fp32(q.levels[c]);
+    dst[row * n_per_row + block * HQ2_K + i] = fp32_to_output_fp8<E5M2>(val);
+}

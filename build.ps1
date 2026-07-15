@@ -36,7 +36,7 @@ if (!(Test-Path $hipcc)) {
     exit 1
 }
 
-$src_dir = "C:\Users\armor\Desktop\MEDUSA framwork\src\hip_quant"
+$src_dir = $PSScriptRoot
 $src_dir_arg = Get-ShortPath $src_dir
 $out_file = Join-Path $src_dir $Output
 $out_file_arg = Join-Path $src_dir_arg $Output

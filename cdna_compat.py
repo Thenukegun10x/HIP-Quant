@@ -207,7 +207,87 @@ def _quantize_block_q8_0(values: np.ndarray) -> bytes:
     return bytes(packed)
 
 
-def cpu_reference_quantize(arr: np.ndarray, type_name: str) -> np.ndarray:
+def _fp16_to_fp32(h: int) -> float:
+    """Decode an IEEE 754 half (uint16 bits) to a Python float."""
+    h &= 0xFFFF
+    sign = (h >> 15) & 1
+    exp = (h >> 10) & 0x1F
+    mant = h & 0x3FF
+    if exp == 0:
+        val = 0.0 if mant == 0 else math.ldexp(mant, -24)
+    elif exp == 31:
+        val = float("inf") if mant == 0 else float("nan")
+    else:
+        val = math.ldexp(mant + 1024, exp - 25)
+    return -val if sign else val
+
+
+def _quantize_block_hq2(values: np.ndarray, weights=None) -> bytes:
+    """HQ2: 256-element block, 4-level importance-weighted learned codebook.
+
+    Mirrors kernels/quant_hq2.cu. Returns 72 bytes:
+      0..7   : 4 FP16 codebook levels (levels[0..3])
+      8..71  : 64 bytes, 2-bit indices (4 per byte)
+    """
+    assert len(values) == 256
+    x = values.astype(np.float64)
+    if weights is None:
+        w = np.ones_like(x)
+    else:
+        w = np.clip(weights.astype(np.float64), 0.0, None)
+    amax = float(np.max(np.abs(x)))
+    if amax < 1e-12:
+        return bytes(72)
+    levels = np.array([-amax, -amax / 3.0, amax / 3.0, amax], dtype=np.float64)
+    for _ in range(4):
+        diff = x[:, None] - levels[None, :]
+        c = np.argmin(diff * diff, axis=1)
+        for cc in range(4):
+            mask = c == cc
+            wc = float(w[mask].sum())
+            if wc > 0.0:
+                levels[cc] = float((w[mask] * x[mask]).sum()) / wc
+    diff = x[:, None] - levels[None, :]
+    c = np.argmin(diff * diff, axis=1)
+    out = bytearray(72)
+    for cc in range(4):
+        out[cc * 2:cc * 2 + 2] = struct.pack("<H", _fp32_to_fp16(float(levels[cc])))
+    for i in range(256):
+        out[8 + (i >> 2)] |= (int(c[i]) & 3) << (2 * (i & 3))
+    return bytes(out)
+
+
+def _dequantize_block_hq2(block_bytes: bytes) -> np.ndarray:
+    """Decode one HQ2 block (72 bytes) to float32."""
+    assert len(block_bytes) == 72
+    levels = [_fp16_to_fp32(int.from_bytes(block_bytes[2 * c:2 * c + 2], "little"))
+              for c in range(4)]
+    out = np.zeros(256, dtype=np.float64)
+    for i in range(256):
+        byte = block_bytes[8 + (i >> 2)]
+        ci = (byte >> (2 * (i & 3))) & 3
+        out[i] = levels[ci]
+    return out.astype(np.float32)
+
+
+def _dequantize_hq2(packed: np.ndarray, n_per_row: int) -> np.ndarray:
+    """Decode a full HQ2 byte buffer (as from cpu_reference_quantize)."""
+    packed = np.ascontiguousarray(packed, dtype=np.uint8).reshape(-1)
+    if packed.size % 72 != 0:
+        raise ValueError("packed size not a multiple of HQ2 block (72 bytes)")
+    n_blocks_per_row = n_per_row // 256
+    n_blocks = packed.size // 72
+    nrows = n_blocks // n_blocks_per_row
+    out = np.zeros((nrows, n_per_row), dtype=np.float32)
+    for k in range(n_blocks):
+        row = k // n_blocks_per_row
+        col = k % n_blocks_per_row
+        out[row, col * 256:(col + 1) * 256] = _dequantize_block_hq2(
+            packed[k * 72:(k + 1) * 72])
+    return out
+
+
+def cpu_reference_quantize(arr: np.ndarray, type_name: str, imatrix=None) -> np.ndarray:
     """CPU reference quantization for a types that have a simple block structure.
     
     Useful for:
@@ -217,7 +297,8 @@ def cpu_reference_quantize(arr: np.ndarray, type_name: str) -> np.ndarray:
     
     Args:
         arr: float32 array (1D or 2D)
-        type_name: e.g. "Q4_0", "Q8_0" (must be in GGML_TYPE)
+        type_name: e.g. "Q4_0", "Q8_0", "HQ2" (must be in GGML_TYPE)
+        imatrix: optional float32 importance matrix (same shape as arr)
     
     Returns:
         uint8 numpy array of quantized bytes
@@ -236,20 +317,27 @@ def cpu_reference_quantize(arr: np.ndarray, type_name: str) -> np.ndarray:
     if blck_bytes == 0:
         raise ValueError(f"Unknown block bytes for: {type_name}")
     
+    imatrix = np.ascontiguousarray(imatrix, dtype=np.float32) if imatrix is not None else None
+    if imatrix is not None and imatrix.shape != arr.shape:
+        raise ValueError(f"imatrix shape {imatrix.shape} != arr shape {arr.shape}")
+    
     n_blocks = n_per_row // blck
     out = bytearray()
     
     for row in range(nrows):
         for b in range(n_blocks):
             block_vals = arr[row, b * blck:(b + 1) * blck]
+            block_w = imatrix[row, b * blck:(b + 1) * blck] if imatrix is not None else None
             if type_name == "Q4_0":
                 out.extend(_quantize_block_q4_0(block_vals))
             elif type_name == "Q8_0":
                 out.extend(_quantize_block_q8_0(block_vals))
+            elif type_name == "HQ2":
+                out.extend(_quantize_block_hq2(block_vals, block_w))
             else:
                 raise NotImplementedError(
                     f"CPU reference not implemented for {type_name}. "
-                    f"Supported: Q4_0, Q8_0"
+                    f"Supported: Q4_0, Q8_0, HQ2"
                 )
     
     out_arr = np.frombuffer(bytes(out), dtype=np.uint8)

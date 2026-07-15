@@ -105,6 +105,7 @@ GGML_TYPE = {
     "IQ4_XS": 23,
     "TQ1_0": 34,
     "TQ2_0": 35,
+    "HQ2": 38,
     "F8_E4M3": 36,
     "F8_E5M2": 37,
 }
@@ -130,6 +131,7 @@ GGML_TYPE_BLOCK_SIZE = {
     23: 256,
     34: 256,
     35: 256,
+    38: 256,
     36: 32,
     37: 32,
 }
@@ -155,6 +157,7 @@ GGML_TYPE_BLOCK_BYTES = {
     23: 136,
     34: 54,
     35: 66,
+    38: 72,
     36: 32,
     37: 32,
 }
@@ -630,7 +633,7 @@ class HipQuant:
         The conversion and FP8 encode execute in one GPU kernel, so no F32
         tensor is allocated or copied back to the host.  Supports all legacy
         Q4/Q5/Q8, K-Quant (Q2_K-Q6_K), I-Quant (IQ1_S-IQ4_XS), T-Quant
-        (TQ1_0, TQ2_0), and IQ4_NL formats.
+        (TQ1_0, TQ2_0), H-Quant (HQ2), and IQ4_NL formats.
 
         Args:
             packed: Flat packed ``uint8`` Q-type data, such as returned by

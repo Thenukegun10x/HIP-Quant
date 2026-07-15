@@ -91,6 +91,26 @@ typedef struct {
     uint8_t qs[QK_K / 2];
 } block_iq4_xs;
 
+// =========================================================================
+// HQ2 — HipQuant-2 (TurboQuant-inspired learned-codebook weight quant)
+//
+// Block of 256 weights. A per-block, importance-weighted non-uniform 4-level
+// codebook is fit on-device (weighted Lloyd's / k-means), so the stored levels
+// adapt to the local weight distribution instead of being a fixed uniform grid.
+// This is what makes 2-bit weights usable: the codebook carries the per-block
+// structure that a plain 2-bit uniform grid throws away.
+//
+//   levels[4] : 4 absolute codebook values, FP16 (8 bytes)
+//   qs[64]    : 256 indices, 2 bits each               (64 bytes)
+//   total     : 72 bytes -> 2.25 bpw
+// =========================================================================
+#define HQ2_K 256
+
+typedef struct {
+    ggml_half levels[4];
+    uint8_t qs[HQ2_K / 4];
+} block_hq2;
+
 typedef struct {
     ggml_half d;
     uint8_t qs[3 * QK_K / 8];

@@ -38,6 +38,7 @@
 #include "kernels/quant_iq3_s.cu"
 #include "kernels/quant_tq1_0.cu"
 #include "kernels/quant_tq2_0.cu"
+#include "kernels/quant_hq2.cu"
 #include "kernels/quant_f8_e4m3.cu"
 #include "kernels/quant_f8_e5m2.cu"
 #include "kernels/fp8_expand.cu"
@@ -353,6 +354,7 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 20: return sizeof(block_iq4_nl) * (n_per_row / QK4_NL);
         case 21: return sizeof(block_iq3_s) * (n_per_row / QK_K);
         case 23: return sizeof(block_iq4_xs) * (n_per_row / QK_K);
+        case 38: return sizeof(block_hq2) * (n_per_row / QK_K);
         case 34: return sizeof(block_tq1_0) * (n_per_row / QK_K);
         case 35: return sizeof(block_tq2_0) * (n_per_row / QK_K);
         case 36: return sizeof(block_f8_e4m3) * (n_per_row / QK_F8);
@@ -365,7 +367,7 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:
             return (int)(n_per_row / 32);
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35:
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38:
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
         case 23: return (int)(n_per_row / QK_K);
@@ -423,6 +425,7 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
         case 20: return sizeof(block_iq4_nl);
         case 21: return sizeof(block_iq3_s);
         case 23: return sizeof(block_iq4_xs);
+        case 38: return sizeof(block_hq2);
         case 34: return sizeof(block_tq1_0);
         case 35: return sizeof(block_tq2_0);
         case 36: return sizeof(block_f8_e4m3);
@@ -434,7 +437,7 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
 HIP_QUANT_EXPORT int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: return 256;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
         case 36: case 37: return QK_F8;
@@ -564,6 +567,11 @@ static int dispatch_quantize_kernel(
         }
         case 35: {
             hipLaunchKernelGGL(quantize_tq2_0_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
+            break;
+        }
+        case 38: {
+            hipLaunchKernelGGL(quantize_hq2_kernel, gridDim, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
             break;
         }
@@ -764,6 +772,10 @@ static int dispatch_dequantize_to_fp8_kernel(
         case 35:
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_tq2_0_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_tq2_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 38:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_hq2_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_hq2 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
             break;
         default:
             return 0;
