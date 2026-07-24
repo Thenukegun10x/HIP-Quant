@@ -3342,6 +3342,10 @@ class QuantizedLinear(nn.Module):
         if self._fp8_weight is not None:
             return
 
+        if not getattr(self, "_warmup_warned", False):
+            print(f"QuantizedLinear: quantizing {self.out_features}×{self.in_features} weight to {self.weight_format}...", end=" ", flush=True)
+            self._warmup_warned = True
+
         if self.weight_format == "fp8_e4m3":
             w = getattr(self, "weight", None)
             if w is not None:
@@ -3361,6 +3365,8 @@ class QuantizedLinear(nn.Module):
             )
             self._weight_scale = torch.tensor(1.0)
             self._weight_inv_scale = torch.tensor(1.0)
+
+        print("done")
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         self._quantize_weight(device=x.device)
@@ -3395,34 +3401,15 @@ class QuantizedLinear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, format={self.weight_format}"
 
 
-def convert_to_quantized(
+def _convert_impl(
     module: "nn.Module",
     weight_format: str = "fp8_e4m3",
     exclude: Optional[Set[type]] = None,
     allow_1d: bool = False,
-) -> "nn.Module":
-    """Recursively replace ``nn.Linear`` layers with ``QuantizedLinear``.
-
-    Weights are preserved — the float tensors are transferred to the new layer.
-
-    .. note::
-
-        ``nn.Embedding`` is never converted (lookup tables degrade badly
-        under FP8).  ``nn.LayerNorm`` and ``nn.RMSNorm`` are also skipped
-        since they operate on 1‑D weight vectors.
-
-        Set ``allow_1d=True`` to also convert small layers like biases,
-        though this is not recommended for quality.
-
-    .. code-block:: python
-
-        model = convert_to_quantized(model)  # model is now FP8-ready
-        model = model.cuda()
-        y = model(x)  # forward uses FP8 via hipBLASLt
-    """
+):
+    """Internal recursive converter — returns (converted_count, skipped_names)."""
     if exclude is None:
         exclude = set()
-    # Never convert embeddings or norm layers
     exclude.update({torch.nn.Embedding, torch.nn.LayerNorm})
     try:
         import torch.nn as nn_mod
@@ -3431,12 +3418,18 @@ def convert_to_quantized(
     except Exception:
         pass
 
+    converted = 0
+    skipped = []
+
     for name, child in module.named_children():
         if type(child) in exclude:
+            if isinstance(child, torch.nn.Module):
+                skipped.append(f"{name} ({type(child).__name__})")
             continue
         if isinstance(child, nn.Linear) and not isinstance(child, QuantizedLinear):
             if not allow_1d and (child.in_features <= 32 or child.out_features <= 32):
-                continue  # skip tiny projection layers (likely per-head dim projections)
+                skipped.append(f"{name} (Linear {child.in_features}->{child.out_features}, too small)")
+                continue
             new = QuantizedLinear(
                 child.in_features, child.out_features,
                 bias=child.bias is not None,
@@ -3446,8 +3439,33 @@ def convert_to_quantized(
             if child.bias is not None:
                 new.bias.data.copy_(child.bias.data)
             setattr(module, name, new)
+            converted += 1
         else:
-            convert_to_quantized(child, weight_format=weight_format, exclude=exclude, allow_1d=allow_1d)
+            c, s = _convert_impl(child, weight_format=weight_format, exclude=exclude, allow_1d=allow_1d)
+            converted += c
+            skipped.extend(s)
+
+    return converted, skipped
+
+
+def convert_to_quantized(
+    module: "nn.Module",
+    weight_format: str = "fp8_e4m3",
+    exclude: Optional[Set[type]] = None,
+    allow_1d: bool = False,
+) -> "nn.Module":
+    """Recursively replace ``nn.Linear`` layers with ``QuantizedLinear``.
+
+    Returns the module (mutated in-place) after printing a conversion summary.
+    """
+    converted, skipped = _convert_impl(module, weight_format=weight_format, exclude=exclude, allow_1d=allow_1d)
+    if converted > 0:
+        print(f"convert_to_quantized: {converted} Linear → QuantizedLinear", end="")
+        if skipped:
+            print(f", {len(skipped)} layer(s) kept in float32: {', '.join(skipped[:5])}", end="")
+        print()
+    else:
+        print("convert_to_quantized: no layers converted (all already QuantizedLinear or excluded)")
     return module
 
 

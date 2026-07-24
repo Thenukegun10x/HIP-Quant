@@ -96,6 +96,9 @@ __all__ = [
     "cpu_reference_quantize",
     "info",
     "demo",
+    "check",
+    "available",
+    "__version__",
     *_TORCH_EXPORTS,
 ]
 
@@ -1090,6 +1093,23 @@ def info(dll_path=None):
         print(f"\nPyTorch:              not installed")
 
     print(f"\nhip_quant version:    {__version__}")
+
+
+def available():
+    """Return True if hip_quant can run FP8 operations on this machine."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(0)
+        arch = getattr(props, "gcnArchName", "")
+        if not arch.startswith("gfx12"):
+            return False
+        from . import torch_api
+        torch_api._load_extension()
+        return True
+    except Exception:
+        return False
 
 
 _DEMO_LOADED = False
