@@ -3011,24 +3011,50 @@ def wave_attn(
 def quantize(
     x: "torch.Tensor",
     dtype: str = "e4m3",
+    scale: Union[float, "torch.Tensor", None] = None,
+    granularity: str = "per_tensor",
+    dim: int = 0,
     block_size: Optional[int] = None,
-) -> "torch.Tensor":
+):
     """Quantize a float / bfloat16 tensor to FP8.
 
-    ``dtype`` is one of ``"e4m3"``, ``"e5m2"``.
-    ``block_size`` enables blockwise quantization (default: per-tensor).
+    Parameters
+    ----------
+    x : torch.Tensor
+        float32, float16, or bfloat16 input tensor.
+    dtype : str
+        ``"e4m3"`` (default) or ``"e5m2"``.
+    scale : float, Tensor, or None
+        If None, a per‑tensor scale is computed automatically from
+        ``max(abs(x)) / max_fp8``.
+        If a float or 1‑element tensor, used as the per‑tensor scale.
+        If a tensor matching ``granularity``, used as per‑channel scales.
+    granularity : str
+        ``"per_tensor"`` — one scale for the whole tensor.
+        ``"per_channel"`` — one scale per slice along ``dim``.
+        ``"per_block"`` — blockwise (requires ``block_size``).
+    dim : int
+        Dimension for per‑channel granularity.
+    block_size : int
+        Block size for per‑block granularity (e.g. 128).
+
+    Returns
+    -------
+    If ``scale is None``: ``(x_fp8, scale)`` tuple of ``(uint8, float32)``.
+    If ``scale`` is given: just ``x_fp8`` (uint8).
 
     .. warning::
 
         Quantizing 1‑D tensors (biases, LayerNorm weights, embeddings) to FP8
-        almost always degrades model quality.  These tensors are typically small
-        and have tight dynamic ranges where FP8 rounding noise is comparable to
-        the signal.  Keep them in float16 or float32.
+        almost always degrades model quality.  You can suppress this warning
+        by setting ``HIP_QUANT_ALLOW_1D_QUANT=1``.
 
-        ``convert_to_quantized()`` automatically skips 1‑D parameters for this
-        reason.
+    Examples
+    --------
+    >>> x_fp8, scale = hip_quant.quantize(x)               # auto per-tensor
+    >>> x_fp8, scales = hip_quant.quantize(w, granularity="per_channel", dim=0)
+    >>> x_fp8 = hip_quant.quantize(x, scale=0.00223)       # explicit scale
     """
-
     # ── Safety guards ──────────────────────────────────────────────────────
     if x.dtype == torch.uint8:
         raise ValueError(
@@ -3038,34 +3064,86 @@ def quantize(
         )
     if x.numel() == 0:
         raise ValueError("quantize() received an empty tensor.")
-    if x.dim() <= 1 and x.numel() <= 4096:
+    if x.dim() <= 1 and x.numel() <= 4096 and not _env_flag("HIP_QUANT_ALLOW_1D_QUANT"):
         warnings.warn(
             f"Quantizing a {tuple(x.shape)} tensor to {dtype}.  "
             "1‑D tensors (biases, LayerNorm weights, embeddings) degrade model quality "
-            "under FP8.  Consider keeping them in float16/float32.  Set "
-            "HIP_QUANT_ALLOW_1D_QUANT=1 to suppress this warning.",
+            "under FP8.  Set HIP_QUANT_ALLOW_1D_QUANT=1 to suppress this warning.",
             stacklevel=2,
         )
-        if not _env_flag("HIP_QUANT_ALLOW_1D_QUANT"):
-            pass  # warn but proceed — user may know what they're doing
 
-    _fn = {"e4m3": quantize_e4m3, "e5m2": quantize_e5m2}
-    if block_size:
-        _fn = {"e4m3": quantize_e4m3_blockwise, "e5m2": quantize_e5m2_blockwise}
-    f = _fn.get(dtype)
-    if f is None:
-        raise ValueError(f"Unknown quantize dtype: {dtype}.  Use 'e4m3' or 'e5m2'.")
-    return f(x, block_size=block_size) if block_size else f(x)
+    if granularity not in ("per_tensor", "per_channel", "per_block"):
+        raise ValueError(
+            f"Unknown granularity: {granularity}.  Use 'per_tensor', 'per_channel', or 'per_block'."
+        )
+
+    # ── fp8 max representable magnitudes ───────────────────────────────────
+    max_fp8 = 448.0 if dtype == "e4m3" else 57344.0
+
+    _raw_quant = {"e4m3": quantize_e4m3, "e5m2": quantize_e5m2}[dtype]
+
+    compute_scale = scale is None
+    return_scale = scale is None
+
+    if granularity == "per_tensor":
+        if compute_scale:
+            amax = x.float().abs().max().clamp(min=1e-12)
+            scale = max_fp8 / amax   # multiply input UP into FP8 range
+        x_scaled = (x.float() * scale).to(x.dtype)
+        q = _raw_quant(x_scaled.contiguous())
+        return (q, scale) if return_scale else q
+
+    elif granularity == "per_channel":
+        if dim < 0:
+            dim = x.dim() + dim
+        reduce_dims = [d for d in range(x.dim()) if d != dim]
+        if compute_scale:
+            amax = x.float().abs()
+            for d in reduce_dims:
+                amax = amax.amax(dim=d, keepdim=True)
+            amax = amax.clamp(min=1e-12)
+            scale = max_fp8 / amax   # per-channel UP-scaling
+        else:
+            shape = [1] * x.dim()
+            shape[dim] = x.shape[dim]
+            scale = torch.as_tensor(scale, dtype=torch.float32, device=x.device).reshape(shape)
+        x_scaled = (x.float() * scale).to(x.dtype)
+        q = _raw_quant(x_scaled.contiguous())
+        return (q, scale) if return_scale else q
+
+    elif granularity == "per_block":
+        if not block_size:
+            raise ValueError("block_size is required for per_block granularity.")
+        _raw_block = {
+            "e4m3": quantize_e4m3_blockwise,
+            "e5m2": quantize_e5m2_blockwise,
+        }[dtype]
+        if compute_scale:
+            # Blockwise quantize computes its own scales internally
+            q = _raw_block(x.contiguous(), int(block_size))
+            # For blockwise the scale is embedded, not returned as a separate tensor currently
+            # Return just the quantized tensor
+            return q
+        else:
+            x_scaled = (x.float() * scale).to(x.dtype)
+            q = _raw_block(x_scaled.contiguous(), int(block_size))
+            return q
 
 
-def dequantize(x: "torch.Tensor") -> "torch.Tensor":
-    """Dequantize FP8 uint8 tensor back to float32 (auto-detects E4M3/E5M2).
+def dequantize(x: "torch.Tensor", scale: Union[float, "torch.Tensor", None] = None) -> "torch.Tensor":
+    """Dequantize FP8 uint8 tensor back to float32.
 
-    For MXFP4, use ``mxfp4_to_fp8`` first, then this function.
+    If ``scale`` (the UP-scaling quant multiplier) is provided it is divided
+    out during dequantization.  The convention matches ``quantize()``:
+    ``dequantize(quantize(x)[0], scale=quantize(x)[1]) ≈ x``.
     """
     if x.dtype != torch.uint8:
         raise ValueError(f"Expected uint8 (FP8) tensor, got {x.dtype}.  Nothing to dequantize.")
-    return dequantize_e4m3(x)
+    result = dequantize_e4m3(x)
+    if scale is not None:
+        scale_t = torch.as_tensor(scale, dtype=torch.float32, device=result.device)
+        result = result / scale_t
+    return result
 
 
 def check():
@@ -3269,7 +3347,10 @@ class QuantizedLinear(nn.Module):
             if w is not None:
                 if device is not None and w.device != device:
                     w = w.to(device)
-                self._fp8_weight = quantize_e4m3(w.data.contiguous().to(torch.float32))
+                self._fp8_weight, self._weight_scale = quantize(
+                    w.data.contiguous().to(torch.float32), dtype="e4m3"
+                )
+                self._weight_inv_scale = self._weight_scale.reciprocal()
                 try:
                     del self.weight
                 except AttributeError:
@@ -3278,6 +3359,8 @@ class QuantizedLinear(nn.Module):
             self._fp8_weight = dequantize_mxfp4_to_fp8(
                 self.packed_weight, self.block_scales, self.in_features
             )
+            self._weight_scale = torch.tensor(1.0)
+            self._weight_inv_scale = torch.tensor(1.0)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         self._quantize_weight(device=x.device)
@@ -3292,16 +3375,16 @@ class QuantizedLinear(nn.Module):
 
         if x.dtype == torch.uint8:
             x_fp8 = x_2d.contiguous()
-            scale_inv = None
+            input_inv_scale = 1.0
         else:
-            x_flat = x_2d.float()
-            amax = x_flat.abs().max().clamp(min=1e-6)
-            scale = 1.0 / amax
-            x_fp8 = quantize_e4m3((x_flat * scale).contiguous())
-            scale_inv = scale.reciprocal()
+            x_fp8, input_scale = quantize(x_2d.float(), dtype="e4m3")
+            input_inv_scale = float(input_scale.reciprocal().item())
 
-        scale_val = float(scale_inv.item()) if scale_inv is not None else 1.0
-        result = _hipblaslt_fp8_linear_forward_prequant(x_fp8, self._fp8_weight, bias, scale_val, 1.0, x.dtype)
+        result = _hipblaslt_fp8_linear_forward_prequant(
+            x_fp8, self._fp8_weight, bias, input_inv_scale,
+            float(getattr(self, "_weight_inv_scale", torch.tensor(1.0)).item()),
+            x.dtype,
+        )
         if result is None:
             fallback_x = dequantize_e4m3(x_fp8) * scale_val
             fallback_w = dequantize_e4m3(self._fp8_weight)
@@ -3352,8 +3435,8 @@ def convert_to_quantized(
         if type(child) in exclude:
             continue
         if isinstance(child, nn.Linear) and not isinstance(child, QuantizedLinear):
-            if not allow_1d and max(child.in_features, child.out_features) <= 256:
-                continue  # skip tiny projection layers (e.g. attention head dim projections)
+            if not allow_1d and (child.in_features <= 32 or child.out_features <= 32):
+                continue  # skip tiny projection layers (likely per-head dim projections)
             new = QuantizedLinear(
                 child.in_features, child.out_features,
                 bias=child.bias is not None,

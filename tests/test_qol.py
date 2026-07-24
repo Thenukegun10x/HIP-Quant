@@ -24,12 +24,19 @@ print(f"  layer 0 type: {type(model[0]).__name__}")
 print(f"  layer 2 type: {type(model[2]).__name__}")
 assert isinstance(model[0], hq.QuantizedLinear)
 
-print("\n=== quantize/dequantize ===")
+print("\n=== quantize/dequantize with scale ===")
 x = torch.randn(2, 4, device='cuda')
-q = hq.quantize(x, 'e4m3')
-d = hq.dequantize(q)
-cos2 = F.cosine_similarity(x.flatten(), d.flatten(), dim=0).item()
+x_fp8, scale = hq.quantize(x, 'e4m3')
+print(f"  scale: {scale.item():.6f}")
+d = hq.dequantize(x_fp8, scale=scale)
+cos2 = torch.nn.functional.cosine_similarity(x.flatten(), d.flatten(), dim=0).item()
 print(f"  cos: {cos2:.4f} {'OK' if cos2>0.99 else 'FAIL'}")
+
+# Per-channel
+w = torch.randn(128, 64, device='cuda')
+w_fp8, scales = hq.quantize(w, granularity="per_channel", dim=0)
+print(f"  per-channel scales shape: {scales.shape}  (expect [128, 1])")
+print(f"  scale range: [{scales.min().item():.6f}, {scales.max().item():.6f}]")
 
 print("\n=== attention alias ===")
 print(f"  attention is wave_attn: {hq.attention is hq.wave_attn}")

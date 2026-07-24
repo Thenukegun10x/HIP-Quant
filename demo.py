@@ -90,15 +90,16 @@ def demo_quantize():
     print(f"  Sample values:       {x[0, :4].tolist()}")
 
     print()
-    print("  Quantizing to FP8 E4M3 (uint8) ...")
-    x_fp8 = hip_quant.quantize(x, dtype="e4m3")
+    print("  Quantizing to FP8 E4M3 (uint8) with per-tensor scale ...")
+    x_fp8, scale = hip_quant.quantize(x, dtype="e4m3")
+    print(f"  Quant scale:         {scale.item():.6f}")
 
     print(f"  Quantized (fp8):     memory = {x_fp8.element_size() * x_fp8.numel()} bytes")
     print(f"  dtype:               {x_fp8.dtype}  (raw uint8 — each byte IS an FP8 value)")
 
     print()
     print("  Dequantizing back to float32 for comparison ...")
-    x_back = hip_quant.dequantize(x_fp8)
+    x_back = hip_quant.dequantize(x_fp8, scale=scale)
     error = (x - x_back).abs()
     print(f"  Max absolute error:  {error.max().item():.6f}")
     print(f"  Mean absolute error: {error.mean().item():.6f}")
@@ -171,7 +172,9 @@ def demo_linear():
     print(f"  Output shape:  {y_fp8.shape}")
 
     # Reference comparison (float32)
-    ref = torch.nn.functional.linear(x, hip_quant.dequantize(layer._fp8_weight), layer.bias)
+    ref = torch.nn.functional.linear(
+        x, hip_quant.dequantize(layer._fp8_weight, scale=layer._weight_scale), layer.bias
+    )
     cos = torch.nn.functional.cosine_similarity(y_fp8.flatten(), ref.flatten(), dim=0)
     print(f"  Cosine similarity vs float32 reference:  {cos.item():.6f}")
     print()
