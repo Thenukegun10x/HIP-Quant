@@ -94,6 +94,7 @@ __all__ = [
     "get_build_config",
     "cpu_reference_quantize",
     "info",
+    "demo",
     *_TORCH_EXPORTS,
 ]
 
@@ -1088,3 +1089,26 @@ def info(dll_path=None):
         print(f"\nPyTorch:              not installed")
 
     print(f"\nhip_quant version:    {__version__}")
+
+
+_DEMO_LOADED = False
+_DEMO_MOD = None
+
+
+def _load_demo():
+    global _DEMO_LOADED, _DEMO_MOD
+    if not _DEMO_LOADED:
+        import importlib
+        _DEMO_MOD = importlib.import_module(".demo", __package__)
+        _DEMO_LOADED = True
+    return _DEMO_MOD
+
+
+def demo(name=None):
+    """Run beginner-friendly demos of FP8 quantization, WaveAttention, MXFP4, and more.
+
+    >>> import hip_quant
+    >>> hip_quant.demo()               # run all demos
+    >>> hip_quant.demo("attention")     # run attention demo only
+    """
+    _load_demo().run(name)
