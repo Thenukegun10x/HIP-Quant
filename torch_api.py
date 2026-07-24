@@ -2992,8 +2992,223 @@ def wave_attn(
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# High-Level QoL API — production-ready wrappers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def quantize(
+    x: "torch.Tensor",
+    dtype: str = "e4m3",
+    block_size: Optional[int] = None,
+) -> "torch.Tensor":
+    """Quantize a float / bfloat16 tensor to FP8.
+
+    ``dtype`` is one of ``"e4m3"``, ``"e5m2"``.
+    ``block_size`` enables blockwise quantization (default: per-tensor).
+    """
+    _fn = {"e4m3": quantize_e4m3, "e5m2": quantize_e5m2}
+    if block_size:
+        _fn = {"e4m3": quantize_e4m3_blockwise, "e5m2": quantize_e5m2_blockwise}
+    f = _fn.get(dtype)
+    if f is None:
+        raise ValueError(f"Unknown quantize dtype: {dtype}")
+    return f(x, block_size=block_size) if block_size else f(x)
 
 
+def dequantize(x: "torch.Tensor") -> "torch.Tensor":
+    """Dequantize FP8 uint8 tensor back to float32 (auto-detects E4M3/E5M2).
+
+    For MXFP4, use ``mxfp4_to_fp8`` first, then this function.
+    """
+    if x.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 tensor, got {x.dtype}")
+    return dequantize_e4m3(x)
+
+
+attention = wave_attn  # alias for cleaner API
+
+
+def mxfp4_to_fp8(
+    packed_values: "torch.Tensor",
+    block_scales: "torch.Tensor",
+    n_per_row: Optional[int] = None,
+) -> "torch.Tensor":
+    """Convert MXFP4 packed weights to FP8 E4M3.
+
+    Raises RuntimeWarning once per session (emulation path).
+    """
+    if n_per_row is None:
+        if packed_values.ndim == 2:
+            n_per_row = int(packed_values.shape[1]) * 2
+        else:
+            raise ValueError("n_per_row required for non-2D packed input")
+    return dequantize_mxfp4_to_fp8(packed_values, block_scales, n_per_row)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QuantizedLinear — drop-in nn.Linear replacement
+# ═══════════════════════════════════════════════════════════════════════════
+
+class QuantizedLinear(nn.Module):
+    """Drop-in replacement for ``nn.Linear`` with automatic FP8 / MXFP4 quantization.
+
+    Weight is stored in its native format and quantized lazily on first forward.
+
+    Parameters
+    ----------
+    in_features, out_features : int
+    bias : bool
+        Include a bias term (stored in float32).
+    weight_format : str
+        ``"fp8_e4m3"`` — quantize float weight to E4M3 (default).
+        ``"mxfp4"`` — pre-packed MXFP4 weight.
+    pre_quantized : bool
+        If True, the weight passed to ``__init__`` is already FP8 uint8.
+
+    Examples
+    --------
+    >>> layer = QuantizedLinear(4096, 14336)
+    >>> y = layer(x)  # weight auto-quantized, input auto-quantized
+
+    >>> # Pre-quantized weight
+    >>> layer = QuantizedLinear(4096, 14336, pre_quantized=True)
+    >>> layer.weight_fp8 = my_fp8_weight
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        weight_format: str = "fp8_e4m3",
+        pre_quantized: bool = False,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_format = weight_format
+        self._fp8_weight = None
+        self._fp8_bias = None
+
+        if weight_format == "fp8_e4m3":
+            self.weight = nn.Parameter(torch.empty(out_features, in_features), requires_grad=False)
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        elif weight_format == "mxfp4":
+            self.register_buffer("packed_weight", torch.empty(1), persistent=True)
+            self.register_buffer("block_scales", torch.empty(1), persistent=True)
+        else:
+            raise ValueError(f"Unknown weight_format: {weight_format}")
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features), requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+
+        self._pre_quantized = pre_quantized
+
+    @classmethod
+    def from_mxfp4(
+        cls,
+        packed_weight: "torch.Tensor",
+        block_scales: "torch.Tensor",
+        bias: Optional["torch.Tensor"] = None,
+    ) -> "QuantizedLinear":
+        """Create from pre-packed MXFP4 weight and scales."""
+        n_per_row = int(packed_weight.shape[1]) * 2
+        out_features = packed_weight.shape[0]
+        layer = cls(n_per_row, out_features, bias=bias is not None, weight_format="mxfp4")
+        layer.packed_weight = packed_weight.contiguous().to(layer.packed_weight.device)
+        layer.block_scales = block_scales.contiguous().to(layer.block_scales.device)
+        if bias is not None:
+            layer.bias.data = bias.contiguous().to(layer.bias.device)
+        return layer
+
+    def _quantize_weight(self, device=None):
+        if self._fp8_weight is not None:
+            return
+
+        if self.weight_format == "fp8_e4m3":
+            w = getattr(self, "weight", None)
+            if w is not None:
+                if device is not None and w.device != device:
+                    w = w.to(device)
+                self._fp8_weight = quantize_e4m3(w.data.contiguous().to(torch.float32))
+                try:
+                    del self.weight
+                except AttributeError:
+                    pass
+        elif self.weight_format == "mxfp4":
+            self._fp8_weight = dequantize_mxfp4_to_fp8(
+                self.packed_weight, self.block_scales, self.in_features
+            )
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        self._quantize_weight(device=x.device)
+
+        # Move bias to input device if needed
+        bias = self.bias
+        if bias is not None and bias.device != x.device:
+            bias = bias.to(x.device)
+
+        *batch, in_dim = x.shape
+        x_2d = x.reshape(-1, in_dim)
+
+        if x.dtype == torch.uint8:
+            x_fp8 = x_2d.contiguous()
+            scale_inv = None
+        else:
+            x_flat = x_2d.float()
+            amax = x_flat.abs().max().clamp(min=1e-6)
+            scale = 1.0 / amax
+            x_fp8 = quantize_e4m3((x_flat * scale).contiguous())
+            scale_inv = scale.reciprocal()
+
+        scale_val = float(scale_inv.item()) if scale_inv is not None else 1.0
+        result = _hipblaslt_fp8_linear_forward_prequant(x_fp8, self._fp8_weight, bias, scale_val, 1.0, x.dtype)
+        if result is None:
+            fallback_x = dequantize_e4m3(x_fp8) * scale_val
+            fallback_w = dequantize_e4m3(self._fp8_weight)
+            result = F.linear(fallback_x, fallback_w, bias)
+        return result.reshape(*batch, self.out_features)
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, format={self.weight_format}"
+
+
+def convert_to_quantized(
+    module: "nn.Module",
+    weight_format: str = "fp8_e4m3",
+    exclude: Optional[Set[type]] = None,
+) -> "nn.Module":
+    """Recursively replace ``nn.Linear`` layers with ``QuantizedLinear``.
+
+    Weights are preserved — the float tensors are transferred to the new layer.
+
+    .. code-block:: python
+
+        model = convert_to_quantized(model)  # model is now FP8-ready
+        model = model.cuda()
+        y = model(x)  # forward uses FP8 via hipBLASLt
+    """
+    if exclude is None:
+        exclude = set()
+
+    for name, child in module.named_children():
+        if type(child) in exclude:
+            continue
+        if isinstance(child, nn.Linear) and not isinstance(child, QuantizedLinear):
+            new = QuantizedLinear(
+                child.in_features, child.out_features,
+                bias=child.bias is not None,
+                weight_format=weight_format,
+            )
+            new.weight.data.copy_(child.weight.data)
+            if child.bias is not None:
+                new.bias.data.copy_(child.bias.data)
+            setattr(module, name, new)
+        else:
+            convert_to_quantized(child, weight_format=weight_format, exclude=exclude)
+    return module
 
 
 

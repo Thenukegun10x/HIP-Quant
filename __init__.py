@@ -6,7 +6,14 @@ import sys
 __version__ = "0.13.1"
 
 _TORCH_EXPORTS = {
-    # ── Quantization / dequantization ──────────────────────
+    # ── High-Level QoL API ─────────────────────────────────
+    "quantize",
+    "dequantize",
+    "attention",
+    "mxfp4_to_fp8",
+    "QuantizedLinear",
+    "convert_to_quantized",
+    # ── Quantization / dequantization (low-level) ──────────
     "quantize_e4m3",
     "quantize_e5m2",
     "quantize_e4m3_transpose",
