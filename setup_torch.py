@@ -102,6 +102,10 @@ ext = CUDAExtension(
         "torch_ext/fp8_linear_kernels_v2.hip",
         "torch_ext/q_to_fp8_kernels.hip",
         "torch_ext/mxfp4_to_fp8_kernels.hip",
+        "torch_ext/hq2_linear_kernels.hip",
+        "torch_ext/hq3_linear_kernels.hip",
+        "torch_ext/hq8_g128_linear_kernels.hip",
+        "torch_ext/wave_attn.hip",
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags
@@ -129,7 +133,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.6.1",
+    version="0.12.0",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

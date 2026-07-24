@@ -25,6 +25,7 @@ GGML_TYPE = {
     "IQ4_NL": 20,
     "IQ3_S": 21,
     "IQ4_XS": 23,
+    "HQ2": 38,
 }
 
 GGML_TYPE_NAME = {v: k for k, v in GGML_TYPE.items()}
@@ -48,6 +49,7 @@ GGML_TYPE_BLOCK_SIZE = {
     20: 32,
     21: 256,
     23: 256,
+    38: 256,
 }
 
 GGML_TYPE_BLOCK_BYTES = {
@@ -69,6 +71,7 @@ GGML_TYPE_BLOCK_BYTES = {
     20: 18,
     21: 110,
     23: 136,
+    38: 72,
 }
 
 IMATRIX_REQUIRED_TYPES = {16, 17, 19}
@@ -129,6 +132,20 @@ class HipQuant:
             ctypes.c_int64,
             ctypes.POINTER(ctypes.c_float),
         ]
+        try:
+            self._quantize_tensor_hq2_iters = self._dll.quantize_tensor_hq2_iters
+            self._quantize_tensor_hq2_iters.restype = ctypes.c_size_t
+            self._quantize_tensor_hq2_iters.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+            ]
+        except AttributeError:
+            self._quantize_tensor_hq2_iters = None
         self._dll.ggml_type_size_for.restype = ctypes.c_size_t
         self._dll.ggml_type_size_for.argtypes = [ctypes.c_int]
         self._dll.ggml_blck_size_for.restype = ctypes.c_size_t
@@ -145,7 +162,11 @@ class HipQuant:
     @property
     def device_name(self):
         raw = self._dll.get_device_name()
-        return raw.decode("utf-8", errors="replace") if raw else "unknown"
+        if not raw:
+            raise RuntimeError(
+                "HIP device initialization failed; check HIP_VISIBLE_DEVICES and HIP_QUANT_DEVICE"
+            )
+        return raw.decode("utf-8", errors="replace")
 
     @property
     def device_count(self):
@@ -173,7 +194,8 @@ class HipQuant:
     def output_shape(self, type_id, nrows, n_per_row):
         return (int(nrows), self.row_size(type_id, int(n_per_row)))
 
-    def quantize_numpy(self, arr, type_id, imatrix=None, require_imatrix=True):
+    def quantize_numpy(self, arr, type_id, imatrix=None, require_imatrix=True,
+                       hq2_iterations=4):
         arr = self._prepare_array(arr)
         type_num = normalize_type(type_id)
         nrows, n_per_row = arr.shape
@@ -182,15 +204,19 @@ class HipQuant:
 
         out_nbytes = self.output_nbytes(type_num, nrows, n_per_row)
         dst = np.empty(out_nbytes, dtype=np.uint8)
-        self._quantize_into(arr, type_num, dst, imatrix)
+        self._quantize_into(arr, type_num, dst, imatrix, hq2_iterations)
         return dst
 
-    def quantize_rows(self, arr, type_id, imatrix=None, require_imatrix=True):
+    def quantize_rows(self, arr, type_id, imatrix=None, require_imatrix=True,
+                      hq2_iterations=4):
         arr = self._prepare_array(arr)
-        out = self.quantize_numpy(arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix)
+        out = self.quantize_numpy(arr, type_id, imatrix=imatrix,
+                                  require_imatrix=require_imatrix,
+                                  hq2_iterations=hq2_iterations)
         return out.reshape(self.output_shape(type_id, arr.shape[0], arr.shape[1]))
 
-    def quantize_numpy_to(self, arr, type_id, dst, imatrix=None, require_imatrix=True):
+    def quantize_numpy_to(self, arr, type_id, dst, imatrix=None, require_imatrix=True,
+                          hq2_iterations=4):
         arr = self._prepare_array(arr)
         type_num = normalize_type(type_id)
         nrows, n_per_row = arr.shape
@@ -202,24 +228,40 @@ class HipQuant:
             raise ValueError(f"dst must have dtype uint8, got {dst.dtype}")
         if not dst.flags.c_contiguous:
             raise ValueError("dst must be C-contiguous")
+        if not dst.flags.writeable:
+            raise ValueError("dst must be writable")
         expected = self.output_nbytes(type_num, nrows, n_per_row)
         if dst.size != expected:
             raise ValueError(f"dst has {dst.size} bytes, expected {expected}")
-        return self._quantize_into(arr, type_num, dst.reshape(-1), imatrix)
+        return self._quantize_into(arr, type_num, dst.reshape(-1), imatrix, hq2_iterations)
 
-    def quantize_to_file(self, arr, type_id, path, imatrix=None, require_imatrix=True):
-        out = self.quantize_numpy(arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix)
+    def quantize_to_file(self, arr, type_id, path, imatrix=None, require_imatrix=True,
+                         hq2_iterations=4):
+        out = self.quantize_numpy(arr, type_id, imatrix=imatrix,
+                                  require_imatrix=require_imatrix,
+                                  hq2_iterations=hq2_iterations)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(out.tobytes())
         return path
 
-    def _quantize_into(self, arr, type_num, dst, imatrix):
+    def _quantize_into(self, arr, type_num, dst, imatrix, hq2_iterations=4):
         src_ptr = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         dst_ptr = dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if imatrix is not None else None
         nrows, n_per_row = arr.shape
-        result = self._dll.quantize_tensor(type_num, src_ptr, dst_ptr, nrows, n_per_row, im_ptr)
+        if type_num == GGML_TYPE["HQ2"] and hq2_iterations != 4:
+            if not 1 <= int(hq2_iterations) <= 16:
+                raise ValueError("hq2_iterations must be in [1, 16]")
+            if self._quantize_tensor_hq2_iters is None:
+                raise RuntimeError(
+                    "Loaded hip_quantize library does not support configurable HQ2 iterations; rebuild it"
+                )
+            result = self._quantize_tensor_hq2_iters(
+                type_num, src_ptr, dst_ptr, nrows, n_per_row, im_ptr, int(hq2_iterations)
+            )
+        else:
+            result = self._dll.quantize_tensor(type_num, src_ptr, dst_ptr, nrows, n_per_row, im_ptr)
         if result != dst.size:
             raise RuntimeError(f"quantize_tensor returned {result} bytes, expected {dst.size}")
         return dst
@@ -273,9 +315,13 @@ def get_hip_quant(dll_path=None):
     return _default_instance
 
 
-def quantize(arr, type_id, imatrix=None, require_imatrix=True):
-    return get_hip_quant().quantize_numpy(arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix)
+def quantize(arr, type_id, imatrix=None, require_imatrix=True, hq2_iterations=4):
+    return get_hip_quant().quantize_numpy(
+        arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix,
+        hq2_iterations=hq2_iterations)
 
 
-def quantize_rows(arr, type_id, imatrix=None, require_imatrix=True):
-    return get_hip_quant().quantize_rows(arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix)
+def quantize_rows(arr, type_id, imatrix=None, require_imatrix=True, hq2_iterations=4):
+    return get_hip_quant().quantize_rows(
+        arr, type_id, imatrix=imatrix, require_imatrix=require_imatrix,
+        hq2_iterations=hq2_iterations)

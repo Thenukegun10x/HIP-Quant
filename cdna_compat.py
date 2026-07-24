@@ -222,7 +222,7 @@ def _fp16_to_fp32(h: int) -> float:
     return -val if sign else val
 
 
-def _quantize_block_hq2(values: np.ndarray, weights=None) -> bytes:
+def _quantize_block_hq2(values: np.ndarray, weights=None, iterations: int = 4) -> bytes:
     """HQ2: 256-element block, 4-level importance-weighted learned codebook.
 
     Mirrors kernels/quant_hq2.cu. Returns 72 bytes:
@@ -230,6 +230,8 @@ def _quantize_block_hq2(values: np.ndarray, weights=None) -> bytes:
       8..71  : 64 bytes, 2-bit indices (4 per byte)
     """
     assert len(values) == 256
+    if iterations < 1:
+        raise ValueError(f"HQ2 iterations must be positive, got {iterations}")
     x = values.astype(np.float64)
     if weights is None:
         w = np.ones_like(x)
@@ -239,7 +241,7 @@ def _quantize_block_hq2(values: np.ndarray, weights=None) -> bytes:
     if amax < 1e-12:
         return bytes(72)
     levels = np.array([-amax, -amax / 3.0, amax / 3.0, amax], dtype=np.float64)
-    for _ in range(4):
+    for _ in range(iterations):
         diff = x[:, None] - levels[None, :]
         c = np.argmin(diff * diff, axis=1)
         for cc in range(4):
@@ -287,7 +289,97 @@ def _dequantize_hq2(packed: np.ndarray, n_per_row: int) -> np.ndarray:
     return out
 
 
-def cpu_reference_quantize(arr: np.ndarray, type_name: str, imatrix=None) -> np.ndarray:
+# -------------------------------------------------------------------------
+# HQ2-Scaled: per-block (mean, scale) + 4 INT8 shape offsets.
+# Layout (72 bytes, same budget as HQ2):
+#   0..1   : FP16 block mean  mu
+#   2..3   : FP16 block scale  d = max|x - mu|
+#   4..7   : 4 x INT8 offsets o_k in [-127,127]; level_k = mu + d*(o_k/127)
+#   8..71  : 64 bytes, 2-bit indices (4 per byte)
+# The 4 levels now describe the block's *shape* (variation around mu), so the
+# 2-bit indices spend their capacity on within-block structure, not on re-encoding
+# the block's DC offset / magnitude. Weights are rarely zero-mean per block, so
+# this concentrates the codebook where it earns its bits.
+# -------------------------------------------------------------------------
+
+def _quantize_block_hq2_scaled(values: np.ndarray, weights=None) -> bytes:
+    assert len(values) == 256
+    x = values.astype(np.float64)
+    if weights is None:
+        w = np.ones_like(x)
+    else:
+        w = np.clip(weights.astype(np.float64), 0.0, None)
+    if float(np.max(np.abs(x))) < 1e-12:
+        return bytes(72)
+    mu = float(np.mean(x))
+    xc = x - mu
+    d = float(np.max(np.abs(xc)))
+    if d < 1e-12:
+        d = 1e-12
+    off = np.array([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float64)
+    for _ in range(4):
+        levels = mu + d * off
+        diff = x[:, None] - levels[None, :]
+        c = np.argmin(diff * diff, axis=1)
+        for cc in range(4):
+            mask = c == cc
+            wc = float(w[mask].sum())
+            if wc > 0.0:
+                rel = (x[mask] - mu) / d
+                off[cc] = float((w[mask] * rel).sum()) / wc
+    off = np.clip(off, -1.0, 1.0)
+    levels = mu + d * off
+    diff = x[:, None] - levels[None, :]
+    c = np.argmin(diff * diff, axis=1)
+    o_int = np.clip(np.round(off * 127.0), -127, 127).astype(np.int32)
+    out = bytearray(72)
+    out[0:2] = struct.pack("<H", _fp32_to_fp16(mu))
+    out[2:4] = struct.pack("<H", _fp32_to_fp16(d))
+    for cc in range(4):
+        out[4 + cc] = o_int[cc] & 0xFF
+    for i in range(256):
+        out[8 + (i >> 2)] |= (int(c[i]) & 3) << (2 * (i & 3))
+    return bytes(out)
+
+
+def _dequantize_block_hq2_scaled(block_bytes) -> np.ndarray:
+    assert len(block_bytes) == 72
+    bb = bytes(block_bytes)
+    mu = _fp16_to_fp32(int.from_bytes(bb[0:2], "little"))
+    d = _fp16_to_fp32(int.from_bytes(bb[2:4], "little"))
+    offs = []
+    for cc in range(4):
+        b = bb[4 + cc]
+        if b > 127:
+            b -= 256
+        offs.append(b / 127.0)
+    out = np.zeros(256, dtype=np.float64)
+    for i in range(256):
+        byte = block_bytes[8 + (i >> 2)]
+        ci = (byte >> (2 * (i & 3))) & 3
+        out[i] = mu + d * offs[ci]
+    return out.astype(np.float32)
+
+
+def _dequantize_hq2_scaled(packed: np.ndarray, n_per_row: int) -> np.ndarray:
+    packed = np.ascontiguousarray(packed, dtype=np.uint8).reshape(-1)
+    if packed.size % 72 != 0:
+        raise ValueError("packed size not a multiple of HQ2-Scaled block (72 bytes)")
+    n_blocks_per_row = n_per_row // 256
+    n_blocks = packed.size // 72
+    nrows = n_blocks // n_blocks_per_row
+    out = np.zeros((nrows, n_per_row), dtype=np.float32)
+    for k in range(n_blocks):
+        row = k // n_blocks_per_row
+        col = k % n_blocks_per_row
+        out[row, col * 256:(col + 1) * 256] = _dequantize_block_hq2_scaled(
+            packed[k * 72:(k + 1) * 72])
+    return out
+
+
+def cpu_reference_quantize(arr: np.ndarray, type_name: str, imatrix=None,
+                           hq2_iterations: int = 4,
+                           aq2_iterations: int = 8) -> np.ndarray:
     """CPU reference quantization for a types that have a simple block structure.
     
     Useful for:
@@ -297,8 +389,10 @@ def cpu_reference_quantize(arr: np.ndarray, type_name: str, imatrix=None) -> np.
     
     Args:
         arr: float32 array (1D or 2D)
-        type_name: e.g. "Q4_0", "Q8_0", "HQ2" (must be in GGML_TYPE)
+        type_name: e.g. "Q4_0", "Q8_0", "HQ2", or "AQ2" (must be in GGML_TYPE)
         imatrix: optional float32 importance matrix (same shape as arr)
+        hq2_iterations: weighted Lloyd iterations for HQ2 (default: 4)
+        aq2_iterations: attention-calibrated Lloyd iterations for AQ2 (default: 8)
     
     Returns:
         uint8 numpy array of quantized bytes
@@ -333,11 +427,19 @@ def cpu_reference_quantize(arr: np.ndarray, type_name: str, imatrix=None) -> np.
             elif type_name == "Q8_0":
                 out.extend(_quantize_block_q8_0(block_vals))
             elif type_name == "HQ2":
-                out.extend(_quantize_block_hq2(block_vals, block_w))
+                out.extend(_quantize_block_hq2(
+                    block_vals, block_w, iterations=hq2_iterations))
+            elif type_name in {"AQ2", "AQ2_QK", "AQ2_VO"}:
+                # AQ2 has the same physical block contract as HQ2.  The
+                # attention-specific part is the calibrated per-weight map
+                # supplied through imatrix; the CPU path intentionally mirrors
+                # the ROCm codebook fit for offline validation.
+                out.extend(_quantize_block_hq2(
+                    block_vals, block_w, iterations=aq2_iterations))
             else:
                 raise NotImplementedError(
                     f"CPU reference not implemented for {type_name}. "
-                    f"Supported: Q4_0, Q8_0, HQ2"
+                    f"Supported: Q4_0, Q8_0, HQ2, AQ2, AQ2_QK, AQ2_VO"
                 )
     
     out_arr = np.frombuffer(bytes(out), dtype=np.uint8)

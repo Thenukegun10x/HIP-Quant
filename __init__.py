@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.6.1"
+__version__ = "0.12.0"
 
 _TORCH_EXPORTS = {
     "quantize_e4m3",
@@ -42,6 +42,13 @@ _TORCH_EXPORTS = {
     "dequantize_q_to_e5m2",
     "dequantize_mxfp4_to_fp8",
     "mxfp4_linear_forward",
+    "rocm_attn_v0",
+    "rocm_attn_v1",
+    "rocm_attn_v2",
+    "rocm_attn_v3",
+    "rocm_attn_v5",
+    "rocm_attn_v6",
+    "rocm_attn_v7",
     "native_mxfp4_contract",
     "native_mxfp4_capability",
     "native_mxfp4_linear_forward",
@@ -106,6 +113,9 @@ GGML_TYPE = {
     "TQ1_0": 34,
     "TQ2_0": 35,
     "HQ2": 38,
+    "AQ2": 39,
+    "AQ2_QK": 40,
+    "AQ2_VO": 41,
     "F8_E4M3": 36,
     "F8_E5M2": 37,
 }
@@ -132,6 +142,9 @@ GGML_TYPE_BLOCK_SIZE = {
     34: 256,
     35: 256,
     38: 256,
+    39: 256,
+    40: 256,
+    41: 256,
     36: 32,
     37: 32,
 }
@@ -158,6 +171,9 @@ GGML_TYPE_BLOCK_BYTES = {
     34: 54,
     35: 66,
     38: 72,
+    39: 72,
+    40: 72,
+    41: 72,
     36: 32,
     37: 32,
 }
@@ -245,6 +261,34 @@ class HipQuant:
             ctypes.c_int64,
             ctypes.POINTER(ctypes.c_float),
         ]
+        try:
+            self._quantize_tensor_hq2_iters = self._dll.quantize_tensor_hq2_iters
+            self._quantize_tensor_hq2_iters.restype = ctypes.c_size_t
+            self._quantize_tensor_hq2_iters.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+            ]
+        except AttributeError:
+            self._quantize_tensor_hq2_iters = None
+        try:
+            self._quantize_tensor_aq2_iters = self._dll.quantize_tensor_aq2_iters
+            self._quantize_tensor_aq2_iters.restype = ctypes.c_size_t
+            self._quantize_tensor_aq2_iters.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+            ]
+        except AttributeError:
+            self._quantize_tensor_aq2_iters = None
         self._dll.quantize_tensor_fp8_input.restype = ctypes.c_size_t
         self._dll.quantize_tensor_fp8_input.argtypes = [
             ctypes.c_int,
@@ -290,6 +334,12 @@ class HipQuant:
         self._dll.get_device_count.restype = ctypes.c_int
         self._dll.get_device_count.argtypes = []
         try:
+            self._get_selected_device = self._dll.get_selected_device
+            self._get_selected_device.restype = ctypes.c_int
+            self._get_selected_device.argtypes = []
+        except AttributeError:
+            self._get_selected_device = None
+        try:
             self._get_arch_name = self._dll.get_arch_name
             self._get_arch_name.restype = ctypes.c_int
             self._get_arch_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
@@ -301,6 +351,21 @@ class HipQuant:
             self._get_hip_runtime_version.argtypes = []
         except AttributeError:
             self._get_hip_runtime_version = None
+        try:
+            self._benchmark_quantize_kernel = self._dll.benchmark_quantize_kernel
+            self._benchmark_quantize_kernel.restype = ctypes.c_int
+            self._benchmark_quantize_kernel.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+            ]
+        except AttributeError:
+            self._benchmark_quantize_kernel = None
         self._dll.fp8_gemm_test_wmma.restype = ctypes.c_int
         self._dll.fp8_gemm_test_wmma.argtypes = [
             ctypes.POINTER(ctypes.c_uint8),
@@ -343,8 +408,20 @@ class HipQuant:
         return self._dll.get_device_count()
 
     @property
+    def selected_device(self):
+        """HIP device index selected by the native library, or -1 if unavailable."""
+        if self._get_selected_device is None:
+            return -1
+        return int(self._get_selected_device())
+
+    @property
     def device_name(self):
-        return self._dll.get_device_name().decode("utf-8")
+        raw = self._dll.get_device_name()
+        if not raw:
+            raise RuntimeError(
+                "HIP device initialization failed; check HIP_VISIBLE_DEVICES and HIP_QUANT_DEVICE"
+            )
+        return raw.decode("utf-8", errors="replace")
 
     @property
     def gcn_arch(self):
@@ -503,13 +580,17 @@ class HipQuant:
             }.get(ret, "None"),
         }
 
-    def quantize_numpy(self, arr, type_num, imatrix=None):
+    def quantize_numpy(self, arr, type_num, imatrix=None, hq2_iterations=4,
+                       aq2_iterations=8):
         """Quantize a float32 numpy array to the given GGML type.
 
         Args:
             arr: 2-D float32 numpy array (nrows, n_per_row) or 1-D.
             type_num: GGML type number (use GGML_TYPE dict).
             imatrix: Optional importance matrix (same shape as arr).
+            hq2_iterations: Lloyd iterations for HQ2 (1-16; default 4).
+            aq2_iterations: Lloyd iterations for AQ2 (1-16; default 8).
+                AQ2 should normally use an attention-derived imatrix.
 
         Returns:
             np.uint8 array of quantized bytes.
@@ -535,34 +616,139 @@ class HipQuant:
             if imatrix.shape != arr.shape:
                 raise ValueError(f"imatrix shape {imatrix.shape} != arr shape {arr.shape}")
             im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        result = self._dll.quantize_tensor(
-            int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
-        )
+        if int(type_num) in {GGML_TYPE["AQ2"], GGML_TYPE["AQ2_QK"], GGML_TYPE["AQ2_VO"]}:
+            if not 1 <= int(aq2_iterations) <= 16:
+                raise ValueError("aq2_iterations must be in [1, 16]")
+            if self._quantize_tensor_aq2_iters is None:
+                raise RuntimeError(
+                    "Loaded hip_quantize library does not support AQ2; rebuild it"
+                )
+            result = self._quantize_tensor_aq2_iters(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr, int(aq2_iterations)
+            )
+        elif int(type_num) == GGML_TYPE["HQ2"] and hq2_iterations != 4:
+            if not 1 <= int(hq2_iterations) <= 16:
+                raise ValueError("hq2_iterations must be in [1, 16]")
+            if self._quantize_tensor_hq2_iters is None:
+                raise RuntimeError(
+                    "Loaded hip_quantize library does not support configurable HQ2 iterations; rebuild it"
+                )
+            result = self._quantize_tensor_hq2_iters(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr, int(hq2_iterations)
+            )
+        else:
+            result = self._dll.quantize_tensor(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
+            )
         if result != out_nbytes:
             raise RuntimeError(
                 f"Quantize returned {result} bytes, expected {out_nbytes}"
             )
         return dst
 
-    def quantize_numpy_to(self, arr, type_num, dst, imatrix=None):
+    def benchmark_quantize_kernel(
+        self, arr, type_num, hq2_iterations=4, warmup_iterations=10, timed_iterations=50
+    ):
+        """Return average HIP-event kernel time in milliseconds.
+
+        Host-to-device copies, allocations, output copies, and optional
+        importance weights are deliberately excluded.  This is for a fair
+        baseline comparison of the native quantization kernels.
+        """
+        if self._benchmark_quantize_kernel is None:
+            raise RuntimeError(
+                "Loaded hip_quantize library does not support kernel benchmarking; rebuild it"
+            )
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2:
+            raise ValueError("arr must be a 1-D or 2-D float32 array")
+        nrows, n_per_row = arr.shape
+        block_size = self.blck_size(type_num)
+        if block_size <= 0:
+            raise ValueError(f"Unsupported type: {type_num}")
+        if n_per_row % block_size != 0:
+            raise ValueError(
+                f"n_per_row ({n_per_row}) must be multiple of block size ({block_size})"
+            )
+        if int(type_num) == GGML_TYPE["HQ2"] and not 1 <= int(hq2_iterations) <= 16:
+            raise ValueError("hq2_iterations must be in [1, 16]")
+        if int(warmup_iterations) < 0 or int(timed_iterations) < 1:
+            raise ValueError("warmup_iterations must be >= 0 and timed_iterations must be >= 1")
+
+        average_ms = ctypes.c_float()
+        result = self._benchmark_quantize_kernel(
+            int(type_num),
+            arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            nrows,
+            n_per_row,
+            int(hq2_iterations),
+            int(warmup_iterations),
+            int(timed_iterations),
+            ctypes.byref(average_ms),
+        )
+        if result != 0:
+            raise RuntimeError("Native quantization kernel benchmark failed")
+        return float(average_ms.value)
+
+    def quantize_numpy_to(self, arr, type_num, dst, imatrix=None, hq2_iterations=4,
+                          aq2_iterations=8):
         """Quantize into a pre-allocated uint8 buffer. Modifies dst in-place."""
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
         nrows, n_per_row = arr.shape
+        block_size = self.blck_size(type_num)
+        if block_size <= 0:
+            raise ValueError(f"Unsupported type: {type_num}")
+        if n_per_row % block_size != 0:
+            raise ValueError(
+                f"n_per_row ({n_per_row}) must be multiple of block size ({block_size})"
+            )
+        out_nbytes = nrows * (self.type_size(type_num) * (n_per_row // block_size))
+        if not isinstance(dst, np.ndarray):
+            raise TypeError("dst must be a writable C-contiguous numpy array")
+        if dst.dtype != np.uint8 or not dst.flags.c_contiguous or not dst.flags.writeable:
+            raise ValueError("dst must be a writable C-contiguous uint8 numpy array")
+        if dst.size != out_nbytes:
+            raise ValueError(
+                f"dst has {dst.size} bytes, expected {out_nbytes} for type {type_num}"
+            )
         src_ptr = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         dst_ptr = dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         im_ptr = None
         if imatrix is not None:
             imatrix = np.ascontiguousarray(imatrix, dtype=np.float32)
+            if imatrix.shape != arr.shape:
+                raise ValueError(f"imatrix shape {imatrix.shape} != arr shape {arr.shape}")
             im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        result = self._dll.quantize_tensor(
-            int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
-        )
-        if result != len(dst):
-            raise RuntimeError(
-                f"Quantize returned {result} bytes, buffer has {len(dst)}"
+        if int(type_num) in {GGML_TYPE["AQ2"], GGML_TYPE["AQ2_QK"], GGML_TYPE["AQ2_VO"]}:
+            if not 1 <= int(aq2_iterations) <= 16:
+                raise ValueError("aq2_iterations must be in [1, 16]")
+            if self._quantize_tensor_aq2_iters is None:
+                raise RuntimeError(
+                    "Loaded hip_quantize library does not support AQ2; rebuild it"
+                )
+            result = self._quantize_tensor_aq2_iters(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr, int(aq2_iterations)
             )
+        elif int(type_num) == GGML_TYPE["HQ2"] and hq2_iterations != 4:
+            if not 1 <= int(hq2_iterations) <= 16:
+                raise ValueError("hq2_iterations must be in [1, 16]")
+            if self._quantize_tensor_hq2_iters is None:
+                raise RuntimeError(
+                    "Loaded hip_quantize library does not support configurable HQ2 iterations; rebuild it"
+                )
+            result = self._quantize_tensor_hq2_iters(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr, int(hq2_iterations)
+            )
+        else:
+            result = self._dll.quantize_tensor(
+                int(type_num), src_ptr, dst_ptr, nrows, n_per_row, im_ptr
+            )
+        if result != out_nbytes:
+            raise RuntimeError(f"Quantize returned {result} bytes, expected {out_nbytes}")
         return dst
 
     def quantize_from_fp8(self, arr_fp8, type_num, imatrix=None, source_format="E4M3"):
@@ -717,8 +903,10 @@ def get_hip_quant(dll_path=None):
     return _default_instance
 
 
-def quantize(arr, type_num):
-    return get_hip_quant().quantize_numpy(arr, type_num)
+def quantize(arr, type_num, imatrix=None, hq2_iterations=4, aq2_iterations=8):
+    return get_hip_quant().quantize_numpy(
+        arr, type_num, imatrix=imatrix, hq2_iterations=hq2_iterations,
+        aq2_iterations=aq2_iterations)
 
 
 def bf16_to_fp32(values, *, shape=None):
@@ -819,18 +1007,24 @@ def get_build_config(target="auto"):
     return build_config_for_arch(target)
 
 
-def cpu_reference_quantize(arr, type_name):
+def cpu_reference_quantize(arr, type_name, imatrix=None, hq2_iterations=4,
+                           aq2_iterations=8):
     """CPU-based reference quantization for testing without a GPU.
 
     Args:
         arr: float32 numpy array
         type_name: str like "Q4_0", "Q8_0"
+        imatrix: optional float32 importance matrix
+        hq2_iterations: Lloyd iterations for HQ2 (default 4)
+        aq2_iterations: Lloyd iterations for AQ2 (default 8)
 
     Returns:
         uint8 numpy array
     """
     from .cdna_compat import cpu_reference_quantize as _cpu_ref
-    return _cpu_ref(arr, type_name)
+    return _cpu_ref(
+        arr, type_name, imatrix=imatrix, hq2_iterations=hq2_iterations,
+        aq2_iterations=aq2_iterations)
 
 
 def __getattr__(name):

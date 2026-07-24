@@ -523,9 +523,9 @@ void dequant_hq2_to_fp8_kernel(
     const int block = blockIdx.y;
     const int i = threadIdx.x;
     if (row >= nrows || block >= blocks_per_row || i >= HQ2_K) return;
-    const block_hq2 q = src[row * blocks_per_row + block];
+    const block_hq2 * q = src + row * blocks_per_row + block;
 
-    const int c = (q.qs[i >> 2] >> (2 * (i & 3))) & 3;
-    const float val = fp16_to_fp32(q.levels[c]);
+    const int c = (q->qs[i >> 2] >> (2 * (i & 3))) & 3;
+    const float val = fp16_to_fp32(q->levels[c]);
     dst[row * n_per_row + block * HQ2_K + i] = fp32_to_output_fp8<E5M2>(val);
 }

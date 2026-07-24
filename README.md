@@ -7,6 +7,7 @@
     <img alt="RDNA3" src="https://img.shields.io/badge/RDNA3-gfx1100%20%7C%20gfx1101%20%7C%20gfx1102%20%7C%20gfx1103-0096FF"/>
     <img alt="CDNA" src="https://img.shields.io/badge/CDNA-gfx90a%20%7C%20gfx942-purple"/>
     <img alt="BF16 FP16" src="https://img.shields.io/badge/PyTorch-BF16%20%7C%20FP16-green"/>
+    <img alt="FP8" src="https://img.shields.io/badge/Attention-FP8%20WMMA-orange"/>
     <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white"/>
     <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.9%2BROCm-EE4C2C?logo=pytorch"/>
   </p>
@@ -20,6 +21,255 @@ It ships **two independent APIs** that can be used together or separately:
 |---|---|---|
 | **NumPy / ctypes** (offline) | Offline GGUF-format quantization via packaged DLL | ROCm runtime, numpy |
 | **PyTorch extension** (training) | GPU-resident FP8 training ops with full autograd | PyTorch 2.x + ROCm, built `_C` extension |
+
+## WaveAttention: Native FP8 Flash Attention for RDNA4
+
+`wave_attn` is a FP8 WMMA flash attention kernel that bypasses AOTriton entirely.
+It calls `v_wmma_f32_16x16x16_fp8_fp8` directly — the native RDNA4 FP8 matrix
+multiply instruction — instead of the 1200-instruction software FP8 decode path
+that AOTriton v2 uses.
+
+```python
+import torch
+import torch_api as hip_quant
+
+q = torch.randn(4, 8, 256, 64, device="cuda")
+k = torch.randn(4, 8, 256, 64, device="cuda")
+v = torch.randn(4, 8, 256, 64, device="cuda")
+
+out = hip_quant.wave_attn(q, k, v)  # FP8 WMMA, 3-8x faster than SDPA
+```
+
+**Key features:**
+- Native `v_wmma_f32_16x16x16_fp8_fp8` (real FP8 hardware, not emulated)
+- `fast_expf` via `__builtin_exp2f` (replaces software exp, ~6x faster)
+- Parallel K/V tile loads (split threads, 2x load throughput)
+- Adaptive tile selection (Q_TILE 16-128, K_TILE 64-128)
+- Online softmax with warp-level shuffle reduction
+- Multi-split parallelism for low-occupancy configs
+
+## HQ2 and HQ3: portable learned-codebook quantization
+
+`hq2` is the public, backend-neutral API for the HQ2 format: each 256-weight
+block stores four FP16 reconstruction values plus a two-bit selector for each
+weight, for an exact physical cost of **2.25 bits per weight**.  The packed
+72-byte blocks have one stable little-endian layout, so data quantized on one
+backend can be decoded on another.
+
+```python
+import numpy as np
+import hq2
+
+weights = np.random.randn(4096, 4096).astype(np.float32)
+packed = hq2.quantize(weights, importance=np.abs(weights), backend="cpu")
+assert packed.bits_per_weight == 2.25
+
+# Portable bytes + metadata; this file can be read on any supported backend.
+packed.save("weights.hq2.npz")
+restored = hq2.load("weights.hq2.npz").dequantize()
+
+# Or copy the same packed blocks to an available Torch CUDA/ROCm device.
+gpu_packed = hq2.load("weights.hq2.npz").to("cuda")
+gpu_restored = gpu_packed.dequantize()
+```
+
+HQ3 is the higher-fidelity companion format. It keeps 256-weight blocks but
+stores eight learned FP16 reconstruction values and 3-bit selectors packed as
+eight selectors in three bytes: **112 bytes / 3.5 bpw**. Use it for
+quality-sensitive projections in a calibrated mixed HQ2/HQ3 model.
+
+```python
+hq3 = hq2.quantize(weights, backend="cpu", format="hq3", iterations=4)
+assert hq3.bits_per_weight == 3.5
+```
+
+For a model conversion, use the HQ-native `.hq2` container rather than a
+generic compressed archive.  It stores the packed HQ2 blocks in their direct
+GEMV layout: uncompressed, 4 KiB-aligned, and indexed by tensor name.  Its
+compact footer index lets payloads begin at the first 4 KiB page rather than
+after a reserved metadata region.  Loading a layer memory-maps its packed
+bytes; it never repeats quantization.
+
+```python
+hq2.save_model(
+    "Gemma-12B-HQ2.hq2",
+    {"model.layers.0.mlp.up_proj.weight": packed},
+    metadata={"architecture": "gemma", "quantization": "HQ2"},
+)
+model_weights = hq2.load_model("Gemma-12B-HQ2.hq2")
+up_proj = model_weights.tensor("model.layers.0.mlp.up_proj.weight").to("cuda")
+```
+
+### HQ archive family contract
+
+`.hq2` is the current conventional extension for an HQ2-only model, but the
+v2 archive envelope is intentionally **HQ-family**, not HQ2-only.  Every
+tensor stores a descriptor with its format name/version, exact block shape,
+bits per weight, byte order/packing identifier, and optional codec parameters.
+That means HQ1 or a later HQ3 revision can use a different physical packing
+and kernel while coexisting with HQ2 layers in the same direct-loadable
+archive. `.hq`,
+`.hq1`, `.hq2`, and `.hq3` are accepted archive suffixes; the descriptor—not
+the filename—selects the decoder.
+
+```python
+import hq2
+
+hq3 = hq2.quantize(np.random.randn(4096, 4096).astype(np.float32), format="hq3")
+with hq2.HQModelWriter("mixed.hq") as archive:
+    archive.add("layer.hq2.weight", packed)       # canonical HQ2
+    archive.add("layer.hq3.weight", hq3)           # canonical HQ3
+```
+
+The Python runtime executes canonical HQ2 and HQ3. On ROCm, `HQ2Linear` and
+`HQ3Linear` have direct packed-weight kernels; other Torch devices use a
+correct decode-plus-linear fallback. Unknown family payloads remain safely
+inspectable through `model.descriptor()` and `model.payload()`. First-generation
+HQ2-only v1 archives, including the existing Gemma conversion, stay readable.
+They can be rewritten to the compact v2 layout with no dequantization or re-quantization:
+
+```python
+hq2.repack_model("Gemma-12B-HQ2-v1.hq2", "Gemma-12B-HQ2-v2.hq2")
+```
+
+### Analyze an HQ archive
+
+`analyze_model()` is the HQ equivalent of a GGUF inspector.  It validates the
+container index, reports model metadata, per-format and per-tensor BPW,
+payload/container overhead, direct-load offsets, and the calibration settings
+recorded during conversion. A deep scan samples up to 2 MiB from every HQ2 or
+HQ3 tensor, checking stored centroids for NaN/Inf and reporting selector use
+and zero blocks. The report explicitly says whether a result is sampled or full;
+`--sha256` additionally fingerprints every complete payload—without decoding
+a full BF16 model.
+
+```powershell
+# Compact human report; add --tensors to print every layer.
+python -m hq2 analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2"
+
+# Installed-wheel shortcut for the same report.
+hq2-analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2"
+
+# Complete machine-readable catalogue record plus physical codec scans.
+python -m hq2 analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" --deep --sha256 --json
+```
+
+```python
+import hq2
+
+report = hq2.analyze_model("Gemma-12B-HQ2.hq2", deep=True)
+print(hq2.render_analysis(report))
+catalogue_json = report.to_json()
+```
+
+The analyzer deeply validates canonical HQ2/HQ3 payloads and reports unknown
+future HQ-family descriptors without pretending to decode them.
+
+On ROCm, `HQ2Linear` and `HQ3Linear` perform real packed-weight inference
+rather than dequantizing an entire layer: their HIP GEMV kernels read the
+selector and FP16 centroid inside the multiply and accumulate directly into
+the output.
+
+```python
+import hq2
+
+weight = hq2.load_model("Gemma-12B-HQ2.hq2").tensor("model.layers.0.mlp.up_proj.weight")
+layer = hq2.HQ2Linear.from_archive(weight).to("cuda")
+output = layer(hidden_states)  # fused ROCm path when hip_quant._C is built
+```
+
+The repository includes a streamed Gemma converter.  Its default
+`gemma-mlp` profile is intentionally HQ2-specific: it packs only language MLP
+projections in the direct `HQ2Linear` layout, preserves the higher-quality
+hybrid strategy used in the evaluation, and leaves embeddings/norms and other
+nonlinear model components in the base BF16 checkpoint.
+
+```powershell
+python tools\quantize_hq2_model.py `
+  --input "Own Quant\Gemma4-12B-it\model.safetensors" `
+  --output "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
+  --profile gemma-mlp --backend rocm --iterations 8 `
+  --imatrix "Own Quant\experimental\gemma4_12b_hq2_l8_mixed_imat\imatrix.npz"
+```
+
+For the Gemma 4 MLP archive, the library can construct the actual hybrid
+Transformers model on ROCm.  It installs all archive MLP layers as fused
+`HQ2Linear` modules and streams the remaining base BF16 tensors to the GPU;
+the original BF16 MLP matrices are skipped entirely.
+
+```python
+import hq2
+
+model = hq2.load_gemma4_hq2(
+    "Own Quant/Gemma4-12B-it",
+    "Own Quant/Gemma4-12B-HQ2-MLP-L8-IMAT.hq2",
+)
+```
+
+### Standalone download-ready HQ2 package
+
+The hybrid archive above is deliberately small, but it needs the original
+checkpoint for non-MLP weights.  Build a standalone package when distributing
+a model: it stores the MLP projections as HQ2 and preserves every remaining
+tensor losslessly as typed `RAW` payloads in the same `model.hq2` archive.
+The package directory also contains the Gemma config, tokenizer, and chat
+template—recipients do **not** need `model.safetensors`.
+
+```powershell
+python tools\package_gemma4_hq2.py `
+  --base "Own Quant\Gemma4-12B-it" `
+  --hq2 "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
+  --output "Own Quant\Gemma4-12B-HQ2-Standalone"
+```
+
+```python
+import hq2
+
+model = hq2.load_gemma4_hq2_package("Gemma4-12B-HQ2-Standalone")
+```
+
+Or use the included inference entrypoint (the first run only loads existing
+BF16/HQ2 data; it never quantizes the model again):
+
+```powershell
+python tools\run_gemma_hq2.py `
+  --base "Own Quant\Gemma4-12B-it" `
+  --archive "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
+  --prompt "Explain why the sky is blue." --max-new-tokens 64
+```
+
+The backends are deliberately explicit:
+
+| Backend | Input | Current state |
+|---|---|---|
+| `cpu` | NumPy array | Portable reference implementation; no GPU dependency. |
+| `rocm` | NumPy array | Existing optimized HIP kernel. Validated locally on RX 9070 XT. |
+| `torch` | Torch tensor | Functional Torch implementation on CPU, CUDA, or ROCm; preserves device residency. ROCm is validated locally; CUDA needs validation on an NVIDIA system. |
+| `cuda` / `rocm-torch` | Torch tensor | Same Torch implementation, with an assertion that the supplied tensor is on the requested platform. |
+| `vulkan` | — | Reserved API name only; there is no SPIR-V kernel yet, and it fails clearly instead of silently using another backend. |
+
+```python
+import torch
+import hq2
+
+weights = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+packed = hq2.quantize(weights, backend="torch", iterations=8)
+reconstructed = packed.dequantize(dtype=torch.bfloat16)
+```
+
+The generic Torch implementation is the correctness and portability baseline,
+not the final performance implementation.  It uses standard Torch operations,
+so the same source can be tested on CUDA and ROCm immediately.  Fused CUDA,
+HIP, and Vulkan kernels can consume the same HQ2/HQ3 block bytes later without a
+format change.  Inspect the actual availability with `hq2.backend_status()`.
+
+To run the intentional CUDA/ROCm integration test on a machine with a visible
+Torch accelerator, use:
+
+```powershell
+$env:HQ2_TEST_GPU = "1"
+python -m pytest tests\test_hq2_portable.py -m gpu -q
+```
 
 ## Hardware Status
 

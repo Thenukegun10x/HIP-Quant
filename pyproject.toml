@@ -4,16 +4,41 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "0.6.1"
-description = "HIP/ROCm quantization library for AMD GPUs"
+version = "0.13.0"
+description = "GPU tensor quantization library for AMD ROCm. Native FP8 WMMA attention, HQ2/HQ3 learned-codebook formats, and portable HIP/ROCm kernels for RDNA3, RDNA4, and CDNA."
 readme = "README.md"
+license = { file = "LICENSE" }
 authors = [
-  { name="Your Name", email="your.email@example.com" }
+  { name = "Thenukegun10x", email = "conormorris84@gmail.com" }
+]
+keywords = ["quantization", "gpu", "hip", "rocm", "amd", "fp8", "wmma", "attention", "pytorch", "ggml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
 ]
 requires-python = ">=3.8"
 dependencies = [
     "numpy"
 ]
+
+[project.urls]
+Homepage = "https://github.com/Thenukegun10x/hip_quant"
+Documentation = "https://github.com/Thenukegun10x/hip_quant/blob/main/README.md"
+Source = "https://github.com/Thenukegun10x/hip_quant"
+Issues = "https://github.com/Thenukegun10x/hip_quant/issues"
 
 [project.optional-dependencies]
 torch = [
@@ -22,9 +47,10 @@ torch = [
 
 [project.scripts]
 hip-quant = "hip_quant.__main__:main"
+hq2-analyze = "hq2.__main__:analyzer_main"
 
 [tool.setuptools]
-packages = ["hip_quant"]
+packages = ["hip_quant", "hq2"]
 # All runtime assets are declared explicitly below.  Avoid deriving package
 # data from MANIFEST.in: every asset directory is importable as a Python
 # namespace package, which otherwise produces ambiguous-package warnings.
@@ -32,6 +58,7 @@ include-package-data = false
 
 [tool.setuptools.package-dir]
 "hip_quant" = "."
+"hq2" = "hq2"
 
 [tool.setuptools.package-data]
 "hip_quant" = [
@@ -56,4 +83,9 @@ include-package-data = false
     "setup_torch.py",
     "tests/*.py",
     "tests/torch/*.py",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires an intentional HQ2_TEST_GPU=1 GPU test run",
 ]

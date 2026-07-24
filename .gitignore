@@ -46,3 +46,41 @@ venv.bak/
 # Tracked test files live under tests/ and tests/torch/ — keep them tracked
 tests/__pycache__/
 tests/.pytest_cache/
+tests/torch/__pycache__/
+tools/__pycache__/
+src/hip_quant/__pycache__/
+__pycache__/
+
+# Compiled extension / build outputs (regenerable; real runtime DLLs are whitelisted above)
+*.pyd
+!_C.cp312-win_amd64.pyd
+*.obj
+*.bc
+*.hsaco
+*.o
+*.a
+
+# Debug / scratch dump directories
+debug_dump/
+codebooks/
+
+# Separately-versioned vendored copy of llama.cpp + benchmark outputs (not part of this repo)
+Own Quant/
+
+# Packaging / install leftovers
+*.whl
+*.tar.gz
+*.tar
+/dist_*/
+/upload_*/
+/dist*/
+
+# HuggingFace model download cache
+.cache/
+.hf_cache/
+
+# Stray model weights / checkpoints
+*.safetensors
+/model.safetensors
+SmolLM2-135M/
+

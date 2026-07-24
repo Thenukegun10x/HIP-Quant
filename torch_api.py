@@ -413,12 +413,18 @@ def _load_extension() -> object:
     try:
         from hip_quant import _C as _ext  # type: ignore[attr-defined]
         _C = _ext
-    except ImportError as exc:
-        raise ImportError(
-            "hip_quant._C extension not found. "
-            "Build it first with:\n"
-            "  python setup_torch.py build_ext --inplace"
-        ) from exc
+    except ImportError:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import _C as _ext
+            _C = _ext
+        except ImportError as exc:
+            raise ImportError(
+                "hip_quant._C extension not found. "
+                "Build it first with:\n"
+                "  python setup_torch.py build_ext --inplace"
+            ) from exc
     return _C
 
 
@@ -2952,3 +2958,45 @@ class Adafactor(torch.optim.Optimizer):
                     p.copy_(p_f32)
 
         return loss
+
+
+def wave_attn(
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    v: "torch.Tensor",
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> "torch.Tensor":
+    """
+    WaveAttention: Native FP8 WMMA flash attention forward kernel for AMD GFX12 (RDNA4).
+    Fast-exp, parallel K/V tile loads, adaptive Q/K tile selection.
+    Bypasses AOTriton entirely — uses v_wmma_f32_16x16x16_fp8_fp8 directly.
+    Expects q, k, v as FP8 uint8 tensors (or float32/float16/bfloat16 tensors auto-quantized).
+    """
+    _require_gfx12_fp8_wmma(q)
+
+    if scale is None:
+        scale = 1.0 / (q.size(-1) ** 0.5)
+
+    q_fp8 = q if q.dtype == torch.uint8 else quantize_e4m3(q)
+    k_fp8 = k if k.dtype == torch.uint8 else quantize_e4m3(k)
+    v_fp8 = v if v.dtype == torch.uint8 else quantize_e4m3(v)
+
+    return _load_extension().wave_attn_forward(
+        q_fp8.contiguous(),
+        k_fp8.contiguous(),
+        v_fp8.contiguous(),
+        float(scale),
+        1.0, 1.0, 1.0,
+        bool(is_causal),
+    )
+
+
+
+
+
+
+
+
+
+

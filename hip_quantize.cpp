@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <ctype.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -39,6 +40,7 @@
 #include "kernels/quant_tq1_0.cu"
 #include "kernels/quant_tq2_0.cu"
 #include "kernels/quant_hq2.cu"
+#include "kernels/quant_aq2.cu"
 #include "kernels/quant_f8_e4m3.cu"
 #include "kernels/quant_f8_e5m2.cu"
 #include "kernels/fp8_expand.cu"
@@ -255,14 +257,30 @@ static bool ensure_initialized() {
             fprintf(stderr, "hip_quantize: no HIP devices available\n");
             return false;
         }
-        device_id = 0;
-        int best_cu = 0;
-        for (int i = 0; i < count; i++) {
-            hipDeviceProp_t p;
-            if (!hip_check(hipGetDeviceProperties(&p, i), "hipGetDeviceProperties")) return false;
-            if (p.multiProcessorCount > best_cu) {
-                best_cu = p.multiProcessorCount;
-                device_id = i;
+        const char *requested = getenv("HIP_QUANT_DEVICE");
+        if (requested && requested[0]) {
+            char *end = NULL;
+            const long parsed = strtol(requested, &end, 10);
+            while (end && *end && isspace((unsigned char)*end)) ++end;
+            if (end == requested || (end && *end) || parsed < 0 || parsed >= count) {
+                fprintf(stderr,
+                        "hip_quantize: HIP_QUANT_DEVICE must be a visible device index in [0, %d), got '%s'\n",
+                        count, requested);
+                return false;
+            }
+            device_id = (int)parsed;
+        } else {
+            // HIP_VISIBLE_DEVICES is applied by the runtime before this point.
+            // Among the remaining devices, prefer the one with most compute units.
+            device_id = 0;
+            int best_cu = 0;
+            for (int i = 0; i < count; i++) {
+                hipDeviceProp_t p;
+                if (!hip_check(hipGetDeviceProperties(&p, i), "hipGetDeviceProperties")) return false;
+                if (p.multiProcessorCount > best_cu) {
+                    best_cu = p.multiProcessorCount;
+                    device_id = i;
+                }
             }
         }
         if (!hip_check(hipSetDevice(device_id), "hipSetDevice")) return false;
@@ -355,6 +373,7 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 21: return sizeof(block_iq3_s) * (n_per_row / QK_K);
         case 23: return sizeof(block_iq4_xs) * (n_per_row / QK_K);
         case 38: return sizeof(block_hq2) * (n_per_row / QK_K);
+        case 39: case 40: case 41: return sizeof(block_aq2) * (n_per_row / QK_K);
         case 34: return sizeof(block_tq1_0) * (n_per_row / QK_K);
         case 35: return sizeof(block_tq2_0) * (n_per_row / QK_K);
         case 36: return sizeof(block_f8_e4m3) * (n_per_row / QK_F8);
@@ -367,7 +386,7 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:
             return (int)(n_per_row / 32);
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38:
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: case 39: case 40: case 41:
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
         case 23: return (int)(n_per_row / QK_K);
@@ -376,9 +395,32 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     }
 }
 
-static bool validate_quant_dims(int64_t nrows, int64_t n_per_row, int n_blocks_per_row) {
+static int get_block_size_for_type(int type) {
+    switch (type) {
+        case 2: case 3: case 6: case 7: case 8: case 9:
+        case 20: case 36: case 37:
+            return 32;
+        case 10: case 11: case 12: case 13: case 14:
+        case 16: case 17: case 18: case 19: case 21:
+        case 23: case 34: case 35: case 38: case 39: case 40: case 41:
+            return 256;
+        default:
+            return 0;
+    }
+}
+
+static bool validate_quant_dims(
+    int type, int64_t nrows, int64_t n_per_row, int n_blocks_per_row
+) {
+    int block_size = get_block_size_for_type(type);
     if (nrows <= 0 || n_per_row <= 0 || n_blocks_per_row <= 0) {
         fprintf(stderr, "hip_quantize: dimensions must be positive\n");
+        return false;
+    }
+    if (block_size <= 0 || n_per_row % block_size != 0) {
+        fprintf(stderr,
+            "hip_quantize: n_per_row (%lld) must be a multiple of block size (%d)\n",
+            (long long)n_per_row, block_size);
         return false;
     }
     if (nrows > INT_MAX || n_per_row > INT_MAX || n_blocks_per_row > INT_MAX) {
@@ -426,6 +468,7 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
         case 21: return sizeof(block_iq3_s);
         case 23: return sizeof(block_iq4_xs);
         case 38: return sizeof(block_hq2);
+        case 39: case 40: case 41: return sizeof(block_aq2);
         case 34: return sizeof(block_tq1_0);
         case 35: return sizeof(block_tq2_0);
         case 36: return sizeof(block_f8_e4m3);
@@ -437,7 +480,7 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
 HIP_QUANT_EXPORT int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: return 256;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: case 39: case 40: case 41: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
         case 36: case 37: return QK_F8;
@@ -465,7 +508,7 @@ HIP_QUANT_EXPORT const char* get_device_name() {
 
 static int dispatch_quantize_kernel(
     int type, float *d_src, uint8_t *d_dst, float *d_imatrix,
-    int nrows, int n_per_row, int n_blocks_per_row
+    int nrows, int n_per_row, int n_blocks_per_row, int hq2_iterations
 ) {
     dim3 gridDim((unsigned int)nrows, (unsigned int)n_blocks_per_row);
 
@@ -572,7 +615,22 @@ static int dispatch_quantize_kernel(
         }
         case 38: {
             hipLaunchKernelGGL(quantize_hq2_kernel, gridDim, 256, 0, 0,
-                d_src, d_dst, d_imatrix, nrows, n_per_row);
+                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
+            break;
+        }
+        case 39: {
+            hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
+            break;
+        }
+        case 40: {
+            hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
+            break;
+        }
+        case 41: {
+            hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
             break;
         }
         case 36: {
@@ -777,6 +835,12 @@ static int dispatch_dequantize_to_fp8_kernel(
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_hq2_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_hq2 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
             break;
+        case 39: case 40: case 41:
+            // AQ2 has the same physical block layout as HQ2, so it can use
+            // the existing decoder until a fused AQ2 inference path exists.
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_hq2_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_hq2 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
         default:
             return 0;
     }
@@ -790,18 +854,23 @@ static int dispatch_dequantize_to_fp8_kernel(
 // quantize_tensor — standard F32 input path
 // ============================================================
 
-HIP_QUANT_EXPORT size_t quantize_tensor(
+static size_t quantize_tensor_impl(
     int type,
     const float* src,
     uint8_t* dst,
     int64_t nrows,
     int64_t n_per_row,
-    const float* imatrix
+    const float* imatrix,
+    int hq2_iterations
 ) {
     if (!ensure_initialized()) return 0;
+    if ((type == 38 || type == 39 || type == 40 || type == 41) && (hq2_iterations < 1 || hq2_iterations > 16)) {
+        fprintf(stderr, "hip_quantize: HQ2/AQ2 iterations must be in [1, 16], got %d\n", hq2_iterations);
+        return 0;
+    }
 
     int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
-    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
+    if (!validate_quant_dims(type, nrows, n_per_row, n_blocks_per_row)) return 0;
 
     size_t row_size = get_row_size(type, n_per_row);
     if (row_size == 0) {
@@ -847,7 +916,8 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
-    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
+    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL,
+                                  (int)nrows, (int)n_per_row, n_blocks_per_row, hq2_iterations)) {
         return 0;
     }
 
@@ -868,6 +938,141 @@ HIP_QUANT_EXPORT size_t quantize_tensor(
     }
 
     return total_size;
+}
+
+// Existing ABI: retain the original four Lloyd iterations for HQ2.
+HIP_QUANT_EXPORT size_t quantize_tensor(
+    int type,
+    const float* src,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix
+) {
+    return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, 4);
+}
+
+// HQ2-only extended ABI.  This keeps a runtime quality/speed control without
+// changing any existing quantize_tensor callers.
+HIP_QUANT_EXPORT size_t quantize_tensor_hq2_iters(
+    int type,
+    const float* src,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix,
+    int hq2_iterations
+) {
+    if (type != 38) {
+        fprintf(stderr, "hip_quantize: quantize_tensor_hq2_iters only supports HQ2 (type 38)\n");
+        return 0;
+    }
+    return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, hq2_iterations);
+}
+
+// AQ2 extended ABI.  AQ2 uses the same iteration control as HQ2 but has a
+// separate entry point so callers cannot accidentally treat an AQ2 tensor as
+// an ordinary HQ2 calibration result.
+HIP_QUANT_EXPORT size_t quantize_tensor_aq2_iters(
+    int type,
+    const float* src,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix,
+    int aq2_iterations
+) {
+    if (type != 39 && type != 40 && type != 41) {
+        fprintf(stderr, "hip_quantize: quantize_tensor_aq2_iters only supports AQ2/AQ2_QK/AQ2_VO (types 39-41)\n");
+        return 0;
+    }
+    return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, aq2_iterations);
+}
+
+// Kernel-only quantization timing for diagnostics and format comparisons.
+// Source upload and buffer allocation occur before the first HIP event, so the
+// returned time covers direct kernel launches only.  It intentionally accepts
+// no importance matrix: the benchmark is meant to compare the baseline
+// format kernels under identical conditions.
+HIP_QUANT_EXPORT int benchmark_quantize_kernel(
+    int type,
+    const float* src,
+    int64_t nrows,
+    int64_t n_per_row,
+    int hq2_iterations,
+    int warmup_iterations,
+    int timed_iterations,
+    float* average_ms
+) {
+    if (!src || !average_ms || warmup_iterations < 0 || timed_iterations < 1) {
+        fprintf(stderr, "hip_quantize: invalid kernel benchmark arguments\n");
+        return 1;
+    }
+    if (!ensure_initialized()) return 1;
+    if ((type == 38 || type == 39 || type == 40 || type == 41) && (hq2_iterations < 1 || hq2_iterations > 16)) {
+        fprintf(stderr, "hip_quantize: HQ2/AQ2 iterations must be in [1, 16], got %d\n", hq2_iterations);
+        return 1;
+    }
+
+    const int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
+    if (!validate_quant_dims(type, nrows, n_per_row, n_blocks_per_row)) return 1;
+    const size_t dst_bytes = get_row_size(type, n_per_row) * (size_t)nrows;
+    const size_t src_bytes = (size_t)nrows * (size_t)n_per_row * sizeof(float);
+    if (dst_bytes == 0 || src_bytes == 0) return 1;
+
+    if (src_bytes > g_d_src_cap) {
+        if (g_d_src) hipFree(g_d_src);
+        if (!hip_check(hipMalloc(&g_d_src, src_bytes), "hipMalloc(benchmark source)")) return 1;
+        g_d_src_cap = src_bytes;
+    }
+    if (dst_bytes > g_d_dst_cap) {
+        if (g_d_dst) hipFree(g_d_dst);
+        if (!hip_check(hipMalloc(&g_d_dst, dst_bytes), "hipMalloc(benchmark destination)")) return 1;
+        g_d_dst_cap = dst_bytes;
+    }
+    if (!hip_check(hipMemcpy(g_d_src, src, src_bytes, hipMemcpyHostToDevice),
+                   "hipMemcpy(benchmark source)") ||
+        !hip_check(hipMemset(g_d_dst, 0, dst_bytes), "hipMemset(benchmark destination)")) {
+        return 1;
+    }
+
+    for (int i = 0; i < warmup_iterations; ++i) {
+        if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, NULL,
+                                      (int)nrows, (int)n_per_row, n_blocks_per_row,
+                                      hq2_iterations)) {
+            return 1;
+        }
+    }
+    if (!hip_check(hipGetLastError(), "benchmark warmup kernel launch") ||
+        !hip_check(hipDeviceSynchronize(), "benchmark warmup synchronize")) {
+        return 1;
+    }
+
+    hipEvent_t start = NULL;
+    hipEvent_t stop = NULL;
+    if (!hip_check(hipEventCreate(&start), "hipEventCreate(benchmark start)") ||
+        !hip_check(hipEventCreate(&stop), "hipEventCreate(benchmark stop)")) {
+        if (start) hipEventDestroy(start);
+        if (stop) hipEventDestroy(stop);
+        return 1;
+    }
+    bool ok = hip_check(hipEventRecord(start), "hipEventRecord(benchmark start)");
+    for (int i = 0; ok && i < timed_iterations; ++i) {
+        ok = dispatch_quantize_kernel(type, g_d_src, g_d_dst, NULL,
+                                      (int)nrows, (int)n_per_row, n_blocks_per_row,
+                                      hq2_iterations) != 0;
+    }
+    if (ok) ok = hip_check(hipGetLastError(), "benchmark timed kernel launch");
+    if (ok) ok = hip_check(hipEventRecord(stop), "hipEventRecord(benchmark stop)");
+    if (ok) ok = hip_check(hipEventSynchronize(stop), "hipEventSynchronize(benchmark stop)");
+
+    float total_ms = 0.0f;
+    if (ok) ok = hip_check(hipEventElapsedTime(&total_ms, start, stop), "hipEventElapsedTime(benchmark)");
+    hipEventDestroy(start);
+    hipEventDestroy(stop);
+    if (!ok) return 1;
+    *average_ms = total_ms / (float)timed_iterations;
+    return 0;
 }
 
 // ============================================================
@@ -899,7 +1104,7 @@ static size_t quantize_tensor_fp8_input_impl(
     if (!ensure_initialized()) return 0;
 
     int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
-    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
+    if (!validate_quant_dims(type, nrows, n_per_row, n_blocks_per_row)) return 0;
 
     size_t row_size = get_row_size(type, n_per_row);
     if (row_size == 0) {
@@ -1018,7 +1223,8 @@ static size_t quantize_tensor_fp8_input_impl(
         if (e != hipSuccess) { fprintf(stderr, "hip_quantize: hipMemset failed: %s\n", hipGetErrorString(e)); return 0; }
     }
 
-    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL, (int)nrows, (int)n_per_row, n_blocks_per_row)) {
+    if (!dispatch_quantize_kernel(type, g_d_src, g_d_dst, imatrix ? g_d_imatrix : NULL,
+                                  (int)nrows, (int)n_per_row, n_blocks_per_row, 4)) {
         return 0;
     }
 
@@ -1134,7 +1340,7 @@ HIP_QUANT_EXPORT size_t dequantize_tensor_to_fp8(
     if (!ensure_initialized()) return 0;
 
     int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
-    if (!validate_quant_dims(nrows, n_per_row, n_blocks_per_row)) return 0;
+    if (!validate_quant_dims(type, nrows, n_per_row, n_blocks_per_row)) return 0;
 
     size_t row_size = get_row_size(type, n_per_row);
     if (row_size == 0) {
@@ -1528,6 +1734,13 @@ HIP_QUANT_EXPORT int get_arch_name(char *buf, int buf_size) {
     strncpy(buf, props.gcnArchName, (size_t)(buf_size - 1));
     buf[buf_size - 1] = '\0';
     return 0;
+}
+
+// Selected device index after HIP_QUANT_DEVICE / automatic selection.  The
+// index is relative to HIP_VISIBLE_DEVICES when that environment variable is
+// set before the process starts.
+HIP_QUANT_EXPORT int get_selected_device() {
+    return ensure_initialized() ? device_id : -1;
 }
 
 HIP_QUANT_EXPORT int get_hip_runtime_version() {

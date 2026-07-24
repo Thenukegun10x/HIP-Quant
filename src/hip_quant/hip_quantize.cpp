@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 
 #include "kernels/quant_q4_0.cu"
 #include "kernels/quant_q4_1.cu"
@@ -22,6 +23,7 @@
 #include "kernels/quant_iq4_xs.cu"
 #include "kernels/quant_iq3_xxs.cu"
 #include "kernels/quant_iq3_s.cu"
+#include "kernels/quant_hq2.cu"
 #include "hip_quant_iq2xxs_data.h"
 #include "hip_quant_iq2xs_data.h"
 #include "hip_quant_iq1s_data.h"
@@ -57,6 +59,46 @@ static int8_t *d_iq3s_grid_data = NULL;
 static int *d_iq3s_map_data = NULL;
 static uint16_t *d_iq3s_neighbours_data = NULL;
 
+static bool initialize_hip() {
+    if (hip_initialized) return true;
+
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count <= 0) {
+        fprintf(stderr, "hip_quantize: no HIP devices available\n");
+        return false;
+    }
+    const char *requested = getenv("HIP_QUANT_DEVICE");
+    if (requested && requested[0]) {
+        char *end = NULL;
+        const long parsed = strtol(requested, &end, 10);
+        while (end && *end && isspace((unsigned char)*end)) ++end;
+        if (end == requested || (end && *end) || parsed < 0 || parsed >= count) {
+            fprintf(stderr,
+                    "hip_quantize: HIP_QUANT_DEVICE must be a visible device index in [0, %d), got '%s'\n",
+                    count, requested);
+            return false;
+        }
+        device_id = (int)parsed;
+    } else {
+        device_id = 0;
+        int best_cu = 0;
+        for (int i = 0; i < count; ++i) {
+            hipDeviceProp_t p;
+            if (hipGetDeviceProperties(&p, i) != hipSuccess) return false;
+            if (p.multiProcessorCount > best_cu) {
+                best_cu = p.multiProcessorCount;
+                device_id = i;
+            }
+        }
+    }
+    if (hipSetDevice(device_id) != hipSuccess ||
+        hipGetDeviceProperties(&props, device_id) != hipSuccess) {
+        return false;
+    }
+    hip_initialized = true;
+    return true;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -81,6 +123,7 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 20: return sizeof(block_iq4_nl) * (n_per_row / QK4_NL);
         case 21: return sizeof(block_iq3_s) * (n_per_row / QK_K);
         case 23: return sizeof(block_iq4_xs) * (n_per_row / QK_K);
+        case 38: return sizeof(block_hq2) * (n_per_row / QK_K);
         default: return 0;
     }
 }
@@ -92,8 +135,20 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
         case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21:
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
-        case 23: return (int)(n_per_row / QK_K);
+        case 23: case 38: return (int)(n_per_row / QK_K);
         default: return 0;
+    }
+}
+
+static int get_block_size_for_type(int type) {
+    switch (type) {
+        case 2: case 3: case 6: case 7: case 8: case 9: case 20:
+            return 32;
+        case 10: case 11: case 12: case 13: case 14:
+        case 16: case 17: case 18: case 19: case 21: case 23: case 38:
+            return 256;
+        default:
+            return 0;
     }
 }
 
@@ -117,6 +172,7 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
         case 20: return sizeof(block_iq4_nl);
         case 21: return sizeof(block_iq3_s);
         case 23: return sizeof(block_iq4_xs);
+        case 38: return sizeof(block_hq2);
         default: return 0;
     }
 }
@@ -124,7 +180,7 @@ __declspec(dllexport) size_t ggml_type_size_for(int type) {
 __declspec(dllexport) int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: return 256;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 38: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
         default: return 0;
@@ -139,52 +195,25 @@ __declspec(dllexport) size_t ggml_row_size_for(int type, int64_t n_per_row) {
 
 __declspec(dllexport) const char* get_device_name() {
     static char name[256];
-    if (!hip_initialized) {
-        int count = 0;
-        hipGetDeviceCount(&count);
-        device_id = 0;
-        int best_cu = 0;
-        for (int i = 0; i < count; i++) {
-            hipDeviceProp_t p;
-            hipGetDeviceProperties(&p, i);
-            if (p.multiProcessorCount > best_cu) {
-                best_cu = p.multiProcessorCount;
-                device_id = i;
-            }
-        }
-        hipSetDevice(device_id);
-        hipGetDeviceProperties(&props, device_id);
-        hip_initialized = true;
-    }
+    if (!initialize_hip()) return "";
     strncpy(name, props.name, 255);
     return name;
 }
 
-__declspec(dllexport) size_t quantize_tensor(
+static size_t quantize_tensor_impl(
     int type,
     const float* src,
     uint8_t* dst,
     int64_t nrows,
     int64_t n_per_row,
-    const float* imatrix
+    const float* imatrix,
+    int hq2_iterations
 ) {
-    if (!hip_initialized) {
-        int count = 0;
-        hipGetDeviceCount(&count);
-        device_id = 0;
-        int best_cu = 0;
-        for (int i = 0; i < count; i++) {
-            hipDeviceProp_t p;
-            hipGetDeviceProperties(&p, i);
-            if (p.multiProcessorCount > best_cu) {
-                best_cu = p.multiProcessorCount;
-                device_id = i;
-            }
-        }
-        hipSetDevice(device_id);
-        hipGetDeviceProperties(&props, device_id);
-        hip_initialized = true;
+    if (type == 38 && (hq2_iterations < 1 || hq2_iterations > 16)) {
+        fprintf(stderr, "hip_quantize: HQ2 iterations must be in [1, 16], got %d\n", hq2_iterations);
+        return 0;
     }
+    if (!initialize_hip()) return 0;
     if (!iq3xxs_tables_loaded) {
         hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_grid), h_iq3xxs_grid, sizeof(h_iq3xxs_grid));
         hipMemcpyToSymbol(HIP_SYMBOL(d_iq3xxs_map), h_iq3xxs_map, sizeof(h_iq3xxs_map));
@@ -236,6 +265,12 @@ __declspec(dllexport) size_t quantize_tensor(
     if (total_size == 0) return 0;
 
     int n_blocks_per_row = get_blocks_per_row(type, n_per_row);
+    int block_size = get_block_size_for_type(type);
+    if (nrows <= 0 || n_per_row <= 0 || n_blocks_per_row <= 0 ||
+        block_size <= 0 || n_per_row % block_size != 0) {
+        fprintf(stderr, "hip_quantize: invalid dimensions for type %d\n", type);
+        return 0;
+    }
 
     // Allocate device memory
     float *d_src = NULL;
@@ -365,6 +400,11 @@ __declspec(dllexport) size_t quantize_tensor(
                 d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row);
             break;
         }
+        case 38: {
+            hipLaunchKernelGGL(quantize_hq2_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, (int)nrows, (int)n_per_row, hq2_iterations);
+            break;
+        }
         default:
             hipFree(d_src);
             hipFree(d_dst);
@@ -398,10 +438,41 @@ __declspec(dllexport) size_t quantize_tensor(
     return total_size;
 }
 
+__declspec(dllexport) size_t quantize_tensor(
+    int type,
+    const float* src,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix
+) {
+    return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, 4);
+}
+
+__declspec(dllexport) size_t quantize_tensor_hq2_iters(
+    int type,
+    const float* src,
+    uint8_t* dst,
+    int64_t nrows,
+    int64_t n_per_row,
+    const float* imatrix,
+    int hq2_iterations
+) {
+    if (type != 38) {
+        fprintf(stderr, "hip_quantize: quantize_tensor_hq2_iters only supports HQ2 (type 38)\n");
+        return 0;
+    }
+    return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, hq2_iterations);
+}
+
 __declspec(dllexport) int get_device_count() {
     int count = 0;
     hipGetDeviceCount(&count);
     return count;
+}
+
+__declspec(dllexport) int get_selected_device() {
+    return initialize_hip() ? device_id : -1;
 }
 
 #ifdef __cplusplus

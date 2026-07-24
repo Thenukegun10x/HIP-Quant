@@ -266,11 +266,6 @@ def probe_device(dll_path=None) -> DeviceProperties:
         dll.get_hip_runtime_version.restype = ctypes.c_int
         dll.get_hip_runtime_version.argtypes = []
         dp.hip_runtime_version = int(dll.get_hip_runtime_version())
-        if dp.hip_runtime_version and dp.hip_runtime_version < 70200000 and dp.has_wmma:
-            dp.has_wmma = False
-            dp.info.append(
-                f"ROCm/HIP runtime {dp.hip_runtime_version} detected; this package's gfx12 FP8/BF8 WMMA kernels are disabled because ROCm 7.1 and older can hang or zero GPU memory."
-            )
     except Exception:
         pass
 

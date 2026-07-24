@@ -27,18 +27,21 @@ from hip_quant.cdna_compat import cpu_reference_quantize, _dequantize_hq2
 
 
 def _uniform2_baseline(x: np.ndarray) -> np.ndarray:
-    """Symmetric 4-level uniform quant — the HQ2 initialization levels.
-
-    k-means (HQ2) should never be worse than this on the same weights.
-    """
-    x = x.astype(np.float64)
-    amax = float(np.max(np.abs(x)))
-    if amax < 1e-12:
-        return np.zeros_like(x)
-    levels = np.array([-amax, -amax / 3.0, amax / 3.0, amax])
-    d = x[:, None] - levels[None, :]
-    c = np.argmin(d * d, axis=1)
-    return levels[c].astype(np.float32)
+    """Symmetric 4-level uniform quantization, independently per 256 block."""
+    x = np.ascontiguousarray(x, dtype=np.float64).reshape(-1)
+    if x.size % 256 != 0:
+        raise ValueError("uniform2 baseline requires a multiple of 256 values")
+    out = np.empty_like(x, dtype=np.float32)
+    for start in range(0, x.size, 256):
+        block = x[start:start + 256]
+        amax = float(np.max(np.abs(block)))
+        if amax < 1e-12:
+            out[start:start + 256] = 0.0
+            continue
+        levels = np.array([-amax, -amax / 3.0, amax / 3.0, amax])
+        diff = block[:, None] - levels[None, :]
+        out[start:start + 256] = levels[np.argmin(diff * diff, axis=1)]
+    return out
 
 
 def _mse(a: np.ndarray, b: np.ndarray) -> float:
@@ -94,9 +97,21 @@ def test_hq2_zero_block():
     assert np.all(rec == 0.0)
 
 
+def test_hq2_iteration_control_is_deterministic_and_valid():
+    rng = np.random.default_rng(7)
+    arr = rng.standard_normal((2, 256 * 2)).astype(np.float32)
+    default = cpu_reference_quantize(arr, "HQ2")
+    explicit = cpu_reference_quantize(arr, "HQ2", hq2_iterations=4)
+    refined = cpu_reference_quantize(arr, "HQ2", hq2_iterations=8)
+    assert np.array_equal(default, explicit)
+    assert refined.shape == default.shape
+    assert np.all(np.isfinite(_dequantize_hq2(refined, arr.shape[1])))
+
+
 if __name__ == "__main__":
     test_hq2_registration()
     test_hq2_block_size_and_roundtrip()
     test_hq2_with_importance_matrix()
     test_hq2_zero_block()
+    test_hq2_iteration_control_is_deterministic_and_valid()
     print("All HQ2 CPU-reference tests passed.")

@@ -11,7 +11,6 @@
 // the codebook toward the weights that matter most for the layer's output,
 // which is the same idea behind TurboQuant's per-block codebook selection.
 
-#define HQ2_ITERS 4
 #define HQ2_EPS   1e-12f
 
 extern "C" __global__
@@ -21,7 +20,8 @@ void quantize_hq2_kernel(
     uint8_t * __restrict__ dst,
     const float * __restrict__ imatrix,
     int nrows,
-    int n_per_row
+    int n_per_row,
+    int hq2_iterations
 ) {
     int row = blockIdx.x;
     int sb  = blockIdx.y;
@@ -30,8 +30,6 @@ void quantize_hq2_kernel(
     int base = row * n_per_row + sb * HQ2_K + tid;
     if (base >= (row + 1) * n_per_row) return;
 
-    __shared__ float s_x[HQ2_K];
-    __shared__ float s_w[HQ2_K];
     __shared__ float s_lev[4];
     __shared__ float s_acc[4];
     __shared__ float s_cnt[4];
@@ -39,8 +37,7 @@ void quantize_hq2_kernel(
     __shared__ int   s_assign[HQ2_K];
 
     float xv = src[base];
-    s_x[tid] = xv;
-    s_w[tid] = (imatrix != NULL) ? fmaxf(imatrix[base], 0.0f) : 1.0f;
+    const float weight = (imatrix != NULL) ? fmaxf(imatrix[base], 0.0f) : 1.0f;
     __syncthreads();
 
     // amax over the block (tree reduction in shared memory)
@@ -75,7 +72,7 @@ void quantize_hq2_kernel(
     // Weighted Lloyd's iterations (k-means). Assignment uses squared error;
     // the update step is importance-weighted so salient weights dominate the
     // fitted level. Shared-memory float atomics keep the reduction simple.
-    for (int it = 0; it < HQ2_ITERS; ++it) {
+    for (int it = 0; it < hq2_iterations; ++it) {
         float best = 1e30f;
         int bc = 0;
         #pragma unroll
@@ -87,8 +84,8 @@ void quantize_hq2_kernel(
 
         if (tid < 4) { s_acc[tid] = 0.0f; s_cnt[tid] = 0.0f; }
         __syncthreads();
-        atomicAdd(&s_acc[bc], s_w[tid] * xv);
-        atomicAdd(&s_cnt[bc], s_w[tid]);
+        atomicAdd(&s_acc[bc], weight * xv);
+        atomicAdd(&s_cnt[bc], weight);
         __syncthreads();
 
         if (tid < 4) {

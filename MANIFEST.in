@@ -17,3 +17,4 @@ include device_info.py
 include cdna_compat.py
 include setup_torch.py
 include DOCUMENTATION.md
+recursive-include hq2 *.py

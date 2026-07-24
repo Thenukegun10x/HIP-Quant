@@ -105,11 +105,33 @@ typedef struct {
 //   total     : 72 bytes -> 2.25 bpw
 // =========================================================================
 #define HQ2_K 256
+#define AQ2_K HQ2_K
 
 typedef struct {
     ggml_half levels[4];
     uint8_t qs[HQ2_K / 4];
 } block_hq2;
+
+// AQ2 uses the same physical 72-byte layout as HQ2.  Keeping the type
+// distinct lets calibration, model metadata, and dispatch distinguish an
+// attention-calibrated tensor without adding inference-time bits.
+typedef struct {
+    ggml_half levels[4];
+    uint8_t qs[HQ2_K / 4];
+} block_aq2;
+
+// AQ2-QK and AQ2-VO intentionally share the AQ2 wire layout.  Their type
+// IDs keep role-specific calibration and model metadata explicit without
+// creating a second inference decoder or adding bits to the tensor.
+typedef block_aq2 block_aq2_qk;
+typedef block_aq2 block_aq2_vo;
+
+#if defined(__cplusplus)
+static_assert(sizeof(block_hq2) == 72, "block_hq2 wire layout must remain 72 bytes");
+static_assert(sizeof(block_aq2) == 72, "block_aq2 wire layout must remain 72 bytes");
+static_assert(sizeof(block_aq2_qk) == 72, "block_aq2_qk wire layout must remain 72 bytes");
+static_assert(sizeof(block_aq2_vo) == 72, "block_aq2_vo wire layout must remain 72 bytes");
+#endif
 
 typedef struct {
     ggml_half d;

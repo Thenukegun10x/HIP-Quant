@@ -91,6 +91,14 @@ typedef struct {
     uint8_t qs[QK_K / 2];
 } block_iq4_xs;
 
+// HQ2: 4 FP16 codebook levels plus 256 packed 2-bit indices.
+#define HQ2_K 256
+
+typedef struct {
+    ggml_half levels[4];
+    uint8_t qs[HQ2_K / 4];
+} block_hq2;
+
 typedef struct {
     ggml_half d;
     uint8_t qs[3 * QK_K / 8];
