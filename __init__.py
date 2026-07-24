@@ -13,6 +13,7 @@ _TORCH_EXPORTS = {
     "mxfp4_to_fp8",
     "QuantizedLinear",
     "convert_to_quantized",
+    "check",
     # ── Quantization / dequantization (low-level) ──────────
     "quantize_e4m3",
     "quantize_e5m2",

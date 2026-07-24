@@ -373,6 +373,7 @@ def _parse_rocm_version(value: Optional[str]) -> Tuple[int, int]:
 
 
 def _require_gfx12_fp8_wmma(tensor: "torch.Tensor") -> None:
+    bypass = _env_flag("HIP_QUANT_BYPASS_ARCH_CHECK")
     if os.environ.get("HIP_QUANT_DISABLE_WMMA", "").lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("hip_quant FP8/BF8 WMMA kernels are disabled by HIP_QUANT_DISABLE_WMMA.")
     if not _TORCH_AVAILABLE:
@@ -391,13 +392,24 @@ def _require_gfx12_fp8_wmma(tensor: "torch.Tensor") -> None:
     arch, rocm_version = cached
 
     if not arch.startswith("gfx12"):
-        raise RuntimeError(
-            f"hip_quant FP8/BF8 WMMA linear kernels use gfx12/RDNA4 w32 intrinsics; current device arch is {arch}. "
-            "CDNA may support FP8/BF16 through MFMA/rocBLASLt paths, but not this RDNA4-specific kernel."
+        msg = (
+            f"hip_quant WMMA kernels are designed for gfx12/RDNA4 (current GPU: {arch}).\n"
+            "These kernels use the v_wmma_f32_16x16x16_fp8_fp8 instruction which\n"
+            "does not exist on older architectures.  Running on this GPU WILL crash\n"
+            "or produce garbage output.\n\n"
+            "If you understand the risk (e.g. testing on an emulated target), set:\n"
+            "  HIP_QUANT_BYPASS_ARCH_CHECK=1"
         )
-    if _parse_rocm_version(rocm_version) < (7, 2):
+        if bypass:
+            warnings.warn(f"BYPASSED ARCH CHECK — {msg}")
+        else:
+            raise RuntimeError(msg)
+
+    if _parse_rocm_version(rocm_version) < (7, 2) and not bypass:
         raise RuntimeError(
-            f"hip_quant FP8/BF8 WMMA linear kernels require ROCm 7.2+; current torch.version.hip is {rocm_version}."
+            f"hip_quant requires ROCm >= 7.2 (detected {rocm_version}).\n"
+            "Your ROCm version may hang or corrupt GPU memory with FP8 WMMA.\n"
+            "Set HIP_QUANT_BYPASS_ARCH_CHECK=1 to override (at your own risk)."
         )
 
 
@@ -3005,13 +3017,44 @@ def quantize(
 
     ``dtype`` is one of ``"e4m3"``, ``"e5m2"``.
     ``block_size`` enables blockwise quantization (default: per-tensor).
+
+    .. warning::
+
+        Quantizing 1‑D tensors (biases, LayerNorm weights, embeddings) to FP8
+        almost always degrades model quality.  These tensors are typically small
+        and have tight dynamic ranges where FP8 rounding noise is comparable to
+        the signal.  Keep them in float16 or float32.
+
+        ``convert_to_quantized()`` automatically skips 1‑D parameters for this
+        reason.
     """
+
+    # ── Safety guards ──────────────────────────────────────────────────────
+    if x.dtype == torch.uint8:
+        raise ValueError(
+            "quantize() received a uint8 tensor — it may already be FP8-quantized.\n"
+            "Double-quantizing corrupts data.  Use dequantize() first to go back to float32,\n"
+            "or pass the uint8 tensor directly to the linear/attention functions."
+        )
+    if x.numel() == 0:
+        raise ValueError("quantize() received an empty tensor.")
+    if x.dim() <= 1 and x.numel() <= 4096:
+        warnings.warn(
+            f"Quantizing a {tuple(x.shape)} tensor to {dtype}.  "
+            "1‑D tensors (biases, LayerNorm weights, embeddings) degrade model quality "
+            "under FP8.  Consider keeping them in float16/float32.  Set "
+            "HIP_QUANT_ALLOW_1D_QUANT=1 to suppress this warning.",
+            stacklevel=2,
+        )
+        if not _env_flag("HIP_QUANT_ALLOW_1D_QUANT"):
+            pass  # warn but proceed — user may know what they're doing
+
     _fn = {"e4m3": quantize_e4m3, "e5m2": quantize_e5m2}
     if block_size:
         _fn = {"e4m3": quantize_e4m3_blockwise, "e5m2": quantize_e5m2_blockwise}
     f = _fn.get(dtype)
     if f is None:
-        raise ValueError(f"Unknown quantize dtype: {dtype}")
+        raise ValueError(f"Unknown quantize dtype: {dtype}.  Use 'e4m3' or 'e5m2'.")
     return f(x, block_size=block_size) if block_size else f(x)
 
 
@@ -3021,8 +3064,102 @@ def dequantize(x: "torch.Tensor") -> "torch.Tensor":
     For MXFP4, use ``mxfp4_to_fp8`` first, then this function.
     """
     if x.dtype != torch.uint8:
-        raise ValueError(f"Expected uint8 tensor, got {x.dtype}")
+        raise ValueError(f"Expected uint8 (FP8) tensor, got {x.dtype}.  Nothing to dequantize.")
     return dequantize_e4m3(x)
+
+
+def check():
+    """Validate the hip_quant environment and print a status report.
+
+    Checks:  PyTorch + ROCm, GPU architecture, extension build, and runs a
+    tiny smoke test to confirm the GPU path works.
+
+    >>> import hip_quant
+    >>> hip_quant.check()
+    """
+    issues = []
+
+    # -- PyTorch --
+    try:
+        import torch
+    except ImportError:
+        issues.append("PyTorch is not installed.")
+        print("FAIL: PyTorch is not installed.")
+        return False
+
+    # -- ROCm --
+    if not torch.cuda.is_available():
+        issues.append("No ROCm GPU visible (torch.cuda.is_available() = False).")
+        print("FAIL: No ROCm GPU visible.")
+        return False
+
+    print("Checking hip_quant environment ...")
+    print(f"  PyTorch:             {torch.__version__}")
+    print(f"  ROCm:                {getattr(torch.version, 'hip', 'N/A')}")
+    print(f"  GPU:                 {torch.cuda.get_device_name(0)}")
+    props = torch.cuda.get_device_properties(0)
+    arch = getattr(props, "gcnArchName", "unknown")
+    print(f"  Architecture:        {arch}")
+
+    if not arch.startswith("gfx12"):
+        issues.append(f"GPU is {arch}, but kernels target gfx12 (RDNA4).")
+        print(f"  WARNING: kernels target gfx12 (RDNA4).  Your GPU ({arch}) may not support FP8 WMMA.")
+    else:
+        print(f"  Architecture:        OK (RDNA4)")
+
+    # -- Extension --
+    try:
+        ext = _load_extension()
+        print(f"  Extension:           loaded ({ext.__module__})")
+        for name in ("wave_attn_forward", "quantize_e4m3", "quantize_e5m2"):
+            print(f"    {name:30s} {'OK' if hasattr(ext, name) else 'MISSING'}")
+            if not hasattr(ext, name):
+                issues.append(f"Extension missing symbol: {name}")
+    except Exception as e:
+        issues.append(f"Extension not built: {e}")
+        print(f"  Extension:           NOT LOADED ({e})")
+
+    # -- Smoke test --
+    if not issues and arch.startswith("gfx12"):
+        try:
+            x = torch.randn(2, 4, device="cuda")
+            xq = quantize_e4m3(x)
+            xb = dequantize_e4m3(xq)
+            cos = torch.nn.functional.cosine_similarity(
+                x.flatten(), xb.flatten(), dim=0
+            )
+            print(f"  Smoke test (quant→dequant cos):  {cos.item():.6f}")
+            if cos < 0.99:
+                issues.append(f"Smoke test precision low (cos={cos.item():.4f} < 0.99)")
+        except Exception as e:
+            issues.append(f"Smoke test failed: {e}")
+            print(f"  Smoke test:          FAILED ({e})")
+
+    if issues:
+        print(f"\n{len(issues)} issue(s) found:")
+        for i in issues:
+            print(f"  - {i}")
+        print("\nTo build the extension:")
+        print('  python setup_torch.py build_ext --inplace')
+        return False
+    else:
+        print("\nAll checks passed — hip_quant is ready.")
+        return True
+
+
+# ── OOM guard helper ──
+def _check_oom(tensors, operation: str):
+    """Warn if the total tensor bytes exceed 80% of free GPU memory."""
+    torch = globals().get("torch") or __import__("torch")
+    if not hasattr(torch.cuda, "mem_get_info"):
+        return
+    free, total = torch.cuda.mem_get_info()
+    needed = sum(t.numel() * t.element_size() for t in tensors if t.is_cuda)
+    if needed > free * 0.8:
+        warnings.warn(
+            f"{operation}: requires {needed / 1e9:.1f} GB but only {free / 1e9:.1f} GB free "
+            f"(out of {total / 1e9:.1f} GB total).  This may OOM."
+        )
 
 
 attention = wave_attn  # alias for cleaner API
@@ -3179,10 +3316,20 @@ def convert_to_quantized(
     module: "nn.Module",
     weight_format: str = "fp8_e4m3",
     exclude: Optional[Set[type]] = None,
+    allow_1d: bool = False,
 ) -> "nn.Module":
     """Recursively replace ``nn.Linear`` layers with ``QuantizedLinear``.
 
     Weights are preserved — the float tensors are transferred to the new layer.
+
+    .. note::
+
+        ``nn.Embedding`` is never converted (lookup tables degrade badly
+        under FP8).  ``nn.LayerNorm`` and ``nn.RMSNorm`` are also skipped
+        since they operate on 1‑D weight vectors.
+
+        Set ``allow_1d=True`` to also convert small layers like biases,
+        though this is not recommended for quality.
 
     .. code-block:: python
 
@@ -3192,11 +3339,21 @@ def convert_to_quantized(
     """
     if exclude is None:
         exclude = set()
+    # Never convert embeddings or norm layers
+    exclude.update({torch.nn.Embedding, torch.nn.LayerNorm})
+    try:
+        import torch.nn as nn_mod
+        if hasattr(nn_mod, "RMSNorm"):
+            exclude.add(nn_mod.RMSNorm)
+    except Exception:
+        pass
 
     for name, child in module.named_children():
         if type(child) in exclude:
             continue
         if isinstance(child, nn.Linear) and not isinstance(child, QuantizedLinear):
+            if not allow_1d and max(child.in_features, child.out_features) <= 256:
+                continue  # skip tiny projection layers (e.g. attention head dim projections)
             new = QuantizedLinear(
                 child.in_features, child.out_features,
                 bias=child.bias is not None,
@@ -3207,7 +3364,7 @@ def convert_to_quantized(
                 new.bias.data.copy_(child.bias.data)
             setattr(module, name, new)
         else:
-            convert_to_quantized(child, weight_format=weight_format, exclude=exclude)
+            convert_to_quantized(child, weight_format=weight_format, exclude=exclude, allow_1d=allow_1d)
     return module
 
 
