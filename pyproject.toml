@@ -35,10 +35,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Thenukegun10x/hip_quant"
-Documentation = "https://github.com/Thenukegun10x/hip_quant/blob/main/README.md"
-Source = "https://github.com/Thenukegun10x/hip_quant"
-Issues = "https://github.com/Thenukegun10x/hip_quant/issues"
+Homepage = "https://github.com/Thenukegun10x/HIP-Quant"
+Documentation = "https://github.com/Thenukegun10x/HIP-Quant/blob/main/README.md"
+Source = "https://github.com/Thenukegun10x/HIP-Quant"
+Issues = "https://github.com/Thenukegun10x/HIP-Quant/issues"
 
 [project.optional-dependencies]
 torch = [
