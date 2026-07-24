@@ -93,6 +93,7 @@ __all__ = [
     "suggest_cdna_emulation",
     "get_build_config",
     "cpu_reference_quantize",
+    "info",
     *_TORCH_EXPORTS,
 ]
 
@@ -1041,10 +1042,49 @@ def __getattr__(name):
             from . import torch_api
         except ImportError as exc:
             raise ImportError(
-                f"hip_quant.{name} requires the PyTorch extension. "
-                "Install ROCm PyTorch and run `python setup_torch.py build_ext --inplace`."
+                f"hip_quant.{name} requires the PyTorch extension.\n\n"
+                "To build it:\n"
+                '  cd C:\\path\\to\\hip_quant\n'
+                '  & "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"\n'
+                '  python setup_torch.py build_ext --inplace\n\n'
+                "Requires: ROCm 7.x + PyTorch 2.x with ROCm support."
             ) from exc
         value = getattr(torch_api, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def info(dll_path=None):
+    """Print a diagnostic report: ROCm version, GPU info, DLL status, torch extension status.
+
+    Call without arguments for a quick system check.  Equivalent to ``hip-quant --info``.
+    """
+    try:
+        from . import report_device
+        print(report_device(dll_path))
+    except Exception as e:
+        print(f"NumPy / DLL backend:  unavailable ({e})")
+
+    try:
+        from . import torch_api as ta
+        ext = ta._load_extension()
+        print(f"\nPyTorch extension:    loaded ({ext.__module__})")
+        print(f"  wave_attn_forward:  {'OK' if hasattr(ext, 'wave_attn_forward') else 'missing — rebuild setup_torch.py'}")
+        print(f"  quantize_e4m3:      {'OK' if hasattr(ext, 'quantize_e4m3') else 'missing'}")
+    except Exception as e:
+        print(f"\nPyTorch extension:    not loaded ({e})")
+
+    try:
+        import torch
+        print(f"\nPyTorch:              {torch.__version__}")
+        if hasattr(torch.version, 'hip'):
+            print(f"ROCm:                 {torch.version.hip}")
+        if torch.cuda.is_available():
+            print(f"GPU:                  {torch.cuda.get_device_name(0)}")
+        else:
+            print(f"GPU:                  none visible")
+    except ImportError:
+        print(f"\nPyTorch:              not installed")
+
+    print(f"\nhip_quant version:    {__version__}")
