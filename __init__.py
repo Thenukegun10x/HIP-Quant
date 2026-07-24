@@ -3,15 +3,14 @@ import numpy as np
 import os
 import sys
 
-__version__ = "0.12.0"
+__version__ = "0.13.1"
 
 _TORCH_EXPORTS = {
+    # ── Quantization / dequantization ──────────────────────
     "quantize_e4m3",
     "quantize_e5m2",
     "quantize_e4m3_transpose",
     "quantize_e5m2_transpose",
-    "Fp8GraphRunner",
-    "capture_hip_graph",
     "quantize_e5m2_stochastic",
     "quantize_e4m3_blockwise",
     "quantize_e5m2_blockwise",
@@ -21,7 +20,9 @@ _TORCH_EXPORTS = {
     "dequantize_e5m2",
     "dequantize_e4m3_blockwise",
     "dequantize_e5m2_blockwise",
-    "adafactor_row_col_mean_square",
+    # ── Attention ──────────────────────────────────────────
+    "wave_attn",
+    # ── Linear / GEMM ─────────────────────────────────────
     "fp8_linear_forward",
     "fp8_linear_forward_scaled",
     "fp8_linear_forward_fp8_weight",
@@ -37,38 +38,38 @@ _TORCH_EXPORTS = {
     "fp8_linear_backward_weight_scaled",
     "fp8_linear_backward_input_fp8_grad",
     "fp8_linear_backward_weight_fp8_grad",
-    "dequantize_q_to_fp8",
-    "dequantize_q_to_e4m3",
-    "dequantize_q_to_e5m2",
+    # ── MXFP4 ─────────────────────────────────────────────
     "dequantize_mxfp4_to_fp8",
     "mxfp4_linear_forward",
-    "rocm_attn_v0",
-    "rocm_attn_v1",
-    "rocm_attn_v2",
-    "rocm_attn_v3",
-    "rocm_attn_v5",
-    "rocm_attn_v6",
-    "rocm_attn_v7",
     "native_mxfp4_contract",
     "native_mxfp4_capability",
     "native_mxfp4_linear_forward",
     "MXFP4_BLOCK_SIZE",
     "MXFP4_PACKED_VALUE_BYTES_PER_BLOCK",
     "MXFP4_SCALE_BYTES_PER_BLOCK",
+    # ── GGML / Q to FP8 dequant ───────────────────────────
+    "dequantize_q_to_fp8",
+    "dequantize_q_to_e4m3",
+    "dequantize_q_to_e5m2",
     "GGML_Q_TO_FP8_SUPPORTED",
+    # ── nn.Module wrappers ────────────────────────────────
     "Fp8LinearFunction",
     "Fp8Linear",
     "Fp8ScaledLinearFunction",
     "Fp8ScaledLinear",
     "Fp8ShadowLinearFunction",
     "Fp8ShadowLinear",
+    "Fp8TensorMeta",
+    "Fp8GraphRunner",
+    "capture_hip_graph",
+    # ── Conv / misc ───────────────────────────────────────
     "fp8_conv1d",
     "Fp8Conv1d",
     "fp8_conv2d",
     "Fp8Conv2d",
-    "Fp8TensorMeta",
     "convert_to_fp8",
     "Adafactor",
+    "adafactor_row_col_mean_square",
 }
 
 __all__ = [
