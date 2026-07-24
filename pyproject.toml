@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "0.13.1"
+version = "1.0.0"
 description = "GPU tensor quantization library for AMD ROCm. Native FP8 WMMA attention, HQ2/HQ3 learned-codebook formats, and portable HIP/ROCm kernels for RDNA3, RDNA4, and CDNA."
 readme = "README.md"
 license = { file = "LICENSE" }
