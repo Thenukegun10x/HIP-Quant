@@ -190,10 +190,25 @@ void launch_dequant_mxfp4_to_fp8(
     int64_t nrows, int n_per_row, hipStream_t stream);
 void launch_wave_attn(
     const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
-    void* Out, float* partial_max, float* partial_sum, float* partial_out,
+    void* Out, float* LSE, float* partial_max, float* partial_sum, float* partial_out,
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
     int out_dtype, bool is_causal, hipStream_t stream);
+void launch_wave_attn_backward(
+    const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
+    const float* O, const float* dO, const float* LSE,
+    float* dQ, float* dK, float* dV,
+    float* delta_scratch, unsigned int* do_amax_scratch, uint8_t* do_fp8_scratch,
+    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float k_scale, float v_scale,
+    bool is_causal, hipStream_t stream);
+void launch_wave_attn_diag(
+    const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
+    const float* dO,
+    float* S_diag, float* dP_diag, float* dS_diag,
+    int Q_TILE, int K_TILE, int Dim,
+    float softmax_scale, int q_tile_row,
+    hipStream_t stream);
 
 // Kept in a HIP-compiled translation unit because the current Windows PyTorch
 // wheel's c10 HIP headers are not MSVC-clean.
@@ -2217,6 +2232,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                            .dtype(torch::kFloat32)
                            .device(q_fp8.device());
         torch::Tensor out = torch::empty({B, H, Seq_Q, Dim}, options);
+        torch::Tensor lse = torch::empty({B, H, Seq_Q}, options);
 
         int Q_TILE = (Seq_Q <= 16) ? 16 : ((Seq_Q <= 32) ? 32 : ((Seq_Q <= 64) ? 64 : 128));
         int K_TILE = (Dim >= 128) ? 64 : ((Seq_K >= 128) ? 128 : 64);
@@ -2248,6 +2264,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             k_fp8.data_ptr<uint8_t>(),
             v_fp8.data_ptr<uint8_t>(),
             out.data_ptr<float>(),
+            lse.data_ptr<float>(),
             p_max_ptr, p_sum_ptr, p_out_ptr,
             B, H, Seq_Q, Seq_K, Dim,
             (float)softmax_scale,
@@ -2259,11 +2276,131 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             stream
         );
 
-        return out;
+        return py::make_tuple(out, lse);
     },
-    "WaveAttention: Native FP8 WMMA flash attention forward kernel for AMD GFX12 (RDNA4).",
+    "WaveAttention: Native FP8 WMMA flash attention forward kernel for AMD GFX12 (RDNA4). Returns (out, lse).",
     py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
     py::arg("softmax_scale"), py::arg("q_scale") = 1.0,
     py::arg("k_scale") = 1.0, py::arg("v_scale") = 1.0,
     py::arg("is_causal") = false);
+    m.def("wave_attn_backward", [](
+        torch::Tensor q_fp8,
+        torch::Tensor k_fp8,
+        torch::Tensor v_fp8,
+        torch::Tensor O,
+        torch::Tensor dO,
+        torch::Tensor lse,
+        double softmax_scale,
+        double q_scale,
+        double k_scale,
+        double v_scale,
+        bool is_causal
+    ) {
+        TORCH_CHECK(q_fp8.is_cuda(), "q_fp8 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(k_fp8.is_cuda(), "k_fp8 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(v_fp8.is_cuda(), "v_fp8 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(O.is_cuda(), "O must be a CUDA/ROCm tensor");
+        TORCH_CHECK(dO.is_cuda(), "dO must be a CUDA/ROCm tensor");
+        TORCH_CHECK(lse.is_cuda(), "lse must be a CUDA/ROCm tensor");
+        TORCH_CHECK(q_fp8.dtype() == torch::kUInt8, "q_fp8 must be uint8 (FP8 E4M3)");
+        TORCH_CHECK(k_fp8.dtype() == torch::kUInt8, "k_fp8 must be uint8 (FP8 E4M3)");
+        TORCH_CHECK(v_fp8.dtype() == torch::kUInt8, "v_fp8 must be uint8 (FP8 E4M3)");
+        TORCH_CHECK(O.dtype() == torch::kFloat32, "O must be float32");
+        TORCH_CHECK(dO.dtype() == torch::kFloat32, "dO must be float32");
+        TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
+
+        int B = q_fp8.size(0);
+        int H = q_fp8.size(1);
+        int Seq_Q = q_fp8.size(2);
+        int Dim = q_fp8.size(3);
+        int Seq_K = k_fp8.size(2);
+
+        TORCH_CHECK(O.dim() == 4 && O.size(0) == B && O.size(1) == H &&
+                    O.size(2) == Seq_Q && O.size(3) == Dim,
+                    "O must be [B, H, Seq_Q, Dim] matching q_fp8");
+        TORCH_CHECK(dO.dim() == 4 && dO.size(0) == B && dO.size(1) == H &&
+                    dO.size(2) == Seq_Q && dO.size(3) == Dim,
+                    "dO must be [B, H, Seq_Q, Dim] matching q_fp8");
+
+        auto options = torch::TensorOptions()
+                           .dtype(torch::kFloat32)
+                           .device(q_fp8.device());
+        torch::Tensor dQ = torch::zeros({B, H, Seq_Q, Dim}, options);
+        torch::Tensor dK = torch::zeros({B, H, Seq_K, Dim}, options);
+        torch::Tensor dV = torch::zeros({B, H, Seq_K, Dim}, options);
+
+        // FlashAttention-2 preprocess scratch: D_i = sum_d dO_id * O_id, and a
+        // per-(batch, head) amax(|dO|) for the FP8 scaling of dO.  The amax
+        // buffer is accumulated with atomicMax and must start at zero.
+        torch::Tensor delta = torch::empty({B, H, Seq_Q}, options);
+        torch::Tensor do_amax = torch::zeros(
+            {B * H}, options.dtype(torch::kInt32));
+        // dO in E4M3, produced once and consumed by both main kernels.
+        torch::Tensor do_fp8 = torch::empty(
+            {B, H, Seq_Q, Dim}, options.dtype(torch::kUInt8));
+
+        hipStream_t stream = current_stream();
+
+        launch_wave_attn_backward(
+            q_fp8.data_ptr<uint8_t>(),
+            k_fp8.data_ptr<uint8_t>(),
+            v_fp8.data_ptr<uint8_t>(),
+            O.data_ptr<float>(),
+            dO.data_ptr<float>(),
+            lse.data_ptr<float>(),
+            dQ.data_ptr<float>(),
+            dK.data_ptr<float>(),
+            dV.data_ptr<float>(),
+            delta.data_ptr<float>(),
+            reinterpret_cast<unsigned int*>(do_amax.data_ptr<int32_t>()),
+            do_fp8.data_ptr<uint8_t>(),
+            B, H, Seq_Q, Seq_K, Dim,
+            (float)softmax_scale,
+            (float)q_scale,
+            (float)k_scale,
+            (float)v_scale,
+            is_causal,
+            stream
+        );
+
+        return py::make_tuple(dQ, dK, dV);
+    },
+    "WaveAttention backward: computes dQ, dK, dV from saved Q/K/V, O, dO, and LSE.",
+    py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+    py::arg("O"), py::arg("dO"), py::arg("lse"),
+    py::arg("softmax_scale"), py::arg("q_scale") = 1.0,
+    py::arg("k_scale") = 1.0, py::arg("v_scale") = 1.0,
+    py::arg("is_causal") = false);
+
+    m.def("wave_attn_diag", [](
+        torch::Tensor Q_fp8, torch::Tensor K_fp8, torch::Tensor V_fp8,
+        torch::Tensor dO,
+        int Q_TILE, int K_TILE, int Dim,
+        double softmax_scale, int q_tile_row
+    ) {
+        TORCH_CHECK(Q_fp8.is_cuda() && Q_fp8.dtype() == torch::kUInt8);
+        TORCH_CHECK(K_fp8.is_cuda() && K_fp8.dtype() == torch::kUInt8);
+        TORCH_CHECK(V_fp8.is_cuda() && V_fp8.dtype() == torch::kUInt8);
+        TORCH_CHECK(dO.is_cuda() && dO.dtype() == torch::kFloat32);
+
+        auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q_fp8.device());
+        torch::Tensor S_diag  = torch::zeros({Q_TILE * K_TILE}, opts);
+        torch::Tensor dP_diag = torch::zeros({Q_TILE * K_TILE}, opts);
+        torch::Tensor dS_diag = torch::zeros({Q_TILE * K_TILE}, opts);
+
+        launch_wave_attn_diag(
+            Q_fp8.data_ptr<uint8_t>(), K_fp8.data_ptr<uint8_t>(),
+            V_fp8.data_ptr<uint8_t>(), dO.data_ptr<float>(),
+            S_diag.data_ptr<float>(), dP_diag.data_ptr<float>(),
+            dS_diag.data_ptr<float>(),
+            Q_TILE, K_TILE, Dim,
+            (float)softmax_scale, q_tile_row,
+            current_stream()
+        );
+        return py::make_tuple(S_diag, dP_diag, dS_diag);
+    },
+    "Diagnostic: dumps WMMA S, dP, dS for a single Q tile row.",
+    py::arg("Q_fp8"), py::arg("K_fp8"), py::arg("V_fp8"),
+    py::arg("dO"), py::arg("Q_TILE"), py::arg("K_TILE"),
+    py::arg("Dim"), py::arg("softmax_scale"), py::arg("q_tile_row"));
 }

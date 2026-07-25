@@ -1076,6 +1076,7 @@ def info(dll_path=None):
         ext = ta._load_extension()
         print(f"\nPyTorch extension:    loaded ({ext.__module__})")
         print(f"  wave_attn_forward:  {'OK' if hasattr(ext, 'wave_attn_forward') else 'missing — rebuild setup_torch.py'}")
+        print(f"  wave_attn_backward: {'OK' if hasattr(ext, 'wave_attn_backward') else 'missing — rebuild setup_torch.py'}")
         print(f"  quantize_e4m3:      {'OK' if hasattr(ext, 'quantize_e4m3') else 'missing'}")
     except Exception as e:
         print(f"\nPyTorch extension:    not loaded ({e})")

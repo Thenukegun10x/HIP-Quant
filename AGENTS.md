@@ -29,6 +29,35 @@ We use `pyproject.toml` and `setuptools` to bundle the Python wrapper together w
 1. Build the package (`.whl` and `.tar.gz`): `python -m build`
 2. Upload to PyPI: `twine upload dist/*`
 
+## WaveAttention backward (`torch_ext/wave_attn_backward.hip`)
+Native GFX12 FP8 WMMA backward for `wave_attn`, computing `dQ`/`dK`/`dV` on-device
+without SDPA recomputation. Wired into `_WaveAttentionFn` in `torch_api.py`; set
+`HIP_QUANT_WAVE_ATTN_SDPA_BACKWARD=1` to fall back to SDPA for debugging.
+
+Follows FlashAttention-2, including its separate preprocess pass for
+`D_i = sum_d dO_id * O_id`. `D` is a full-row reduction, so it **cannot** be
+accumulated inside the K-tile loop — the preprocess kernel materialises it up
+front. This is why `wave_attn_backward` takes `O` as an argument.
+
+Invariants that are easy to break silently:
+- The dK/dV block must have exactly one wave per 16-key sub-tile
+  (`THREADS/32 == K_TILE/16`); fewer waves leaves the uncovered keys at zero.
+  A `static_assert` guards this — do not derive its thread count from `Q_TILE`.
+- Per-lane validity predicates (`q_valid`, `k_valid`, forward `valid_wave`) must
+  never gate control flow. They are divergent *within* a wave whenever the
+  sequence length is not a multiple of 16, and both kernels rely on
+  `__syncthreads()` and on `__shfl_sync(..., lg*8 + i)` broadcasts that read
+  lanes 0..15. Use them as load/store predicates only.
+- LDS tile pitches are padded by `WAVE_ATTN_LDS_PAD`. Unpadded pitches
+  (`Dim`, `K_TILE`, `16`) alias onto one or two LDS banks and cost a 16-way
+  conflict on every WMMA operand fetch.
+
+Accuracy is ~0.999 cosine vs an FP32 SDPA reference — the FP8 E4M3 floor —
+and is invariant to sequence length, tile alignment, quantization scale, and
+gradient magnitude. `test_backward_correctness.py` covers the aligned unit-scale
+case; `test_backward_math.py` covers ragged lengths, non-unit `q/k/v` scales,
+and small-magnitude `dO`.
+
 ## Agent Conventions
 - **Performance First**: Keep C++ kernels optimized for HIP and `gfx1201`. Memory throughput is key.
 - **Python-Native Interop**: When modifying Python code, ensure `ctypes` signatures perfectly match the types exposed by `hip_quantize.cpp` to prevent segfaults.

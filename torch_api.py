@@ -2972,6 +2972,80 @@ class Adafactor(torch.optim.Optimizer):
         return loss
 
 
+class _WaveAttentionFn(torch.autograd.Function):
+    """Autograd wrapper for the WaveAttention HIP kernel.
+
+    Forward  — FP8 E4M3 WMMA flash attention (native GFX12 ISA).
+               Saves FP8-compressed Q/K/V and LSE for backward.
+    Backward — Native HIP backward kernel (dQ/dK/dV via WMMA).
+               Falls back to FP32 SDPA recompute if
+               ``HIP_QUANT_WAVE_ATTN_SDPA_BACKWARD=1``.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, is_causal, scale):
+        ext = _load_extension()
+        q_fp8 = q if q.dtype == torch.uint8 else quantize_e4m3(q)
+        k_fp8 = k if k.dtype == torch.uint8 else quantize_e4m3(k)
+        v_fp8 = v if v.dtype == torch.uint8 else quantize_e4m3(v)
+
+        out, lse = ext.wave_attn_forward(
+            q_fp8.contiguous(), k_fp8.contiguous(), v_fp8.contiguous(),
+            float(scale), 1.0, 1.0, 1.0, bool(is_causal),
+        )
+
+        # ``out`` is saved because the backward's FlashAttention-2 preprocess
+        # pass needs D_i = sum_d dO_id * O_id.
+        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, lse)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q_fp8, k_fp8, v_fp8, out, lse = ctx.saved_tensors
+
+        # Allow opt-out to SDPA fallback for debugging
+        if _env_flag("HIP_QUANT_WAVE_ATTN_SDPA_BACKWARD"):
+            return _WaveAttentionFn._backward_sdpa(ctx, grad_out, q_fp8, k_fp8, v_fp8)
+
+        ext = _load_extension()
+        dq, dk, dv = ext.wave_attn_backward(
+            q_fp8.contiguous(), k_fp8.contiguous(), v_fp8.contiguous(),
+            out.contiguous().float(), grad_out.contiguous().float(), lse,
+            float(ctx.scale), 1.0, 1.0, 1.0, bool(ctx.is_causal),
+        )
+
+        return dq, dk, dv, None, None
+
+    @staticmethod
+    def _backward_sdpa(ctx, grad_out, q_fp8, k_fp8, v_fp8):
+        """SDPA fallback backward: dequant FP8 → FP32 → recompute via SDPA."""
+        q_f32 = dequantize_e4m3(q_fp8).detach().requires_grad_(True)
+        k_f32 = dequantize_e4m3(k_fp8).detach().requires_grad_(True)
+        v_f32 = dequantize_e4m3(v_fp8).detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            out_f32 = F.scaled_dot_product_attention(
+                q_f32, k_f32, v_f32,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=ctx.is_causal,
+                scale=ctx.scale,
+            )
+
+            dq, dk, dv = torch.autograd.grad(
+                outputs=out_f32,
+                inputs=(q_f32, k_f32, v_f32),
+                grad_outputs=grad_out,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+
+        return dq, dk, dv, None, None
+
+
 def wave_attn(
     q: "torch.Tensor",
     k: "torch.Tensor",
@@ -2984,7 +3058,30 @@ def wave_attn(
     Fast-exp, parallel K/V tile loads, adaptive Q/K tile selection.
     Bypasses AOTriton entirely — uses v_wmma_f32_16x16x16_fp8_fp8 directly.
     Expects q, k, v as FP8 uint8 tensors (or float32/float16/bfloat16 tensors auto-quantized).
+
+    This is an autograd-safe wrapper: forward uses the native HIP kernel and saves
+    log-sum-exp (LSE); backward recomputes softmax via the native backward kernel.
+
+    For inference-only workloads, call ``hip_quant.wave_attn_forward_fast(...)`` to
+    skip autograd graph construction and save memory.
     """
+    _require_gfx12_fp8_wmma(q)
+
+    if scale is None:
+        scale = 1.0 / (q.size(-1) ** 0.5)
+
+    return _WaveAttentionFn.apply(q, k, v, is_causal, scale)
+
+
+def wave_attn_forward_fast(
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    v: "torch.Tensor",
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> "torch.Tensor":
+    """Forward-only WaveAttention (no autograd). Faster than :func:`wave_attn`
+    for inference because it skips LSE output and ``save_for_backward``."""
     _require_gfx12_fp8_wmma(q)
 
     if scale is None:
@@ -2994,7 +3091,7 @@ def wave_attn(
     k_fp8 = k if k.dtype == torch.uint8 else quantize_e4m3(k)
     v_fp8 = v if v.dtype == torch.uint8 else quantize_e4m3(v)
 
-    return _load_extension().wave_attn_forward(
+    out, _ = _load_extension().wave_attn_forward(
         q_fp8.contiguous(),
         k_fp8.contiguous(),
         v_fp8.contiguous(),
@@ -3002,6 +3099,7 @@ def wave_attn(
         1.0, 1.0, 1.0,
         bool(is_causal),
     )
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════

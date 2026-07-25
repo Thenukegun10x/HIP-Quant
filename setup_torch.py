@@ -106,6 +106,8 @@ ext = CUDAExtension(
         "torch_ext/hq3_linear_kernels.hip",
         "torch_ext/hq8_g128_linear_kernels.hip",
         "torch_ext/wave_attn.hip",
+        "torch_ext/wave_attn_backward.hip",
+        "torch_ext/wave_attn_diag.hip",
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags
