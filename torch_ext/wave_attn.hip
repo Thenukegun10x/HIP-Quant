@@ -175,10 +175,12 @@ __global__ void wave_attn_kernel_templated(
     const int LDK = Dim + WAVE_ATTN_LDS_PAD;
     constexpr int LDV = K_TILE + WAVE_ATTN_LDS_PAD;
 
+    // Sequential K/V loading: K tile is loaded first, then V tile reuses
+    // the same LDS region after S/softmax.  All threads participate in
+    // each load phase (no split), so each thread does half as many uint4
+    // loads as before.  LDS footprint is max(K, V) instead of K+V.
     extern __shared__ uint8_t smem_base[];
-    uint8_t* smem_K = smem_base;
-    uint8_t* smem_V = smem_K + K_TILE * LDK;
-    uint8_t* smem_Q_stage = smem_base;   // setup only, aliases smem_K/smem_V
+    uint8_t* smem_K    = smem_base;       // K tile (Phase 1), then V tile (Phase 3)
 
     const cg::thread_block cta = cg::this_thread_block();
     const cg::thread_group wmma_wave = cg::tiled_partition(cta, 32);
@@ -208,12 +210,12 @@ __global__ void wave_attn_kernel_templated(
     float pscale = 16.0f;
     int num_d = (Dim + 15) / 16;
     int num_q_waves = Q_TILE >> 4;
-    int half_threads = THREADS_PER_BLOCK >> 1;
 
-    // Stage the Q tile in LDS (all threads participate); each lane copies its
-    // own rows into registers below, after which this space becomes K/V.
-    load_tile_to_lds_wave_fast(Q_fp8 + q_off, smem_Q_stage, q_block_start, Q_TILE, Dim, Seq_Q, tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Dim);
-    __syncthreads();
+    // Q is reloaded from global memory (FP8, L2-cached) on each WMMA
+    // iteration instead of pre-loaded into a 16-VGPR q_reg[8] array.
+    // This keeps total register pressure within the wave32 budget and
+    // avoids the LDS occupancy cost of a separate Q tile region.
+    const uint8_t* __restrict__ Q_base = Q_fp8 + q_off;
 
     v8f acc_o[8];
     #pragma unroll
@@ -236,47 +238,12 @@ __global__ void wave_attn_kernel_templated(
         if (kt_end > m) kt_end = m;
     }
 
-    int q_lds_row = (wave_id < num_q_waves) ? (wave_id * 16 + lw) : 0;
-    // NOTE: q_r depends on lw, so "is this query in range" is divergent *within*
-    // a wave whenever Seq_Q is not a multiple of 16.  It must therefore never
-    // gate control flow: the softmax rescale and the epilogue both broadcast
-    // per-row state with __shfl_sync(..., lg * 8 + i), which reads lanes 0..15
-    // of this wave.  Retiring those lanes early makes the broadcast read dead
-    // lanes and corrupts rsum/rmax for the whole tail block.  Out-of-range
-    // lanes instead run the full pipeline against zero-padded LDS (giving a
-    // finite, discarded row) and are dropped at the `orr < Seq_Q` store guards.
-
-    // ── Pull this lane's Q fragments into registers ──────────────────
-    // Dim <= 128, so at most 8 sub-tiles of 16; the trip count is a compile-time
-    // constant precisely so the array indices are constants and the array stays
-    // in VGPRs instead of spilling to scratch.  Costs 8 * 8B = 16 VGPRs.
-    constexpr int MAX_D_SUBS = 8;
-    v2i q_reg[MAX_D_SUBS];
-    #pragma unroll
-    for (int dt = 0; dt < MAX_D_SUBS; dt++) {
-        v2i qv = (v2i){0, 0};
-        int doff = dt * 16;
-        if (doff + lg * 8 < Dim) {
-            uint64_t q64 = *(const uint64_t*)&smem_Q_stage[q_lds_row * Dim + doff + lg * 8];
-            qv = *(const v2i*)&q64;
-        }
-        q_reg[dt] = qv;
-    }
-    // Every lane must finish reading Q before the K/V loads overwrite it.
-    __syncthreads();
-
     // ─── outer loop over K/V tiles ──────────────────────────────────
     for (int kt = kt_start; kt < kt_end; kt++) {
         int ks = kt * K_TILE;
 
-        // ── Parallel K/V tile load (split threads, 2× throughput) ──
-        // Low half loads K (row-major), high half loads V (transposed)
-        if (tid < half_threads) {
-            load_tile_to_lds_wave_fast(K_fp8 + k_off, smem_K, ks, K_TILE, Dim, Seq_K, tid, half_threads, THREADS_PER_BLOCK, LDK);
-        } else {
-            load_v_tile_transposed_wave_fast<K_TILE, LDV>(V_fp8 + v_off, smem_V, ks, K_TILE, Dim, Seq_K,
-                tid - half_threads, half_threads, THREADS_PER_BLOCK);
-        }
+        // ── Load K tile (all threads) ────────────────────────────
+        load_tile_to_lds_wave_fast(K_fp8 + k_off, smem_K, ks, K_TILE, Dim, Seq_K, tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK, LDK);
         cta.sync();
 
         // ── Phase 1: S = Q @ K^T  (FP8 WMMA + scale + running max) ──
@@ -285,11 +252,19 @@ __global__ void wave_attn_kernel_templated(
         #pragma unroll
         for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) sacc[k_sub] = (v8f){};
 
+        // Q is reloaded from global memory (FP8, L2-cached) on each
+        // d-sub-tile iteration instead of pre-loaded into q_reg[8].
+        // This saves 14 VGPRs (16→2), bringing register pressure below
+        // 128 and eliminating scratch spilling.
         #pragma unroll
-        for (int dt = 0; dt < MAX_D_SUBS; dt++) {
-            if (dt >= num_d) break;   // uniform across the block
+        for (int dt = 0; dt < 8; dt++) {
+            if (dt >= num_d) break;
             int doff = dt * 16;
-            v2i qv = q_reg[dt];
+            v2i qv = (v2i){0, 0};
+            if (q_r < Seq_Q && doff + lg * 8 < Dim) {
+                uint64_t q64 = *(const uint64_t*)&Q_base[(int64_t)q_r * Dim + doff + lg * 8];
+                qv = *(const v2i*)&q64;
+            }
 
             #pragma unroll
             for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
@@ -306,7 +281,9 @@ __global__ void wave_attn_kernel_templated(
         }
 
         // ── Phase 2: scale + running max (single fused pass) ────────
-        float scaled[NUM_K_SUBS][8];
+        // Reuse sacc for scaled values — sacc is dead after Phase 1,
+        // so writing the scaled scores back into it saves 32 VGPRs
+        // vs a separate scaled[NUM_K_SUBS][8] array.
         #pragma unroll
         for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
             #pragma unroll
@@ -314,7 +291,7 @@ __global__ void wave_attn_kernel_templated(
                 int kc = ks + k_sub * 16 + lg * 8 + i;
                 float s = sacc[k_sub][i] * cscale;
                 if (kc >= Seq_K || (is_causal && kc > q_r)) s = -1e30f;
-                scaled[k_sub][i] = s;
+                sacc[k_sub][i] = s;  // reuse sacc as scaled storage
                 tile_max = fmaxf(tile_max, s);
             }
         }
@@ -334,7 +311,7 @@ __global__ void wave_attn_kernel_templated(
             float p_vals[8];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
-                float pv_f = (scaled[k_sub][i] > -1e29f) ? fast_expf(scaled[k_sub][i] - nmax) : 0.0f;
+                float pv_f = (sacc[k_sub][i] > -1e29f) ? fast_expf(sacc[k_sub][i] - nmax) : 0.0f;
                 p_vals[i] = pv_f;
                 row_sum_new += pv_f;
             }
@@ -345,7 +322,6 @@ __global__ void wave_attn_kernel_templated(
         row_sum = row_sum_new;
 
         // ── Alpha rescaling: fuse into P@V WMMA operand preparation ──
-        // Apply alpha to acc_o via vector multiply, then proceed to P@V
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             float corr_alpha = __shfl_sync(0xFFFFFFFFFFFFFFFFULL, alpha, lg * 8 + i);
@@ -354,6 +330,11 @@ __global__ void wave_attn_kernel_templated(
                 acc_o[d][i] *= corr_alpha;
             }
         }
+
+        // ── Load V tile (all threads, reuses K's LDS) ──────────
+        load_v_tile_transposed_wave_fast<K_TILE, LDV>(V_fp8 + v_off, smem_K, ks, K_TILE, Dim, Seq_K,
+            tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+        cta.sync();
 
         // ── Phase 3: O += P @ V  (FP8 WMMA) ────────────────────────
         for (int dt = 0; dt < num_d; dt++) {
@@ -364,7 +345,7 @@ __global__ void wave_attn_kernel_templated(
             for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
                 v2i vv = (v2i){0, 0};
                 if (vc < Dim) {
-                    uint64_t v64 = *(const uint64_t*)&smem_V[vc * LDV + k_sub * 16 + lg * 8];
+                    uint64_t v64 = *(const uint64_t*)&smem_K[vc * LDV + k_sub * 16 + lg * 8];
                     vv = *(const v2i*)&v64;
                 }
                 #if defined(__gfx1200__) || defined(__gfx1201__)
@@ -408,9 +389,6 @@ __global__ void wave_attn_kernel_templated(
             for (int i = 0; i < 8; i++) {
                 int orr = q_block_start + wave_id * 16 + lg * 8 + i;
                 int oc = doff + lw;
-                // Hoisted above the store guard: `orr < Seq_Q && oc < Dim` is
-                // lane-divergent, and a broadcast inside it would read lanes
-                // that are inactive for this iteration.
                 float rmax = __shfl_sync(0xFFFFFFFFFFFFFFFFULL, row_max, lg * 8 + i);
                 float rsum = __shfl_sync(0xFFFFFFFFFFFFFFFFULL, total_row_sum, lg * 8 + i);
                 if (orr < Seq_Q && oc < Dim) {
@@ -486,27 +464,27 @@ void launch_wave_attn(
     int out_dtype, bool is_causal, hipStream_t stream
 ) {
     // ── Tile selection ──────────────────────────────────────────────
-    // Q_TILE capped at 64: smaller Q → bigger K_TILE → fewer outer iterations
-    // K_TILE=128 for D<128, K_TILE=64 for D≥128 (LDS budget)
+    // K_TILE=128 for D≤64 and Seq_K≥128: halves K-tile iterations.
+    // K_TILE=64  otherwise (small sequences have only 1 iter anyway
+    //   and the larger sacc[8] VGPR footprint hurts more than it helps).
     int Q_TILE, K_TILE, THREADS;
+    const bool large_k = (Dim <= 64 && Seq_K >= 128);
 
-    // ── Adaptive tile selection (v7-style with K_TILE bias toward 128) ─
     if (Seq_Q <= 16) {
         Q_TILE = 16;
-        K_TILE = (Dim >= 128 || Seq_K < 128) ? 64 : 128;
+        K_TILE = large_k ? 128 : 64;
         THREADS = 32;
     } else if (Seq_Q <= 32) {
         Q_TILE = 32;
-        K_TILE = (Dim >= 128 || Seq_K < 128) ? 64 : 128;
+        K_TILE = large_k ? 128 : 64;
         THREADS = 64;
     } else if (Seq_Q <= 64) {
         Q_TILE = 64;
-        K_TILE = (Dim >= 128 || Seq_K < 128) ? 64 : 128;
+        K_TILE = large_k ? 128 : 64;
         THREADS = 128;
     } else {
-        // Long sequences: use Q_TILE=128 to keep block count down and reuse K/V loads
         Q_TILE = 128;
-        K_TILE = (Dim >= 128) ? 64 : ((Seq_K >= 128) ? 128 : 64);
+        K_TILE = large_k ? 128 : 64;
         THREADS = 256;
     }
 
@@ -523,18 +501,27 @@ void launch_wave_attn(
 
     dim3 grid(B * H * num_splits, num_blocks_q);
     dim3 block(THREADS);
-    // Q is staged through the K/V region and then held in registers, so the
-    // block only needs whichever of the two phases is larger.
-    size_t kv_bytes = (size_t)(K_TILE * (Dim + WAVE_ATTN_LDS_PAD)
-                             + Dim * (K_TILE + WAVE_ATTN_LDS_PAD));
-    size_t smem_bytes = (size_t)((Q_TILE * Dim > (int)kv_bytes) ? (size_t)(Q_TILE * Dim) : kv_bytes) * sizeof(uint8_t);
+    // Sequential K/V loading: only one tile in LDS at a time.
+    size_t smem_bytes = (size_t)max(
+        (int64_t)K_TILE * (Dim + WAVE_ATTN_LDS_PAD),
+        (int64_t)Dim    * (K_TILE + WAVE_ATTN_LDS_PAD));
 
-    if (Q_TILE == 16) {
+    if (Q_TILE == 16 && K_TILE == 128) {
+        hipLaunchKernelGGL((wave_attn_kernel_templated<16, 128, 32>), grid, block, smem_bytes, stream,
+            Q_fp8, K_fp8, V_fp8, Out, LSE, partial_max, partial_sum, partial_out,
+            B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale,
+            out_dtype, is_causal, num_splits);
+    } else if (Q_TILE == 16 && K_TILE == 64) {
         hipLaunchKernelGGL((wave_attn_kernel_templated<16, 64, 32>), grid, block, smem_bytes, stream,
             Q_fp8, K_fp8, V_fp8, Out, LSE, partial_max, partial_sum, partial_out,
             B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale,
             out_dtype, is_causal, num_splits);
-    } else if (Q_TILE == 32) {
+    } else if (Q_TILE == 32 && K_TILE == 128) {
+        hipLaunchKernelGGL((wave_attn_kernel_templated<32, 128, 64>), grid, block, smem_bytes, stream,
+            Q_fp8, K_fp8, V_fp8, Out, LSE, partial_max, partial_sum, partial_out,
+            B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale,
+            out_dtype, is_causal, num_splits);
+    } else if (Q_TILE == 32 && K_TILE == 64) {
         hipLaunchKernelGGL((wave_attn_kernel_templated<32, 64, 64>), grid, block, smem_bytes, stream,
             Q_fp8, K_fp8, V_fp8, Out, LSE, partial_max, partial_sum, partial_out,
             B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale,

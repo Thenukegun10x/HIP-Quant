@@ -46,6 +46,12 @@ CODEBOOKS = (
          ArraySpec("h_iq1s_neighbours", "uint16_t", 1375339)),
     ),
     CodebookSpec(
+        "iq2_s", "hip_quant_iq2s_data.h",
+        (ArraySpec("h_iq2s_grid", "int8_t", 1024 * 8),
+         ArraySpec("h_iq2s_map", "int", 43692),
+         ArraySpec("h_iq2s_neighbours", "uint16_t", 209100)),
+    ),
+    CodebookSpec(
         "iq2_xs", "hip_quant_iq2xs_data.h",
         (ArraySpec("h_iq2xs_grid", "int8_t", 512 * 8),
          ArraySpec("h_iq2xs_map", "int", 43692),

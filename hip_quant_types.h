@@ -77,6 +77,29 @@ typedef struct {
     int8_t qs[32];
 } block_q8_1;
 
+// Q1_0: 128-element groups, 1 sign bit per element (1.125 bpw)
+#define QK1_0 128
+
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK1_0 / 8];
+} block_q1_0;
+
+// Q2_0: 64-element groups, 2 bits per element (2.25 bpw)
+#define QK2_0 64
+
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+
+// Q8_K: 256-element blocks, float scale, 8-bit quants + int16 sums of 16-element groups
+typedef struct {
+    float d;
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+} block_q8_K;
+
 #define QK4_NL 32
 
 typedef struct {
@@ -164,6 +187,30 @@ typedef struct {
     uint8_t qs[QK_K / 8];
     uint16_t qh[QK_K / 32];
 } block_iq1_s;
+
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_K / 4];
+    uint8_t qh[QK_K / 32];
+    uint8_t scales[QK_K / 32];
+} block_iq2_s;
+
+typedef struct {
+    uint8_t qs[QK_K / 8];
+    uint8_t qh[QK_K / 16];
+    uint8_t scales[QK_K / 32];
+} block_iq1_m;
+
+#if defined(__cplusplus)
+static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s wire layout must remain 82 bytes");
+static_assert(sizeof(block_iq1_m) == 56, "block_iq1_m wire layout must remain 56 bytes");
+#endif
+
+#if defined(__cplusplus)
+static_assert(sizeof(block_q1_0) == 18, "block_q1_0 wire layout must remain 18 bytes");
+static_assert(sizeof(block_q2_0) == 18, "block_q2_0 wire layout must remain 18 bytes");
+static_assert(sizeof(block_q8_K) == 292, "block_q8_K wire layout must remain 292 bytes");
+#endif
 
 typedef struct {
     uint8_t qs[(QK_K - 4 * QK_K / 64) / 5]; // 5 elements per byte

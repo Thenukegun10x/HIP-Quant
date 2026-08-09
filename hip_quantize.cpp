@@ -43,6 +43,12 @@
 #include "kernels/quant_aq2.cu"
 #include "kernels/quant_f8_e4m3.cu"
 #include "kernels/quant_f8_e5m2.cu"
+#include "kernels/quant_iq2_s.cu"
+#include "kernels/quant_iq1_m.cu"
+#include "kernels/quant_q1_0.cu"
+#include "kernels/quant_q2_0.cu"
+#include "kernels/quant_q8_K.cu"
+#include "kernels/quant_bf16.cu"
 #include "kernels/fp8_expand.cu"
 #include "kernels/dequant_to_fp8.cu"
 #include "kernels/fp8_gemm_test.cu"
@@ -65,6 +71,7 @@ static bool iq2xxs_tables_loaded = false;
 static bool iq2xs_tables_loaded = false;
 static bool iq1s_tables_loaded = false;
 static bool iq3s_tables_loaded = false;
+static bool iq2s_tables_loaded = false;
 static int device_id = 0;
 static hipDeviceProp_t props;
 static int *d_iq2xxs_map_data = NULL;
@@ -78,6 +85,9 @@ static uint16_t *d_iq1s_neighbours_data = NULL;
 static int8_t *d_iq3s_grid_data = NULL;
 static int *d_iq3s_map_data = NULL;
 static uint16_t *d_iq3s_neighbours_data = NULL;
+static int8_t *d_iq2s_grid_data = NULL;
+static int *d_iq2s_map_data = NULL;
+static uint16_t *d_iq2s_neighbours_data = NULL;
 
 // Per-thread cached GPU buffers for quantize_tensor.
 // File-scope so quantize_reset() can free them from any thread.
@@ -345,6 +355,18 @@ static bool ensure_initialized() {
         if (!copied) { free_iq_tables(ptrs, 3); return false; }
         iq3s_tables_loaded = true;
     }
+    if (!iq2s_tables_loaded) {
+        void **ptrs[] = {(void **)&d_iq2s_grid_data, (void **)&d_iq2s_map_data, (void **)&d_iq2s_neighbours_data};
+        iq_host_codebook table = {};
+        if (!load_iq_host_codebook("iq2_s", 1024 * 8, 43692 * sizeof(int), 209100 * sizeof(uint16_t), &table)) return false;
+        bool copied =
+            alloc_copy_table((void **)&d_iq2s_grid_data, table.grid, 1024 * 8, "copy iq2s grid") &&
+            alloc_copy_table((void **)&d_iq2s_map_data, table.map, 43692 * sizeof(int), "copy iq2s map") &&
+            alloc_copy_table((void **)&d_iq2s_neighbours_data, table.neighbours, 209100 * sizeof(uint16_t), "copy iq2s neighbours");
+        free_iq_host_codebook(&table);
+        if (!copied) { free_iq_tables(ptrs, 3); return false; }
+        iq2s_tables_loaded = true;
+    }
     return true;
 }
 
@@ -371,11 +393,17 @@ static size_t get_row_size(int type, int64_t n_per_row) {
         case 19: return sizeof(block_iq1_s) * (n_per_row / QK_K);
         case 20: return sizeof(block_iq4_nl) * (n_per_row / QK4_NL);
         case 21: return sizeof(block_iq3_s) * (n_per_row / QK_K);
+        case 22: return sizeof(block_iq2_s) * (n_per_row / QK_K);
         case 23: return sizeof(block_iq4_xs) * (n_per_row / QK_K);
+        case 29: return sizeof(block_iq1_m) * (n_per_row / QK_K);
         case 38: return sizeof(block_hq2) * (n_per_row / QK_K);
-        case 39: case 40: case 41: return sizeof(block_aq2) * (n_per_row / QK_K);
+        case 31: case 32: case 33: return sizeof(block_aq2) * (n_per_row / QK_K);
         case 34: return sizeof(block_tq1_0) * (n_per_row / QK_K);
         case 35: return sizeof(block_tq2_0) * (n_per_row / QK_K);
+        case 41: return sizeof(block_q1_0) * (n_per_row / QK1_0);
+        case 42: return sizeof(block_q2_0) * (n_per_row / QK2_0);
+        case 15: return sizeof(block_q8_K) * (n_per_row / QK_K);
+        case 30: return 2 * n_per_row;
         case 36: return sizeof(block_f8_e4m3) * (n_per_row / QK_F8);
         case 37: return sizeof(block_f8_e5m2) * (n_per_row / QK_F8);
         default: return 0;
@@ -386,10 +414,15 @@ static int get_blocks_per_row(int type, int64_t n_per_row) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:
             return (int)(n_per_row / 32);
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: case 39: case 40: case 41:
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 22: case 34: case 35: case 38: case 31: case 32: case 33:
             return (int)(n_per_row / QK_K);
         case 20: return (int)(n_per_row / QK4_NL);
         case 23: return (int)(n_per_row / QK_K);
+        case 29: return (int)(n_per_row / QK_K);
+        case 41: return (int)(n_per_row / QK1_0);
+        case 42: return (int)(n_per_row / QK2_0);
+        case 15: return (int)(n_per_row / QK_K);
+        case 30: return (int)n_per_row;
         case 36: case 37: return (int)(n_per_row / QK_F8);
         default: return 0;
     }
@@ -402,8 +435,13 @@ static int get_block_size_for_type(int type) {
             return 32;
         case 10: case 11: case 12: case 13: case 14:
         case 16: case 17: case 18: case 19: case 21:
-        case 23: case 34: case 35: case 38: case 39: case 40: case 41:
+        case 22: case 23: case 29:
+        case 34: case 35: case 38: case 31: case 32: case 33:
             return 256;
+        case 41: return QK1_0;
+        case 42: return QK2_0;
+        case 15: return QK_K;
+        case 30: return 1;
         default:
             return 0;
     }
@@ -466,11 +504,17 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
         case 19: return sizeof(block_iq1_s);
         case 20: return sizeof(block_iq4_nl);
         case 21: return sizeof(block_iq3_s);
+        case 22: return sizeof(block_iq2_s);
         case 23: return sizeof(block_iq4_xs);
+        case 29: return sizeof(block_iq1_m);
         case 38: return sizeof(block_hq2);
-        case 39: case 40: case 41: return sizeof(block_aq2);
+        case 31: case 32: case 33: return sizeof(block_aq2);
         case 34: return sizeof(block_tq1_0);
         case 35: return sizeof(block_tq2_0);
+        case 41: return sizeof(block_q1_0);
+        case 42: return sizeof(block_q2_0);
+        case 15: return sizeof(block_q8_K);
+        case 30: return 2;
         case 36: return sizeof(block_f8_e4m3);
         case 37: return sizeof(block_f8_e5m2);
         default: return 0;
@@ -480,10 +524,14 @@ HIP_QUANT_EXPORT size_t ggml_type_size_for(int type) {
 HIP_QUANT_EXPORT int ggml_blck_size_for(int type) {
     switch (type) {
         case 2:  case 3:  case 6:  case 7:  case 8:  case 9:  return 32;
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 34: case 35: case 38: case 39: case 40: case 41: return 256;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 22: case 29: case 34: case 35: case 38: case 31: case 32: case 33: return 256;
         case 20: return QK4_NL;
         case 23: return QK_K;
         case 36: case 37: return QK_F8;
+        case 41: return QK1_0;
+        case 42: return QK2_0;
+        case 15: return QK_K;
+        case 30: return 1;
         default: return 0;
     }
 }
@@ -598,6 +646,16 @@ static int dispatch_quantize_kernel(
                 d_src, d_dst, d_imatrix, d_iq3s_grid_data, d_iq3s_map_data, d_iq3s_neighbours_data, nrows, n_per_row);
             break;
         }
+        case 22: {
+            hipLaunchKernelGGL(quantize_iq2_s_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq2s_grid_data, d_iq2s_map_data, d_iq2s_neighbours_data, nrows, n_per_row);
+            break;
+        }
+        case 29: {
+            hipLaunchKernelGGL(quantize_iq1_m_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, d_iq1s_grid_data, d_iq1s_map_data, d_iq1s_neighbours_data, nrows, n_per_row);
+            break;
+        }
         case 23: {
             hipLaunchKernelGGL(quantize_iq4_xs_kernel, gridDim, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row);
@@ -618,19 +676,42 @@ static int dispatch_quantize_kernel(
                 d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
             break;
         }
-        case 39: {
+        case 31: {
             hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
             break;
         }
-        case 40: {
+        case 32: {
+            hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
+            break;
+        }
+        case 33: {
             hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
                 d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
             break;
         }
         case 41: {
-            hipLaunchKernelGGL(quantize_aq2_kernel, gridDim, 256, 0, 0,
-                d_src, d_dst, d_imatrix, nrows, n_per_row, hq2_iterations);
+            hipLaunchKernelGGL(quantize_q1_0_kernel, gridDim, QK1_0, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
+            break;
+        }
+        case 42: {
+            hipLaunchKernelGGL(quantize_q2_0_kernel, gridDim, QK2_0, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
+            break;
+        }
+        case 15: {
+            hipLaunchKernelGGL(quantize_q8_K_kernel, gridDim, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
+            break;
+        }
+        case 30: {
+            int64_t total = (int64_t)nrows * n_per_row;
+            if (!validate_flat_blocks(total, 256, "quantize_bf16")) return 0;
+            dim3 flatGrid((unsigned int)((total + 255) / 256));
+            hipLaunchKernelGGL(quantize_bf16_kernel, flatGrid, 256, 0, 0,
+                d_src, d_dst, d_imatrix, nrows, n_per_row);
             break;
         }
         case 36: {
@@ -823,6 +904,14 @@ static int dispatch_dequantize_to_fp8_kernel(
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_iq4_xs_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_iq4_xs *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
             break;
+        case 22:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_iq2_s_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_iq2_s *)d_src, d_dst, d_iq2s_grid_data, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 29:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_iq1_m_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
+                (const block_iq1_m *)d_src, d_dst, d_iq1s_grid_data, nrows, n_blocks_per_row, n_per_row);
+            break;
         case 34:
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_tq1_0_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_tq1_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
@@ -835,12 +924,32 @@ static int dispatch_dequantize_to_fp8_kernel(
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_hq2_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_hq2 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
             break;
-        case 39: case 40: case 41:
+        case 31: case 32: case 33:
             // AQ2 has the same physical block layout as HQ2, so it can use
             // the existing decoder until a fused AQ2 inference path exists.
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_hq2_to_fp8_kernel<E5M2>), gridDim, 256, 0, 0,
                 (const block_hq2 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
             break;
+        case 41:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q1_0_to_fp8_kernel<E5M2>), gridDim, QK1_0, 0, 0,
+                (const block_q1_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 42:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q2_0_to_fp8_kernel<E5M2>), gridDim, QK2_0, 0, 0,
+                (const block_q2_0 *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 15:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q8_k_to_fp8_kernel<E5M2>), gridDim, QK_K, 0, 0,
+                (const block_q8_K *)d_src, d_dst, nrows, n_blocks_per_row, n_per_row);
+            break;
+        case 30: {
+            int64_t total = (int64_t)nrows * n_per_row;
+            if (!validate_flat_blocks(total, 256, "dequant_bf16")) return 0;
+            dim3 flatGrid((unsigned int)((total + 255) / 256));
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_bf16_to_fp8_kernel<E5M2>), flatGrid, 256, 0, 0,
+                (const uint16_t *)d_src, d_dst, total);
+            break;
+        }
         default:
             return 0;
     }
@@ -864,7 +973,7 @@ static size_t quantize_tensor_impl(
     int hq2_iterations
 ) {
     if (!ensure_initialized()) return 0;
-    if ((type == 38 || type == 39 || type == 40 || type == 41) && (hq2_iterations < 1 || hq2_iterations > 16)) {
+    if ((type == 38 || type == 31 || type == 32 || type == 33) && (hq2_iterations < 1 || hq2_iterations > 16)) {
         fprintf(stderr, "hip_quantize: HQ2/AQ2 iterations must be in [1, 16], got %d\n", hq2_iterations);
         return 0;
     }
@@ -983,7 +1092,7 @@ HIP_QUANT_EXPORT size_t quantize_tensor_aq2_iters(
     int aq2_iterations
 ) {
     if (type != 39 && type != 40 && type != 41) {
-        fprintf(stderr, "hip_quantize: quantize_tensor_aq2_iters only supports AQ2/AQ2_QK/AQ2_VO (types 39-41)\n");
+        fprintf(stderr, "hip_quantize: quantize_tensor_aq2_iters only supports AQ2/AQ2_QK/AQ2_VO (types 31-33)\n");
         return 0;
     }
     return quantize_tensor_impl(type, src, dst, nrows, n_per_row, imatrix, aq2_iterations);
@@ -1009,7 +1118,7 @@ HIP_QUANT_EXPORT int benchmark_quantize_kernel(
         return 1;
     }
     if (!ensure_initialized()) return 1;
-    if ((type == 38 || type == 39 || type == 40 || type == 41) && (hq2_iterations < 1 || hq2_iterations > 16)) {
+    if ((type == 38 || type == 31 || type == 32 || type == 33) && (hq2_iterations < 1 || hq2_iterations > 16)) {
         fprintf(stderr, "hip_quantize: HQ2/AQ2 iterations must be in [1, 16], got %d\n", hq2_iterations);
         return 1;
     }

@@ -1,0 +1,216 @@
+#include "../hip_quant_types.h"
+#include "../hip_quant_util.h"
+#include <float.h>
+
+#define GROUP_MAX_EPS_IQ2_S 1e-8f
+#define IQ2S_BLOCK_SIZE 16
+
+static __device__ int iq2s_find_best_neighbour(
+    const uint16_t * neighbours, const int8_t * grid,
+    const float * xval, const float * weight, float scale, int8_t * L
+) {
+    int num_neighbors = neighbours[0];
+    float best_d2 = FLT_MAX;
+    int best_idx = neighbours[1];
+    for (int j = 1; j <= num_neighbors; ++j) {
+        int idx = neighbours[j];
+        const int8_t * pg = grid + 8 * idx;
+        float d2 = 0;
+        for (int i = 0; i < 8; ++i) {
+            float q = (float)pg[i];
+            float diff = scale * q - xval[i];
+            d2 += weight[i] * diff * diff;
+        }
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_idx = idx;
+        }
+    }
+    const int8_t * pg = grid + 8 * best_idx;
+    for (int i = 0; i < 8; ++i) L[i] = (pg[i] - 1) / 2;
+    return best_idx;
+}
+
+__global__ void quantize_iq2_s_kernel(
+    const float * __restrict__ src,
+    uint8_t * __restrict__ dst,
+    const float * __restrict__ imatrix,
+    const int8_t * __restrict__ grid,
+    const int * __restrict__ map,
+    const uint16_t * __restrict__ neighbours_data,
+    int nrows,
+    int n_per_row
+) {
+    const int n_sub_blocks = QK_K / IQ2S_BLOCK_SIZE;
+    int row = blockIdx.x;
+    int ibl = blockIdx.y;
+    int ib = threadIdx.x;
+    if (row >= nrows) return;
+    int nbl = n_per_row / QK_K;
+    if (ibl >= nbl) return;
+    if (ib >= n_sub_blocks) return;
+
+    const float * xbl = src + row * n_per_row + QK_K * ibl;
+    block_iq2_s * y = (block_iq2_s *)(dst + (row * nbl + ibl) * sizeof(block_iq2_s));
+
+    __shared__ float s_scales[QK_K / IQ2S_BLOCK_SIZE];
+    __shared__ uint8_t s_qs_low[QK_K / 8];
+    __shared__ uint8_t s_qs_sign[QK_K / 8];
+    __shared__ uint8_t s_qh2[QK_K / 16];
+
+    for (int i = threadIdx.x; i < QK_K / 8; i += n_sub_blocks) s_qs_low[i] = 0;
+    for (int i = threadIdx.x; i < QK_K / 8; i += n_sub_blocks) s_qs_sign[i] = 0;
+    for (int i = threadIdx.x; i < QK_K / 16; i += n_sub_blocks) s_qh2[i] = 0;
+    __syncthreads();
+
+    float local_scale;
+    float sumx2 = 0;
+    for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
+    float sigma2 = 2.0f * sumx2 / QK_K;
+
+    {
+        const float * xb = xbl + IQ2S_BLOCK_SIZE * ib;
+        const float * qw = imatrix ? imatrix + row * n_per_row + QK_K * ibl + IQ2S_BLOCK_SIZE * ib : NULL;
+        float weight[IQ2S_BLOCK_SIZE], waux[IQ2S_BLOCK_SIZE], xval[IQ2S_BLOCK_SIZE];
+        int8_t L[IQ2S_BLOCK_SIZE], Laux[IQ2S_BLOCK_SIZE];
+        bool is_on_grid[2], is_on_grid_aux[2];
+        uint8_t block_signs[2];
+
+        for (int i = 0; i < IQ2S_BLOCK_SIZE; ++i) {
+            float wi = qw ? qw[i] * sqrtf(sigma2 + xb[i] * xb[i]) : 0.25f * sigma2 + xb[i] * xb[i];
+            weight[i] = wi;
+            waux[i] = sqrtf(wi);
+        }
+        for (int k = 0; k < 2; ++k) {
+            uint8_t s = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (xb[8 * k + i] >= 0) xval[8 * k + i] = xb[8 * k + i];
+                else {
+                    xval[8 * k + i] = -xb[8 * k + i];
+                    s |= (1u << i);
+                }
+            }
+            block_signs[k] = s;
+        }
+
+        float max_v = xval[0];
+        for (int i = 1; i < IQ2S_BLOCK_SIZE; ++i) if (xval[i] > max_v) max_v = xval[i];
+        for (int i = 0; i < IQ2S_BLOCK_SIZE; ++i) L[i] = 0;
+        if (max_v < GROUP_MAX_EPS_IQ2_S) {
+            local_scale = 0;
+        } else {
+            float best = 0;
+            float scale = max_v / 5.0f;
+            is_on_grid[0] = is_on_grid[1] = true;
+            for (int is = -9; is <= 9; ++is) {
+                float id = (5.0f + (float)is * 0.1f) / max_v;
+                float this_scale = 1.0f / id;
+                for (int k = 0; k < 2; ++k) {
+                    for (int i = 0; i < 8; ++i) {
+                        int l = nearest_int(0.5f * (id * xval[8 * k + i] - 1.0f));
+                        if (l < 0) l = 0;
+                        if (l > 2) l = 2;
+                        Laux[8 * k + i] = (int8_t)l;
+                    }
+                    uint16_t u = 0;
+                    for (int i = 0; i < 8; ++i) u |= ((uint16_t)Laux[8 * k + i] << (2 * i));
+                    int grid_index = map[u];
+                    is_on_grid_aux[k] = true;
+                    if (grid_index < 0) {
+                        is_on_grid_aux[k] = false;
+                        const uint16_t * neighbours = neighbours_data + (-grid_index - 1);
+                        grid_index = iq2s_find_best_neighbour(neighbours, grid, xval + 8 * k, waux + 8 * k, this_scale, Laux + 8 * k);
+                    }
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < IQ2S_BLOCK_SIZE; ++i) {
+                    float w = weight[i];
+                    float q = 2.0f * (float)Laux[i] + 1.0f;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+                    scale = sumqx / sumq2;
+                    best = scale * sumqx;
+                    for (int i = 0; i < IQ2S_BLOCK_SIZE; ++i) L[i] = Laux[i];
+                    for (int k = 0; k < 2; ++k) is_on_grid[k] = is_on_grid_aux[k];
+                }
+            }
+
+            int n_not_ongrid = 0;
+            for (int k = 0; k < 2; ++k) if (!is_on_grid[k]) ++n_not_ongrid;
+            if (n_not_ongrid > 0 && scale > 0) {
+                float id = 1.0f / scale;
+                for (int k = 0; k < 2; ++k) {
+                    if (is_on_grid[k]) continue;
+                    uint16_t u = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        int l = nearest_int(0.5f * (id * xval[8 * k + i] - 1.0f));
+                        if (l < 0) l = 0;
+                        if (l > 2) l = 2;
+                        u |= ((uint16_t)l << (2 * i));
+                        L[8 * k + i] = (int8_t)l;
+                    }
+                    int grid_index = map[u];
+                    if (grid_index < 0) {
+                        const uint16_t * neighbours = neighbours_data + (-grid_index - 1);
+                        grid_index = iq2s_find_best_neighbour(neighbours, grid, xval + 8 * k, waux + 8 * k, scale, L + 8 * k);
+                    }
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < IQ2S_BLOCK_SIZE; ++i) {
+                    float w = weight[i];
+                    float q = 2.0f * (float)L[i] + 1.0f;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0) scale = sumqx / sumq2;
+            }
+
+            if (scale < 0) {
+                scale = -scale;
+                for (int k = 0; k < 2; ++k) block_signs[k] = ~block_signs[k];
+            }
+            for (int k = 0; k < 2; ++k) {
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) u |= ((uint16_t)L[8 * k + i] << (2 * i));
+                int grid_index = map[u];
+                if (grid_index < 0) { grid_index = 0; }
+                const int i8 = 2 * ib + k;
+                s_qs_low[i8] = (uint8_t)(grid_index & 255);
+                s_qh2[ib] |= (uint8_t)((grid_index >> 8) << (2 * k));
+                s_qs_sign[i8] = block_signs[k];
+            }
+            local_scale = scale;
+        }
+    }
+
+    s_scales[ib] = local_scale;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float max_scale = 0;
+        for (int j = 0; j < n_sub_blocks; ++j)
+            if (s_scales[j] > max_scale) max_scale = s_scales[j];
+
+        if (max_scale == 0) {
+            memset(y, 0, sizeof(block_iq2_s));
+        } else {
+            memset(y, 0, sizeof(block_iq2_s));
+            float d = max_scale / 31.0f;
+            y->d = fp32_to_fp16(d * 0.9875f);
+            float id = 1.0f / d;
+            for (int j = 0; j < n_sub_blocks; ++j) {
+                int l = nearest_int(0.5f * (id * s_scales[j] - 1.0f));
+                if (l < 0) l = 0;
+                if (l > 15) l = 15;
+                if (j % 2 == 0) y->scales[j / 2] = (uint8_t)l;
+                else y->scales[j / 2] |= (uint8_t)(l << 4);
+            }
+            for (int i = 0; i < QK_K / 8; ++i) y->qs[i] = s_qs_low[i];
+            for (int i = 0; i < QK_K / 8; ++i) y->qs[QK_K / 8 + i] = s_qs_sign[i];
+            for (int i = 0; i < QK_K / 32; ++i)
+                y->qh[i] = (uint8_t)(s_qh2[2 * i] | (s_qh2[2 * i + 1] << 4));
+        }
+    }
+}
