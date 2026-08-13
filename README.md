@@ -48,13 +48,15 @@ out = hip_quant.wave_attn(q, k, v)  # FP8 WMMA, 3-8x faster than SDPA
 - Online softmax with warp-level shuffle reduction
 - Multi-split parallelism for low-occupancy configs
 
-## HQ2 and HQ3: portable learned-codebook quantization
+## HQ2 / HQ3 — experimental learned-codebook formats
 
-`hq2` is the public, backend-neutral API for the HQ2 format: each 256-weight
-block stores four FP16 reconstruction values plus a two-bit selector for each
-weight, for an exact physical cost of **2.25 bits per weight**.  The packed
-72-byte blocks have one stable little-endian layout, so data quantized on one
-backend can be decoded on another.
+`hq2` is a backend-neutral Python API for the HQ-family formats. The shipped
+HQ2 stores each 256-weight block as four learned FP16 centroids plus a two-bit
+selector per weight (72 bytes, **2.25 bpw**); HQ3 stores eight FP16 centroids
+plus 3-bit selectors (112 bytes, **3.5 bpw**). Blocks have one stable
+little-endian layout, so a tensor quantized on one backend decodes on another.
+This 2.25 bpw scalar layout is the original format; the 2.06 bpw `HQ2V`
+successor is described below and is not yet wired into this module.
 
 ```python
 import numpy as np
@@ -63,213 +65,41 @@ import hq2
 weights = np.random.randn(4096, 4096).astype(np.float32)
 packed = hq2.quantize(weights, importance=np.abs(weights), backend="cpu")
 assert packed.bits_per_weight == 2.25
-
-# Portable bytes + metadata; this file can be read on any supported backend.
-packed.save("weights.hq2.npz")
-restored = hq2.load("weights.hq2.npz").dequantize()
-
-# Or copy the same packed blocks to an available Torch CUDA/ROCm device.
-gpu_packed = hq2.load("weights.hq2.npz").to("cuda")
-gpu_restored = gpu_packed.dequantize()
+restored = packed.dequantize()
 ```
 
-HQ3 is the higher-fidelity companion format. It keeps 256-weight blocks but
-stores eight learned FP16 reconstruction values and 3-bit selectors packed as
-eight selectors in three bytes: **112 bytes / 3.5 bpw**. Use it for
-quality-sensitive projections in a calibrated mixed HQ2/HQ3 model.
+> **Status: experimental — not competitive yet.** HQ2 is a blockwise *scalar*
+> quantizer that sits within 0.02 dB of its Lloyd-Max optimum, so its gap to
+> the vector-quantized GGML IQ family is structural, not a bug. In a controlled
+> MLP-only study it **loses to `iq2_xxs` while spending more bits** (2.25 vs
+> 2.0625 bpw, Δln PPL −0.179), and HQ3 (3.5 bpw) loses to `iq3_s`/`q3_k`
+> (3.44 bpw). A full mixed HQ2/HQ3 policy also loses to Unsloth `IQ2_M` at
+> equal size. See `Own Quant/HQ_LADDER_FINDINGS.md` and
+> `Own Quant/HQ2_FINDINGS.md` for the measurements.
 
-```python
-hq3 = hq2.quantize(weights, backend="cpu", format="hq3", iterations=4)
-assert hq3.bits_per_weight == 3.5
-```
+> **The packed kernels are a functional baseline, not a speed win.** The direct
+> packed-weight ROCm kernels (`HQ2Linear`, `HQ3Linear`) decode correctly
+> on-device, but the current one-output-row GEMV measures ~14–75× slower than
+> decoded BF16 `F.linear` (1.8 tok/s on a hybrid Gemma 4 package; see
+> `Own Quant/experimental/inference_speed/RESULTS.md`).
 
-For a model conversion, use the HQ-native `.hq2` container rather than a
-generic compressed archive.  It stores the packed HQ2 blocks in their direct
-GEMV layout: uncompressed, 4 KiB-aligned, and indexed by tensor name.  Its
-compact footer index lets payloads begin at the first 4 KiB page rather than
-after a reserved metadata region.  Loading a layer memory-maps its packed
-bytes; it never repeats quantization.
+The encoder-side research that *does* pass the GGML rate–distortion frontier —
+`HQ2V` (a 256-entry 4-D codebook, **2.0625 bpw**) and `HQ2VL` (HQ2V plus
+LDLQ/GPTQ-style Hessian error feedback at **zero bit cost**) — is not yet
+shipped as a codec: it needs a GPU encoder, a sequential layer-by-layer driver,
+and held-out scoring before it is shippable (`Own Quant/HQ_LADDER_FINDINGS.md`).
 
-```python
-hq2.save_model(
-    "Gemma-12B-HQ2.hq2",
-    {"model.layers.0.mlp.up_proj.weight": packed},
-    metadata={"architecture": "gemma", "quantization": "HQ2"},
-)
-model_weights = hq2.load_model("Gemma-12B-HQ2.hq2")
-up_proj = model_weights.tensor("model.layers.0.mlp.up_proj.weight").to("cuda")
-```
+The API and format remain useful for archive inspection and reference decode,
+with backends `cpu`, `torch`, and `rocm`:
 
-### HQ archive family contract
-
-`.hq2` is the current conventional extension for an HQ2-only model, but the
-v2 archive envelope is intentionally **HQ-family**, not HQ2-only.  Every
-tensor stores a descriptor with its format name/version, exact block shape,
-bits per weight, byte order/packing identifier, and optional codec parameters.
-That means HQ1 or a later HQ3 revision can use a different physical packing
-and kernel while coexisting with HQ2 layers in the same direct-loadable
-archive. `.hq`,
-`.hq1`, `.hq2`, and `.hq3` are accepted archive suffixes; the descriptor—not
-the filename—selects the decoder.
-
-```python
-import hq2
-
-hq3 = hq2.quantize(np.random.randn(4096, 4096).astype(np.float32), format="hq3")
-with hq2.HQModelWriter("mixed.hq") as archive:
-    archive.add("layer.hq2.weight", packed)       # canonical HQ2
-    archive.add("layer.hq3.weight", hq3)           # canonical HQ3
-```
-
-The Python runtime executes canonical HQ2 and HQ3. On ROCm, `HQ2Linear` and
-`HQ3Linear` have direct packed-weight kernels; other Torch devices use a
-correct decode-plus-linear fallback. Unknown family payloads remain safely
-inspectable through `model.descriptor()` and `model.payload()`. First-generation
-HQ2-only v1 archives, including the existing Gemma conversion, stay readable.
-They can be rewritten to the compact v2 layout with no dequantization or re-quantization:
-
-```python
-hq2.repack_model("Gemma-12B-HQ2-v1.hq2", "Gemma-12B-HQ2-v2.hq2")
-```
-
-### Analyze an HQ archive
-
-`analyze_model()` is the HQ equivalent of a GGUF inspector.  It validates the
-container index, reports model metadata, per-format and per-tensor BPW,
-payload/container overhead, direct-load offsets, and the calibration settings
-recorded during conversion. A deep scan samples up to 2 MiB from every HQ2 or
-HQ3 tensor, checking stored centroids for NaN/Inf and reporting selector use
-and zero blocks. The report explicitly says whether a result is sampled or full;
-`--sha256` additionally fingerprints every complete payload—without decoding
-a full BF16 model.
-
-```powershell
-# Compact human report; add --tensors to print every layer.
-python -m hq2 analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2"
-
-# Installed-wheel shortcut for the same report.
-hq2-analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2"
-
-# Complete machine-readable catalogue record plus physical codec scans.
-python -m hq2 analyze "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" --deep --sha256 --json
-```
-
-```python
-import hq2
-
-report = hq2.analyze_model("Gemma-12B-HQ2.hq2", deep=True)
-print(hq2.render_analysis(report))
-catalogue_json = report.to_json()
-```
-
-The analyzer deeply validates canonical HQ2/HQ3 payloads and reports unknown
-future HQ-family descriptors without pretending to decode them.
-
-On ROCm, `HQ2Linear` and `HQ3Linear` perform real packed-weight inference
-rather than dequantizing an entire layer: their HIP GEMV kernels read the
-selector and FP16 centroid inside the multiply and accumulate directly into
-the output.
-
-```python
-import hq2
-
-weight = hq2.load_model("Gemma-12B-HQ2.hq2").tensor("model.layers.0.mlp.up_proj.weight")
-layer = hq2.HQ2Linear.from_archive(weight).to("cuda")
-output = layer(hidden_states)  # fused ROCm path when hip_quant._C is built
-```
-
-The repository includes a streamed Gemma converter.  Its default
-`gemma-mlp` profile is intentionally HQ2-specific: it packs only language MLP
-projections in the direct `HQ2Linear` layout, preserves the higher-quality
-hybrid strategy used in the evaluation, and leaves embeddings/norms and other
-nonlinear model components in the base BF16 checkpoint.
-
-```powershell
-python tools\quantize_hq2_model.py `
-  --input "Own Quant\Gemma4-12B-it\model.safetensors" `
-  --output "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
-  --profile gemma-mlp --backend rocm --iterations 8 `
-  --imatrix "Own Quant\experimental\gemma4_12b_hq2_l8_mixed_imat\imatrix.npz"
-```
-
-For the Gemma 4 MLP archive, the library can construct the actual hybrid
-Transformers model on ROCm.  It installs all archive MLP layers as fused
-`HQ2Linear` modules and streams the remaining base BF16 tensors to the GPU;
-the original BF16 MLP matrices are skipped entirely.
-
-```python
-import hq2
-
-model = hq2.load_gemma4_hq2(
-    "Own Quant/Gemma4-12B-it",
-    "Own Quant/Gemma4-12B-HQ2-MLP-L8-IMAT.hq2",
-)
-```
-
-### Standalone download-ready HQ2 package
-
-The hybrid archive above is deliberately small, but it needs the original
-checkpoint for non-MLP weights.  Build a standalone package when distributing
-a model: it stores the MLP projections as HQ2 and preserves every remaining
-tensor losslessly as typed `RAW` payloads in the same `model.hq2` archive.
-The package directory also contains the Gemma config, tokenizer, and chat
-template—recipients do **not** need `model.safetensors`.
-
-```powershell
-python tools\package_gemma4_hq2.py `
-  --base "Own Quant\Gemma4-12B-it" `
-  --hq2 "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
-  --output "Own Quant\Gemma4-12B-HQ2-Standalone"
-```
-
-```python
-import hq2
-
-model = hq2.load_gemma4_hq2_package("Gemma4-12B-HQ2-Standalone")
-```
-
-Or use the included inference entrypoint (the first run only loads existing
-BF16/HQ2 data; it never quantizes the model again):
-
-```powershell
-python tools\run_gemma_hq2.py `
-  --base "Own Quant\Gemma4-12B-it" `
-  --archive "Own Quant\Gemma4-12B-HQ2-MLP-L8-IMAT.hq2" `
-  --prompt "Explain why the sky is blue." --max-new-tokens 64
-```
-
-The backends are deliberately explicit:
-
-| Backend | Input | Current state |
+| Backend | Input | State |
 |---|---|---|
-| `cpu` | NumPy array | Portable reference implementation; no GPU dependency. |
-| `rocm` | NumPy array | Existing optimized HIP kernel. Validated locally on RX 9070 XT. |
-| `torch` | Torch tensor | Functional Torch implementation on CPU, CUDA, or ROCm; preserves device residency. ROCm is validated locally; CUDA needs validation on an NVIDIA system. |
-| `cuda` / `rocm-torch` | Torch tensor | Same Torch implementation, with an assertion that the supplied tensor is on the requested platform. |
-| `vulkan` | — | Reserved API name only; there is no SPIR-V kernel yet, and it fails clearly instead of silently using another backend. |
+| `cpu` | NumPy array | Portable reference; no GPU dependency. |
+| `torch` | Torch tensor | Functional Torch implementation (CPU/CUDA/ROCm), preserves device residency. |
+| `rocm` | NumPy array | Native HIP quantizer. |
+| `vulkan` | — | Reserved name only; fails clearly instead of silently using another backend. |
 
-```python
-import torch
-import hq2
-
-weights = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-packed = hq2.quantize(weights, backend="torch", iterations=8)
-reconstructed = packed.dequantize(dtype=torch.bfloat16)
-```
-
-The generic Torch implementation is the correctness and portability baseline,
-not the final performance implementation.  It uses standard Torch operations,
-so the same source can be tested on CUDA and ROCm immediately.  Fused CUDA,
-HIP, and Vulkan kernels can consume the same HQ2/HQ3 block bytes later without a
-format change.  Inspect the actual availability with `hq2.backend_status()`.
-
-To run the intentional CUDA/ROCm integration test on a machine with a visible
-Torch accelerator, use:
-
-```powershell
-$env:HQ2_TEST_GPU = "1"
-python -m pytest tests\test_hq2_portable.py -m gpu -q
-```
+Inspect the actual availability with `hq2.backend_status()`.
 
 ## Hardware Status
 
@@ -311,21 +141,28 @@ Validated local test system:
 
 ### 🔢 Standard & K-Quants (offline API)
 - **Legacy:** `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`
-- **K-Quants:** `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`
+- **K-Quants:** `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`
+- **Binary / low-bit:** `Q1_0` (1.125 bpw), `Q2_0` (2.25 bpw)
 
 ### 🧠 I-Quants (Importance Matrix)
 Non-linear quants that preserve quality at extreme low bits:
-- `IQ1_S`, `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`
+- `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`
 
 ### ⚖️ Ternary Quants
 For models trained to be ternary (BitNet, TriLM):
 - `TQ1_0` (1.69 bpw), `TQ2_0` (2.06 bpw)
 
-### 🧪 FP8 Formats (both APIs)
+### 🎯 Attention-calibrated & HQ (experimental)
+- `AQ2`, `AQ2_QK`, `AQ2_VO` (2.25 bpw; HQ2 physical block, fit with
+  attention-derived saliency)
+- `HQ2` (2.25 bpw) — experimental; see the HQ2/HQ3 section above
+
+### 🧪 FP8 / BF16 Formats (both APIs)
 | Format | Layout | Use case |
 |---|---|---|
 | `F8_E4M3` | 1s·4e·3m, bias=7, max=±448, NaN only | Forward activations & weights |
 | `F8_E5M2` | 1s·5e·2m, bias=15, max=±57344, ±Inf+NaN | Backward gradients |
+| `BF16` | 1s·8e·7m IEEE bfloat16 | Checkpoint / weight storage (cast) |
 
 Default FP8 quantization uses OCP standard semantics with round-to-nearest-even. The PyTorch extension also exposes opt-in stochastic E5M2 rounding for backward gradients.
 
@@ -419,7 +256,7 @@ the next replay.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-0.5.6-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-1.1.0-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -886,11 +723,11 @@ The benchmark is available at `tests/torch/bench_fp8.py`. It measures custom
 WMMA automatically on a compatible device and reports the runtime guard reason
 otherwise.
 
-The 0.6.1 FP8/BF16 optimization pass is primarily a speed and memory-bandwidth
+The FP8/BF16 kernel path is primarily a speed and memory-bandwidth
 improvement: it reuses pre-quantized FP8 activations/gradients, skips redundant
 output zeroing, fuses bias stores, vectorizes elementwise FP8 kernels, and caches
 offline FP8 temporary buffers. Persistent VRAM savings are still mainly provided
-by `Fp8ShadowLinear` FP8 weight shadows and activation compression; this release
+by `Fp8ShadowLinear` FP8 weight shadows and activation compression; this path
 reduces transient allocations and extra memory passes around those features.
 
 RDNA3 (`gfx11`) and CDNA devices are rejected for this specific builtin path.
@@ -995,18 +832,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-0.5.6-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.6.tar.gz"
+  "dist\hip_quant-1.1.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.1.0.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-0.5.6-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-0.5.6.tar.gz"
+  "dist\hip_quant-1.1.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.1.0.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-0.5.6-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-1.1.0-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:
