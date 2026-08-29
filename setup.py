@@ -112,6 +112,10 @@ def _torch_extension_config():
             "torch_ext/mxfp4_to_fp8_kernels.hip",
             "torch_ext/hq2_linear_kernels.hip",
             "torch_ext/hq3_linear_kernels.hip",
+            "torch_ext/hq8_g128_linear_kernels.hip",
+            "torch_ext/wave_attn.hip",
+            "torch_ext/wave_attn_backward.hip",
+            "torch_ext/wave_attn_diag.hip",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],
