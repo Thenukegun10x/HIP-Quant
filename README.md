@@ -164,6 +164,19 @@ For models trained to be ternary (BitNet, TriLM):
 | `F8_E5M2` | 1s·5e·2m, bias=15, max=±57344, ±Inf+NaN | Backward gradients |
 | `BF16` | 1s·8e·7m IEEE bfloat16 | Checkpoint / weight storage (cast) |
 
+#### 🧊 MXFP8 OCP Microscaling — true UE8M0 (new in 1.2.0)
+`MXFP8_E4M3` / `MXFP8_E5M2` are OCP v1.0 microscaling: **1× UE8M0 (`2^(b-127)` power-of-two, `0xFF`=NaN) + 32× E4M3/E5M2** `8.25 bpw`, 1 warp (32 threads) per scale block, shuffle-reduced `amax → ceil(log2(amax/448|57344))+127`, RNE. No FP32-scale emulation — native `MX` wire `real = fp8 * 2^(scale-127)`. Optimized for `gfx12 w32` (`hip_quant_util.h`).
+
+```python
+import torch, hip_quant.torch_api as hq
+x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+q, s = hq.quantize_mxfp8_e4m3(x)   # q:uint8 [4096,4096], s:uint8 UE8M0 [4096,128]
+y = hq.dequantize_mxfp8_e4m3(q, s) # float32
+q2, s2 = hq.quantize_mxfp8_e5m2(x) # E5M2 variant for gradients
+```
+
+CPU reference in `tests/test_mxfp8_numerical.py` (11 cases: `zero`, `1.0→ue119 q0x78`, `448→ue127`, `500→ue128`, `NaN/Inf`, `subnormal`) and GPU `tests/torch/test_mxfp8_torch.py` (10 warp-correct cases, `tail 33/31`, `F16/BF16`, `vs FP32-scale 1.4×`).
+
 Default FP8 quantization uses OCP standard semantics with round-to-nearest-even. The PyTorch extension also exposes opt-in stochastic E5M2 rounding for backward gradients.
 
 ---
@@ -256,7 +269,7 @@ the next replay.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-1.1.0-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-1.2.0-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -832,18 +845,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-1.1.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.1.0.tar.gz"
+  "dist\hip_quant-1.2.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.2.0.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-1.1.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.1.0.tar.gz"
+  "dist\hip_quant-1.2.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.2.0.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-1.1.0-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-1.2.0-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:
@@ -872,6 +885,7 @@ hip_quant/
 ├── torch_ext/               # PyTorch extension source
 │   ├── pytorch_bindings.cpp # C++ bindings (TORCH_CHECK, pybind11)
 │   ├── fp8_quant_kernels.hip# Element-wise quant/dequant kernels
+│   ├── mxfp8_kernels.hip    # MXFP8 UE8M0 quant/dequant (OCP, 32-thread warp)
 │   └── fp8_linear_kernels.hip# Tiled FP8 GEMM kernels
 └── tests/torch/             # GPU test suite (pytest)
 ```

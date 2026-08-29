@@ -98,6 +98,7 @@ ext = CUDAExtension(
         "torch_ext/pytorch_bindings.cpp",
         "torch_ext/current_stream.hip",
         "torch_ext/fp8_quant_kernels.hip",
+        "torch_ext/mxfp8_kernels.hip",
         "torch_ext/fp8_linear_kernels.hip",
         "torch_ext/fp8_linear_kernels_v2.hip",
         "torch_ext/q_to_fp8_kernels.hip",
@@ -135,7 +136,7 @@ ext = CUDAExtension(
 
 setup(
     name="hip_quant_torch",
-    version="0.12.0",
+    version="0.13.0",
     description="PyTorch FP8 extension for hip_quant (AMD ROCm / HIP)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},

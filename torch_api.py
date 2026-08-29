@@ -683,6 +683,41 @@ def dequantize_e5m2_blockwise(
     )
 
 
+def quantize_mxfp8_e4m3(
+    x: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """OCP MXFP8 E4M3 — true microscaling, block=32, UE8M0 per block (8.25bpw).
+
+    Returns ``(q_uint8, scales_uint8)`` where ``scales`` are raw UE8M0 bytes
+    ``shape[..., K/32]``, ``q`` is E4M3 bytes ``shape[..., K]``. Wire format is
+    ``real = fp8_to_fp32(q) * 2^(scale-127)``.
+    """
+    return _load_extension().quantize_mxfp8_e4m3(x.contiguous())
+
+
+def quantize_mxfp8_e5m2(
+    x: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """OCP MXFP8 E5M2 — true microscaling, block=32, UE8M0 per block."""
+    return _load_extension().quantize_mxfp8_e5m2(x.contiguous())
+
+
+def dequantize_mxfp8_e4m3(
+    x: "torch.Tensor",
+    scales: "torch.Tensor",
+) -> "torch.Tensor":
+    """Dequantize MXFP8 E4M3 ``(q, scales)`` UE8M0 -> float32."""
+    return _load_extension().dequantize_mxfp8_e4m3(x.contiguous(), scales.contiguous())
+
+
+def dequantize_mxfp8_e5m2(
+    x: "torch.Tensor",
+    scales: "torch.Tensor",
+) -> "torch.Tensor":
+    """Dequantize MXFP8 E5M2 ``(q, scales)`` UE8M0 -> float32."""
+    return _load_extension().dequantize_mxfp8_e5m2(x.contiguous(), scales.contiguous())
+
+
 def adafactor_row_col_mean_square(
     grad: "torch.Tensor",
     eps: float = 0.0,

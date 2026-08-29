@@ -105,6 +105,7 @@ def _torch_extension_config():
             "torch_ext/pytorch_bindings.cpp",
             "torch_ext/current_stream.hip",
             "torch_ext/fp8_quant_kernels.hip",
+            "torch_ext/mxfp8_kernels.hip",
             "torch_ext/fp8_linear_kernels.hip",
             "torch_ext/fp8_linear_kernels_v2.hip",
             "torch_ext/q_to_fp8_kernels.hip",

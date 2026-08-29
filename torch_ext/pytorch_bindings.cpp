@@ -188,6 +188,16 @@ void launch_dequant_q_to_fp8(
 void launch_dequant_mxfp4_to_fp8(
     const uint8_t* packed_values, const uint8_t* block_scales, uint8_t* output,
     int64_t nrows, int n_per_row, hipStream_t stream);
+void launch_quant_mxfp8_e4m3(const void* src, uint8_t* dst, uint8_t* scales,
+                             int64_t rows, int64_t cols, int64_t bpr,
+                             int dtype, hipStream_t stream);
+void launch_quant_mxfp8_e5m2(const void* src, uint8_t* dst, uint8_t* scales,
+                             int64_t rows, int64_t cols, int64_t bpr,
+                             int dtype, hipStream_t stream);
+void launch_dequant_mxfp8_e4m3(const uint8_t* src, const uint8_t* scales, float* dst,
+                               int64_t rows, int64_t cols, int64_t bpr, hipStream_t stream);
+void launch_dequant_mxfp8_e5m2(const uint8_t* src, const uint8_t* scales, float* dst,
+                               int64_t rows, int64_t cols, int64_t bpr, hipStream_t stream);
 void launch_wave_attn(
     const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
     void* Out, float* LSE, float* partial_max, float* partial_sum, float* partial_out,
@@ -1104,6 +1114,70 @@ torch::Tensor dequantize_e5m2_blockwise(
     launch_dequant_e5m2_blockwise(
         input.data_ptr<uint8_t>(), scales.data_ptr<float>(), output.data_ptr<float>(),
         rows, cols, blocks_per_row, iBlock, current_stream());
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// MXFP8 OCP — true UE8M0, block=32, 8.25 bpw, not a FP32-scale emulation
+// ---------------------------------------------------------------------------
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8_e4m3(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(),       "quantize_mxfp8_e4m3: input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "quantize_mxfp8_e4m3: input must be contiguous");
+    int input_dtype = float_dtype_code(input, "quantize_mxfp8_e4m3: input");
+    constexpr int64_t kBlock = 32;
+    int64_t rows=0, cols=0, bpr=0;
+    check_blockwise_quant_shape(input, kBlock, "quantize_mxfp8_e4m3", rows, cols, bpr);
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kUInt8));
+    std::vector<int64_t> scale_sizes = input.sizes().vec();
+    scale_sizes.back() = bpr;
+    auto scales = torch::empty(scale_sizes, input.options().dtype(torch::kUInt8));
+    launch_quant_mxfp8_e4m3(input.data_ptr(), output.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+                           rows, cols, bpr, input_dtype, current_stream());
+    return std::make_tuple(output, scales);
+}
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8_e5m2(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(),       "quantize_mxfp8_e5m2: input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "quantize_mxfp8_e5m2: input must be contiguous");
+    int input_dtype = float_dtype_code(input, "quantize_mxfp8_e5m2: input");
+    constexpr int64_t kBlock = 32;
+    int64_t rows=0, cols=0, bpr=0;
+    check_blockwise_quant_shape(input, kBlock, "quantize_mxfp8_e5m2", rows, cols, bpr);
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kUInt8));
+    std::vector<int64_t> scale_sizes = input.sizes().vec();
+    scale_sizes.back() = bpr;
+    auto scales = torch::empty(scale_sizes, input.options().dtype(torch::kUInt8));
+    launch_quant_mxfp8_e5m2(input.data_ptr(), output.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+                           rows, cols, bpr, input_dtype, current_stream());
+    return std::make_tuple(output, scales);
+}
+torch::Tensor dequantize_mxfp8_e4m3(torch::Tensor input, torch::Tensor scales) {
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "dequantize_mxfp8_e4m3: input must be contiguous CUDA");
+    TORCH_CHECK(input.scalar_type()==torch::kUInt8, "dequantize_mxfp8_e4m3: input must be uint8");
+    TORCH_CHECK(scales.is_cuda() && scales.is_contiguous(), "dequantize_mxfp8_e4m3: scales must be contiguous CUDA");
+    TORCH_CHECK(scales.scalar_type()==torch::kUInt8, "dequantize_mxfp8_e4m3: scales must be uint8 UE8M0");
+    TORCH_CHECK(input.device()==scales.device(), "dequantize_mxfp8_e4m3: device mismatch");
+    constexpr int64_t kBlock = 32;
+    int64_t rows=0, cols=0, bpr=0;
+    check_blockwise_quant_shape(input, kBlock, "dequantize_mxfp8_e4m3", rows, cols, bpr);
+    check_blockwise_scale_shape(input, scales, bpr, "dequantize_mxfp8_e4m3");
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kFloat32));
+    launch_dequant_mxfp8_e4m3(input.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), output.data_ptr<float>(),
+                             rows, cols, bpr, current_stream());
+    return output;
+}
+torch::Tensor dequantize_mxfp8_e5m2(torch::Tensor input, torch::Tensor scales) {
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "dequantize_mxfp8_e5m2: input must be contiguous CUDA");
+    TORCH_CHECK(input.scalar_type()==torch::kUInt8, "dequantize_mxfp8_e5m2: input must be uint8");
+    TORCH_CHECK(scales.is_cuda() && scales.is_contiguous(), "dequantize_mxfp8_e5m2: scales must be contiguous CUDA");
+    TORCH_CHECK(scales.scalar_type()==torch::kUInt8, "dequantize_mxfp8_e5m2: scales must be uint8 UE8M0");
+    TORCH_CHECK(input.device()==scales.device(), "dequantize_mxfp8_e5m2: device mismatch");
+    constexpr int64_t kBlock = 32;
+    int64_t rows=0, cols=0, bpr=0;
+    check_blockwise_quant_shape(input, kBlock, "dequantize_mxfp8_e5m2", rows, cols, bpr);
+    check_blockwise_scale_shape(input, scales, bpr, "dequantize_mxfp8_e5m2");
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kFloat32));
+    launch_dequant_mxfp8_e5m2(input.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), output.data_ptr<float>(),
+                             rows, cols, bpr, current_stream());
     return output;
 }
 
@@ -2105,6 +2179,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequantize_e5m2_blockwise", &dequantize_e5m2_blockwise,
           "Block-wise dequantize FP8 E5M2 data using FP32 scales",
           py::arg("input"), py::arg("scales"), py::arg("block_size") = 32);
+    m.def("quantize_mxfp8_e4m3", &quantize_mxfp8_e4m3,
+          "OCP MXFP8 E4M3 quantize with UE8M0 scale per 32 (8.25bpw) — true microscaling",
+          py::arg("input"));
+    m.def("quantize_mxfp8_e5m2", &quantize_mxfp8_e5m2,
+          "OCP MXFP8 E5M2 quantize with UE8M0 scale per 32 — true microscaling",
+          py::arg("input"));
+    m.def("dequantize_mxfp8_e4m3", &dequantize_mxfp8_e4m3,
+          "OCP MXFP8 E4M3 dequantize using UE8M0 scales",
+          py::arg("input"), py::arg("scales"));
+    m.def("dequantize_mxfp8_e5m2", &dequantize_mxfp8_e5m2,
+          "OCP MXFP8 E5M2 dequantize using UE8M0 scales",
+          py::arg("input"), py::arg("scales"));
     m.def("adafactor_row_col_mean_square", &adafactor_row_col_mean_square,
           "Compute Adafactor 2-D row/column mean-square statistics on-device",
           py::arg("grad"), py::arg("eps") = 0.0);
