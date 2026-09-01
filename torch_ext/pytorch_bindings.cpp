@@ -204,6 +204,12 @@ void launch_wave_attn(
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
     int out_dtype, bool is_causal, hipStream_t stream);
+void launch_wave_attn_int4(
+    const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V_fp8,
+    void* Out, float* LSE, float* partial_max, float* partial_sum, float* partial_out,
+    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float k_scale, float v_scale,
+    int out_dtype, bool is_causal, hipStream_t stream);
 void launch_wave_attn_backward(
     const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
     const float* O, const float* dO, const float* LSE,
@@ -2366,6 +2372,73 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     },
     "WaveAttention: Native FP8 WMMA flash attention forward kernel for AMD GFX12 (RDNA4). Returns (out, lse).",
     py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+    py::arg("softmax_scale"), py::arg("q_scale") = 1.0,
+    py::arg("k_scale") = 1.0, py::arg("v_scale") = 1.0,
+    py::arg("is_causal") = false);
+    m.def("wave_attn_int4_forward", [](
+        torch::Tensor q_int4,
+        torch::Tensor k_int4,
+        torch::Tensor v_fp8,
+        double softmax_scale,
+        double q_scale,
+        double k_scale,
+        double v_scale,
+        bool is_causal
+    ) {
+        TORCH_CHECK(q_int4.is_cuda(), "q_int4 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(k_int4.is_cuda(), "k_int4 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(v_fp8.is_cuda(), "v_fp8 must be a CUDA/ROCm tensor");
+        TORCH_CHECK(q_int4.dtype() == torch::kUInt8, "q_int4 must be uint8 packed 2xINT4");
+        TORCH_CHECK(k_int4.dtype() == torch::kUInt8, "k_int4 must be uint8 packed 2xINT4");
+        TORCH_CHECK(v_fp8.dtype() == torch::kUInt8, "v_fp8 must be uint8 (FP8 E4M3)");
+        int B = v_fp8.size(0);
+        int H = v_fp8.size(1);
+        int Seq_K = v_fp8.size(2);
+        int Dim = v_fp8.size(3);
+        int Seq_Q = q_int4.size(2);
+        Dim = q_int4.size(3) * 2;
+        Seq_K = k_int4.size(2);
+        TORCH_CHECK(q_int4.size(0)==B && q_int4.size(1)==H, "Q batch/head mismatch");
+        TORCH_CHECK(k_int4.size(0)==B && k_int4.size(1)==H, "K batch/head mismatch");
+        TORCH_CHECK(v_fp8.size(0)==B && v_fp8.size(1)==H && v_fp8.size(3)==Dim, "V shape mismatch");
+        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q_int4.device());
+        torch::Tensor out = torch::empty({B, H, Seq_Q, Dim}, options);
+        torch::Tensor lse = torch::empty({B, H, Seq_Q}, options);
+        int Q_TILE = (Seq_Q <= 16) ? 16 : ((Seq_Q <= 32) ? 32 : ((Seq_Q <= 64) ? 64 : 128));
+        int K_TILE = (Dim >= 128) ? 64 : ((Seq_K >= 128) ? 128 : 64);
+        int num_blocks_q = (Seq_Q + Q_TILE - 1) / Q_TILE;
+        int base_grid = B * H * num_blocks_q;
+        int num_k_tiles = (Seq_K + K_TILE - 1) / K_TILE;
+        int num_splits = 1;
+        if (base_grid <= 2 && num_k_tiles >= 4) {
+            num_splits = (16 + base_grid - 1) / base_grid;
+            if (num_splits > num_k_tiles) num_splits = num_k_tiles;
+            if (num_splits > 8) num_splits = 8;
+        }
+        torch::Tensor p_max, p_sum, p_out;
+        float *p_max_ptr=nullptr, *p_sum_ptr=nullptr, *p_out_ptr=nullptr;
+        if (num_splits > 1) {
+            p_max = torch::empty({B, H, Seq_Q, num_splits}, options);
+            p_sum = torch::empty({B, H, Seq_Q, num_splits}, options);
+            p_out = torch::empty({B, H, Seq_Q, Dim, num_splits}, options);
+            p_max_ptr=p_max.data_ptr<float>(); p_sum_ptr=p_sum.data_ptr<float>(); p_out_ptr=p_out.data_ptr<float>();
+        }
+        hipStream_t stream = current_stream();
+        launch_wave_attn_int4(
+            q_int4.data_ptr<uint8_t>(),
+            k_int4.data_ptr<uint8_t>(),
+            v_fp8.data_ptr<uint8_t>(),
+            out.data_ptr<float>(),
+            lse.data_ptr<float>(),
+            p_max_ptr, p_sum_ptr, p_out_ptr,
+            B, H, Seq_Q, Seq_K, Dim,
+            (float)softmax_scale, (float)q_scale, (float)k_scale, (float)v_scale,
+            0, is_causal, stream
+        );
+        return py::make_tuple(out, lse);
+    },
+    "WaveAttention INT4 QK (packed 2xINT4/byte) + FP8 V/P/O. Returns (out, lse).",
+    py::arg("q_int4"), py::arg("k_int4"), py::arg("v_fp8"),
     py::arg("softmax_scale"), py::arg("q_scale") = 1.0,
     py::arg("k_scale") = 1.0, py::arg("v_scale") = 1.0,
     py::arg("is_causal") = false);

@@ -470,6 +470,32 @@ def quantize_e4m3_transpose(x: "torch.Tensor") -> "torch.Tensor":
     return _load_extension().quantize_e4m3_transpose(x.contiguous())
 
 
+def quantize_int4_packed(x: "torch.Tensor", scale: float = 1.0) -> "torch.Tensor":
+    """Quantize [B,H,S,Dim] float to packed INT4 (2 per byte, low nibble first) uint8.
+    scale is int4 step: float value = int4 * scale. int4 clipped to -8..7."""
+    y = torch.round(x / scale).clamp(-8, 7).to(torch.int8)
+    B, H, S, D = y.shape
+    assert D % 2 == 0, "Dim must be even for INT4 pack"
+    y_low = (y[..., 0::2] & 0xF).to(torch.uint8)
+    y_high = (y[..., 1::2] & 0xF).to(torch.uint8)
+    packed = (y_low | (y_high << 4)).contiguous()
+    return packed
+
+
+def dequantize_int4_packed(packed: "torch.Tensor", scale: float = 1.0) -> "torch.Tensor":
+    """Unpack INT4 for correctness reference (not kernel)."""
+    B, H, S, D2 = packed.shape
+    D = D2 * 2
+    low = (packed & 0xF).to(torch.int8)
+    high = ((packed >> 4) & 0xF).to(torch.int8)
+    low = torch.where((low & 0x8) != 0, low - 16, low)
+    high = torch.where((high & 0x8) != 0, high - 16, high)
+    out = torch.empty(B, H, S, D, device=packed.device, dtype=torch.float32)
+    out[..., 0::2] = low.float() * scale
+    out[..., 1::2] = high.float() * scale
+    return out
+
+
 def quantize_e5m2_transpose(x: "torch.Tensor") -> "torch.Tensor":
     """Quantize a rank-2 tensor to E5M2 and transpose it in one GPU pass."""
     return _load_extension().quantize_e5m2_transpose(x.contiguous())
@@ -3079,6 +3105,41 @@ class _WaveAttentionFn(torch.autograd.Function):
             )
 
         return dq, dk, dv, None, None
+
+
+def wave_attn_int4(
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    v: "torch.Tensor",
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: float = 1.0,
+) -> "torch.Tensor":
+    """WaveAttention INT4 QK (packed 2xINT4/byte, QK 4b + V FP8) - native kernel."""
+    _require_gfx12_fp8_wmma(q if q.dtype != torch.uint8 else v)
+    if scale is None:
+        dim = v.size(-1) if v.size(-1) % 64 == 0 or v.size(-1) == 128 else q.size(-1) * (2 if q.dtype == torch.uint8 else 1)
+        scale = 1.0 / (dim ** 0.5)
+    is_packed = (q.dtype == torch.uint8 and k.dtype == torch.uint8 and q.size(-1) * 2 == v.size(-1))
+    if is_packed:
+        if q_scale is None: q_scale = 1.0
+        if k_scale is None: k_scale = 1.0
+        q_int4 = q.contiguous(); k_int4 = k.contiguous()
+    else:
+        if q_scale is None:
+            q_scale = q.abs().max().item() / 7.0 if q.abs().max().item() > 0 else 1.0
+        if k_scale is None:
+            k_scale = k.abs().max().item() / 7.0 if k.abs().max().item() > 0 else 1.0
+        q_int4 = quantize_int4_packed(q, q_scale)
+        k_int4 = quantize_int4_packed(k, k_scale)
+    v_fp8 = v if v.dtype == torch.uint8 else quantize_e4m3(v)
+    out, _ = _load_extension().wave_attn_int4_forward(
+        q_int4.contiguous(), k_int4.contiguous(), v_fp8.contiguous(),
+        float(scale), float(q_scale), float(k_scale), float(v_scale), bool(is_causal)
+    )
+    return out
 
 
 def wave_attn(
