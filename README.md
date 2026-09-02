@@ -47,6 +47,23 @@ out = hip_quant.wave_attn(q, k, v)  # FP8 WMMA, 3-8x faster than SDPA
 - Adaptive tile selection (Q_TILE 16-128, K_TILE 64-128)
 - Online softmax with warp-level shuffle reduction
 - Multi-split parallelism for low-occupancy configs
+- Native INT4 WMMA path (`wave_attn_int4`) — Q/K 4-bit, V FP8, LUT unpack (new in 1.3.0)
+
+**Performance — RX 9070 XT `gfx1201`, `ROCm 7.2.1` + `torch 2.9.1+rocm7.2.1`, `D=128` (measured `bench_attn.py` vs `F.scaled_dot_product_attention`/AOTriton):**
+
+| Config (B,H,S,D) | Causal | `wave` fwd | `SDPA` fwd | fwd speedup | `wave` bwd | `SDPA` bwd | bwd speedup |
+|---|:---:|---|---|---|---|---|---|
+| 1,32,128,128 | N | 0.079 ms | 0.175 ms | **2.23×** | 0.177 ms | 0.561 ms | **3.18×** |
+| 1,32,256,128 | N | 0.134 ms | 0.533 ms | **3.97×** | 0.318 ms | 1.517 ms | **4.78×** |
+| 1,32,512,128 | N | 0.308 ms | 1.702 ms | **5.52×** | 0.845 ms | 5.108 ms | **6.04×** |
+| 1,32,1024,128 | N | 1.148 ms | 6.431 ms | **5.60×** | 2.902 ms | 17.963 ms | **6.19×** |
+| 1,32,2048,128 | N | 3.917 ms | 22.520 ms | **5.75×** | 10.686 ms | 68.469 ms | **6.41×** |
+| 1,32,256,128 | Y | 0.139 ms | 0.370 ms | **2.66×** | 0.298 ms | 1.158 ms | **3.89×** |
+| 1,32,1024,128 | Y | 0.792 ms | 4.422 ms | **5.59×** | 2.878 ms | 10.632 ms | **3.69×** |
+
+Accuracy: FP8 `cos ~0.9986-0.999` vs FP32 reference, backward `dQ 0.9981 / dK 0.9986 / dV 0.9999`, stable across `S`.
+
+> **Why not FA3?** FlashAttention-3 is `Hopper` (`sm90`) CUDA-only — no ROCm/HIP port and no `gfx12` codegen. The fair ROCm baseline is `PyTorch SDPA` which on ROCm routes to `AOTriton` (`Efficient Attention`). `wave_attn` beats that path by specializing for `gfx1200/1201` `WMMA` directly.
 
 ## HQ2 / HQ3 — experimental learned-codebook formats
 
@@ -164,7 +181,7 @@ For models trained to be ternary (BitNet, TriLM):
 | `F8_E5M2` | 1s·5e·2m, bias=15, max=±57344, ±Inf+NaN | Backward gradients |
 | `BF16` | 1s·8e·7m IEEE bfloat16 | Checkpoint / weight storage (cast) |
 
-#### 🧊 MXFP8 OCP Microscaling — true UE8M0 (new in 1.2.0)
+#### 🧊 MXFP8 OCP Microscaling — true UE8M0 (new in 1.2.0, INT4 WMMA in 1.3.0)
 `MXFP8_E4M3` / `MXFP8_E5M2` are OCP v1.0 microscaling: **1× UE8M0 (`2^(b-127)` power-of-two, `0xFF`=NaN) + 32× E4M3/E5M2** `8.25 bpw`, 1 warp (32 threads) per scale block, shuffle-reduced `amax → ceil(log2(amax/448|57344))+127`, RNE. No FP32-scale emulation — native `MX` wire `real = fp8 * 2^(scale-127)`. Optimized for `gfx12 w32` (`hip_quant_util.h`).
 
 ```python
@@ -269,7 +286,7 @@ the next replay.
 
 ```powershell
 # Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-1.2.0-cp312-cp312-win_amd64.whl
+pip install dist/hip_quant-1.3.0-cp312-cp312-win_amd64.whl
 
 # With PyTorch optional dependency declared
 pip install "hip-quant[torch]"
@@ -845,18 +862,18 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-1.2.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.2.0.tar.gz"
+  "dist\hip_quant-1.3.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.3.0.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-1.2.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.2.0.tar.gz"
+  "dist\hip_quant-1.3.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-1.3.0.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-1.2.0-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-1.3.0-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
 
 Suggested release order:
