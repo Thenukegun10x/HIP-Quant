@@ -3,7 +3,9 @@ param(
     [switch]$CDNA,
     [switch]$All,
     [string]$Arch = "",
-    [string]$RocmBin = $env:HIP_QUANT_ROCM_BIN
+    [string]$RocmBin = $env:HIP_QUANT_ROCM_BIN,
+    [switch]$SkipSmi = $false,
+    [switch]$SmiOnly = $false
 )
 
 $ErrorActionPreference = "Continue"
@@ -125,3 +127,45 @@ if ($exit -ne 0) {
 Write-Host $result
 Write-Host "DLL created: $out_file"
 Write-Host "Architectures: $($archs -join ', ')"
+
+# ── gpu-smi vendoring (913KB single-exe, HIP→ADL→WMI→sysfs) ──────────────
+if ($SmiOnly) { $SkipSmi = $false }
+if (-not $SkipSmi) {
+    $toolsDir = Join-Path $src_dir "tools"
+    if (!(Test-Path $toolsDir)) { New-Item -ItemType Directory -Path $toolsDir | Out-Null }
+    $cargoCandidates = @(
+        "C:\Users\armor\.cargo\bin\cargo.exe",
+        "$env:USERPROFILE\.cargo\bin\cargo.exe",
+        (Get-Command cargo -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique -First 1
+    if (-not $cargoCandidates) { $cargoCandidates = "cargo" }
+    $smiManifest = Join-Path $src_dir "gpu-smi-src\Cargo.toml"
+    $smiSrc = Join-Path $src_dir "gpu-smi-src"
+    if (Test-Path $smiManifest) {
+        Write-Host "`nBuilding gpu-smi (cargo)..."
+        $cargoBin = $cargoCandidates
+        if ($cargoBin -is [array]) { $cargoBin = $cargoBin[0] }
+        Write-Host "  cargo: $cargoBin"
+        Write-Host "  manifest: $smiManifest"
+        $smiOut = Join-Path $toolsDir "gpu-smi.exe"
+        $prev = $LASTEXITCODE
+        & $cargoBin build --release --manifest-path $smiManifest 2>&1 | Write-Host
+        if ($LASTEXITCODE -eq 0) {
+            $built = Join-Path $smiSrc "target\release\gpu-smi.exe"
+            if (Test-Path $built) {
+                Copy-Item -Force $built $smiOut
+                Write-Host "gpu-smi vendored: $smiOut ($( (Get-Item $smiOut).Length / 1KB ) KB)"
+                # also copy to package root for pip wheel (tools/ is package-data)
+                $binSize = (Get-Item $smiOut).Length
+                if ($binSize -gt 2MB) { Write-Warning "gpu-smi $binSize >2MB — check lto+strip" }
+            } else {
+                Write-Warning "cargo built but $built not found"
+            }
+        } else {
+            Write-Warning "cargo build failed (exit $LASTEXITCODE) — skipping gpu-smi vendor. Install Rust or set -SkipSmi"
+        }
+    } else {
+        Write-Host "gpu-smi-src not found — skipping gpu-smi vendor (clone https://github.com/Thenukegun10x/GPU-SMI to gpu-smi-src/)"
+    }
+}
+if ($SmiOnly) { exit 0 }

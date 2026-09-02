@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 _TORCH_EXPORTS = {
     # ── High-Level QoL API ─────────────────────────────────
@@ -14,6 +14,22 @@ _TORCH_EXPORTS = {
     "QuantizedLinear",
     "convert_to_quantized",
     "check",
+    # ── Drop-in attention (SageAttn-style) ─────────────────
+    "wave_available",
+    "is_wave_compatible",
+    "wave_sdpa",
+    "patch_sdpa",
+    "unpatch_sdpa",
+    "is_patched",
+    "patch_transformers",
+    # ── GPU SMI (easy query while training) ────────────────
+    "query",
+    "query_one",
+    "brief",
+    "status",
+    "format_gpu",
+    "format_table",
+    "GpuMonitor",
     # ── Quantization / dequantization (low-level) ──────────
     "quantize_e4m3",
     "quantize_e5m2",
@@ -1061,6 +1077,33 @@ def cpu_reference_quantize(arr, type_name, imatrix=None, hq2_iterations=4,
 
 def __getattr__(name):
     if name in _TORCH_EXPORTS:
+        # drop-in helpers live in hip_quant.wave_helpers (lighter import)
+        if name in (
+            "wave_available",
+            "is_wave_compatible",
+            "wave_sdpa",
+            "patch_sdpa",
+            "unpatch_sdpa",
+            "is_patched",
+            "patch_transformers",
+        ):
+            try:
+                from . import wave_helpers as _attn_mod  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    f"hip_quant.{name} requires PyTorch. Install torch with ROCm support."
+                ) from exc
+            value = getattr(_attn_mod, name)
+            globals()[name] = value
+            return value
+        if name in ("query", "query_one", "brief", "status", "format_gpu", "format_table", "GpuMonitor"):
+            try:
+                from . import smi as _smi_mod  # type: ignore
+            except ImportError as exc:
+                raise ImportError(f"hip_quant.{name} requires hip_quant.smi") from exc
+            value = getattr(_smi_mod, name)
+            globals()[name] = value
+            return value
         try:
             from . import torch_api
         except ImportError as exc:

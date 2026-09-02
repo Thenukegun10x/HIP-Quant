@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "1.3.0"
+version = "1.3.1"
 description = "GPU tensor quantization library for AMD ROCm. Native FP8 WMMA attention, HQ2/HQ3 learned-codebook formats, and portable HIP/ROCm kernels for RDNA3, RDNA4, and CDNA."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -48,6 +48,7 @@ torch = [
 [project.scripts]
 hip-quant = "hip_quant.__main__:main"
 hq2-analyze = "hq2.__main__:analyzer_main"
+gpu-smi = "hip_quant.smi:main"
 
 [tool.setuptools]
 packages = ["hip_quant", "hq2"]
@@ -78,6 +79,10 @@ include-package-data = false
     "torch_ext/pytorch_bindings.cpp",
     "torch_ext/pytorch_bindings_hip.cpp",
     "torch_api.py",
+    "wave_helpers.py",
+    "smi.py",
+    "tools/gpu-smi.exe",
+    "tools/gpu-smi",
     "device_info.py",
     "cdna_compat.py",
     "setup_torch.py",
