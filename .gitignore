@@ -84,3 +84,6 @@ Own Quant/
 /model.safetensors
 SmolLM2-135M/
 
+# Nested hip_inference repo (separately versioned; see hip_inference/.git)
+/hip_inference/
+

@@ -9,6 +9,7 @@
 #include <assert.h>
 #include "../hip_quant_types.h"
 #include "../hip_quant_util.h"
+#include "../hip_iquant_util.h"
 
 // -----------------------------------------------------------------------
 // Device helpers (duplicated from kernels/dequant_to_fp8.cu so this
@@ -242,6 +243,49 @@ void dequant_q6_k_to_fp8_kernel(
         scale * (float)value);
 }
 
+template <bool E5M2>
+__global__ __launch_bounds__(32, 8)
+void dequant_iq4_nl_to_fp8_kernel(
+    const block_iq4_nl * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK4_NL) return;
+    const block_iq4_nl q = src[row * blocks_per_row + block];
+    const uint8_t nibble = i < 16 ? (q.qs[i] & 0x0f) : (q.qs[i - 16] >> 4);
+    dst[row * n_per_row + block * QK4_NL + i] = fp32_to_output_fp8<E5M2>(
+        fp16_to_fp32(q.d) * (float)d_kvalues_iq4nl[nibble]);
+}
+
+template <bool E5M2>
+__global__ __launch_bounds__(256, 4)
+void dequant_iq4_xs_to_fp8_kernel(
+    const block_iq4_xs * __restrict__ src, uint8_t * __restrict__ dst,
+    int nrows, int blocks_per_row, int n_per_row
+) {
+    const int row = (int)blockIdx.x + (int)blockIdx.z * (int)gridDim.x;
+    const int block = blockIdx.y;
+    const int i = threadIdx.x;
+    if (row >= nrows || block >= blocks_per_row || i >= QK_K) return;
+    const block_iq4_xs q = src[row * blocks_per_row + block];
+
+    const int ib = i / 32;          // sub-block (0..7)
+    const int pos_in_sub = i % 32;  // position (0..31)
+    const int nibble = (pos_in_sub < 16)
+        ? (q.qs[16 * ib + pos_in_sub] & 0x0f)
+        : (q.qs[16 * ib + (pos_in_sub - 16)] >> 4);
+
+    const int ls_low = (q.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+    const int ls_high = (q.scales_h >> (2 * ib)) & 3;
+    const int ls = ls_low | (ls_high << 4);
+    const float dl = fp16_to_fp32(q.d) * (float)(ls - 32);
+
+    dst[row * n_per_row + block * QK_K + i] = fp32_to_output_fp8<E5M2>(
+        dl * (float)d_kvalues_iq4nl[nibble]);
+}
+
 // -----------------------------------------------------------------------
 // Dispatch helper: given GGML type number, launch the correct kernel.
 // Returns 1 on success, 0 if the type is unsupported.
@@ -302,6 +346,14 @@ static int dispatch_dequant_q_to_fp8(
         case 14:
             hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_q6_k_to_fp8_kernel<E5M2>), grid, 256, 0, stream,
                 (const block_q6_K *)src, dst, nrows, blocks_per_row, n_per_row);
+            break;
+        case 20:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_iq4_nl_to_fp8_kernel<E5M2>), grid, 32, 0, stream,
+                (const block_iq4_nl *)src, dst, nrows, blocks_per_row, n_per_row);
+            break;
+        case 23:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(dequant_iq4_xs_to_fp8_kernel<E5M2>), grid, 256, 0, stream,
+                (const block_iq4_xs *)src, dst, nrows, blocks_per_row, n_per_row);
             break;
         default:
             return 0;
