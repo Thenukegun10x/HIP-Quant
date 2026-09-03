@@ -386,8 +386,14 @@ __global__ void wave_attn_kernel_templated(
 
     int q_r = q_block_start + wave_id * 16 + lw;
 
+    // Decode support: when Seq_Q < Seq_K the Q tile covers the LAST Seq_Q
+    // keys (absolute positions q_start .. Seq_K-1). q_start is block-uniform
+    // (kernel args only); the mask below stays a per-lane expression, so no
+    // new divergent control flow around __syncthreads/__shfl_sync.
+    const int q_start = (Seq_K > Seq_Q) ? (Seq_K - Seq_Q) : 0;
+
     if (is_causal) {
-        int max_q_in_block = q_block_start + Q_TILE - 1;
+        int max_q_in_block = q_start + q_block_start + Q_TILE - 1;
         int m = (max_q_in_block + K_TILE - 1) / K_TILE;
         if (kt_end > m) kt_end = m;
     }
@@ -444,7 +450,7 @@ __global__ void wave_attn_kernel_templated(
             for (int i = 0; i < 8; i++) {
                 int kc = ks + k_sub * 16 + lg * 8 + i;
                 float s = sacc[k_sub][i] * cscale;
-                if (kc >= Seq_K || (is_causal && kc > q_r)) s = -1e30f;
+                if (kc >= Seq_K || (is_causal && kc > q_start + q_r)) s = -1e30f;
                 sacc[k_sub][i] = s;  // reuse sacc as scaled storage
                 tile_max = fmaxf(tile_max, s);
             }
@@ -596,6 +602,8 @@ __global__ void wave_attn_kernel_templated_int4(
     int q_block_idx = blockIdx.y; int q_block_start = q_block_idx*Q_TILE;
     if (q_block_start >= Seq_Q) return;
     int num_q_waves = Q_TILE>>4; int q_r = q_block_start + wave_id*16 + lw;
+    // Decode support: Q tile covers absolute positions q_start... (uniform).
+    const int q_start = (Seq_K > Seq_Q) ? (Seq_K - Seq_Q) : 0;
     int64_t q_off_packed = ((int64_t)b * H + h) * Seq_Q * Dim / 2;
     int64_t k_off_packed = ((int64_t)b * H + h) * Seq_K * Dim / 2;
     int64_t v_off = ((int64_t)b * H + h) * Seq_K * Dim;
@@ -667,7 +675,7 @@ __global__ void wave_attn_kernel_templated_int4(
                 #endif
             }
         }
-        bool wave_fully_unmasked = !is_causal || (ks + K_TILE <= q_block_start + wave_id*16);
+        bool wave_fully_unmasked = !is_causal || (ks + K_TILE <= q_start + q_block_start + wave_id*16);
         float tile_max = -1e30f;
         #pragma unroll
         for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
@@ -675,7 +683,7 @@ __global__ void wave_attn_kernel_templated_int4(
             for (int i=0;i<8;i++) {
                 int kc = ks + k_sub*16 + lg*8 + i;
                 float s = sacc[k_sub][i] * cscale;
-                if (wave_fully_unmasked) { if (kc >= Seq_K) s = -1e30f; } else { if (kc >= Seq_K || kc > q_r) s = -1e30f; }
+                if (wave_fully_unmasked) { if (kc >= Seq_K) s = -1e30f; } else { if (kc >= Seq_K || kc > q_start + q_r) s = -1e30f; }
                 sacc[k_sub][i]=s; tile_max = fmaxf(tile_max,s);
             }
         }
@@ -792,6 +800,8 @@ __global__ void wave_attn_kernel_templated_int4_native(
     int q_block_idx = blockIdx.y; int q_block_start = q_block_idx*Q_TILE;
     if (q_block_start >= Seq_Q) return;
     int num_q_waves = Q_TILE>>4; int q_r = q_block_start + wave_id*16 + lw;
+    // Decode support: Q tile covers absolute positions q_start... (uniform).
+    const int q_start = (Seq_K > Seq_Q) ? (Seq_K - Seq_Q) : 0;
     int64_t q_off_packed = ((int64_t)b * H + h) * Seq_Q * Dim / 2;
     int64_t k_off_packed = ((int64_t)b * H + h) * Seq_K * Dim / 2;
     int64_t v_off = ((int64_t)b * H + h) * Seq_K * Dim;
@@ -857,7 +867,7 @@ __global__ void wave_attn_kernel_templated_int4_native(
             #pragma unroll
             for(int i=0;i<8;i++) sacc[k][i] = float(sacc_i[k][i]) * cscale;
         }
-        bool wave_fully_unmasked = !is_causal || (ks + K_TILE <= q_block_start + wave_id*16);
+        bool wave_fully_unmasked = !is_causal || (ks + K_TILE <= q_start + q_block_start + wave_id*16);
         float tile_max = -1e30f;
         #pragma unroll
         for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
@@ -865,7 +875,7 @@ __global__ void wave_attn_kernel_templated_int4_native(
             for (int i=0;i<8;i++) {
                 int kc = ks + k_sub*16 + lg*8 + i;
                 float s = sacc[k_sub][i];
-                if (wave_fully_unmasked) { if (kc >= Seq_K) s = -1e30f; } else { if (kc >= Seq_K || kc > q_r) s = -1e30f; }
+                if (wave_fully_unmasked) { if (kc >= Seq_K) s = -1e30f; } else { if (kc >= Seq_K || kc > q_start + q_r) s = -1e30f; }
                 sacc[k_sub][i]=s; tile_max = fmaxf(tile_max,s);
             }
         }

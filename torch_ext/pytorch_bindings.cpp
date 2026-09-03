@@ -21,6 +21,17 @@
 // tensor allocation.
 
 #include <hip/hip_runtime.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+// TheRock 7.14 host headers (hipblaslt_e5m3.h) use GCC's __builtin_clz in a
+// host code path. MSVC has no such builtin; provide an equivalent. The call
+// site guarantees a non-zero argument so _BitScanReverse semantics match.
+#include <intrin.h>
+static inline int hip_quant_builtin_clz(unsigned int x) {
+    unsigned long idx = 0;
+    return _BitScanReverse(&idx, (unsigned long)x) ? (31 - (int)idx) : 32;
+}
+#define __builtin_clz hip_quant_builtin_clz
+#endif
 #include <hipblaslt/hipblaslt.h>
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
@@ -209,6 +220,27 @@ void launch_wave_attn_int4(
     void* Out, float* LSE, float* partial_max, float* partial_sum, float* partial_out,
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
+    int out_dtype, bool is_causal, hipStream_t stream);
+void launch_wave_attn_prefill(
+    const uint8_t* Q, const uint8_t* K, const uint8_t* V,
+    void* Out, float* LSE, float* partial_max, float* partial_sum, float* partial_out,
+    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float k_scale, float v_scale,
+    int out_dtype, bool is_causal, bool use_int4, hipStream_t stream);
+void launch_wave_attn_decode(
+    const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V_int4,
+    void* Out, float* LSE,
+    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float k_scale, float v_scale,
+    int out_dtype, bool is_causal, hipStream_t stream);
+void launch_wave_attn_long(
+    const uint8_t* Q_fp8,
+    const uint8_t* K_fp8, const uint8_t* K_int4, const uint8_t* K_scales,
+    const uint8_t* V_fp8, const uint8_t* V_int4, const uint8_t* V_scales,
+    const int32_t* block_table,
+    void* Out, float* LSE,
+    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float v_scale,
     int out_dtype, bool is_causal, hipStream_t stream);
 void launch_wave_attn_backward(
     const uint8_t* Q_fp8, const uint8_t* K_fp8, const uint8_t* V_fp8,
@@ -2530,6 +2562,79 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::arg("softmax_scale"), py::arg("q_scale") = 1.0,
     py::arg("k_scale") = 1.0, py::arg("v_scale") = 1.0,
     py::arg("is_causal") = false);
+
+    m.def("wave_attn_prefill_forward", [](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        double softmax_scale, double q_scale, double k_scale, double v_scale,
+        bool is_causal, bool use_int4
+    ) {
+        TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
+        TORCH_CHECK(q.dtype()==torch::kUInt8 && k.dtype()==torch::kUInt8 && v.dtype()==torch::kUInt8, "q/k/v must be uint8");
+        TORCH_CHECK(q.dim()==4 && k.dim()==4 && v.dim()==4, "q/k/v must be 4D");
+        int B=q.size(0), H=q.size(1), Seq_Q=q.size(2), Seq_K=k.size(2), Dim=v.size(3);
+        if (use_int4) { TORCH_CHECK(q.size(3)*2==Dim, "INT4 q dim*2 must match v Dim"); TORCH_CHECK(k.size(3)*2==Dim, "INT4 k dim*2 must match v Dim"); }
+        else { TORCH_CHECK(q.size(3)==Dim && k.size(3)==Dim, "FP8 q/k Dim mismatch"); }
+        auto opts=torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+        torch::Tensor out=torch::empty({B,H,Seq_Q,Dim}, opts);
+        torch::Tensor lse=torch::empty({B,H,Seq_Q}, opts);
+        int Q_TILE=(Seq_Q<=16)?16:((Seq_Q<=32)?32:((Seq_Q<=64)?64:128));
+        int K_TILE=(Dim>=128)?64:((Seq_K>=128)?128:64);
+        int num_blocks_q=(Seq_Q+Q_TILE-1)/Q_TILE;
+        int base_grid=B*H*num_blocks_q;
+        int num_k_tiles=(Seq_K+K_TILE-1)/K_TILE;
+        int num_splits=1;
+        if(base_grid<=2 && num_k_tiles>=4){ num_splits=(16+base_grid-1)/base_grid; if(num_splits>num_k_tiles) num_splits=num_k_tiles; if(num_splits>8) num_splits=8; }
+        torch::Tensor p_max,p_sum,p_out; float *pmp=nullptr,*psp=nullptr,*pop=nullptr;
+        if(num_splits>1){ p_max=torch::empty({B,H,Seq_Q,num_splits}, opts); p_sum=torch::empty({B,H,Seq_Q,num_splits}, opts); p_out=torch::empty({B,H,Seq_Q,Dim,num_splits}, opts); pmp=p_max.data_ptr<float>(); psp=p_sum.data_ptr<float>(); pop=p_out.data_ptr<float>(); }
+        launch_wave_attn_prefill(q.data_ptr<uint8_t>(),k.data_ptr<uint8_t>(),v.data_ptr<uint8_t>(), out.data_ptr(),lse.data_ptr<float>(),pmp,psp,pop, B,H,Seq_Q,Seq_K,Dim,(float)softmax_scale,(float)q_scale,(float)k_scale,(float)v_scale,0,is_causal,use_int4, current_stream());
+        return py::make_tuple(out,lse);
+    }, "WaveAttention prefill inference kernel (adaptive Q_TILE, INT4 QK/FP8 V hybrid).", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false, py::arg("use_int4")=true);
+
+    m.def("wave_attn_decode_forward", [](
+        torch::Tensor q_int4, torch::Tensor k_int4, torch::Tensor v_int4,
+        double softmax_scale, double q_scale, double k_scale, double v_scale,
+        bool is_causal
+    ) {
+        TORCH_CHECK(q_int4.is_cuda() && k_int4.is_cuda() && v_int4.is_cuda(), "q/k/v must be CUDA");
+        TORCH_CHECK(q_int4.dtype()==torch::kUInt8 && k_int4.dtype()==torch::kUInt8 && v_int4.dtype()==torch::kUInt8, "q/k/v INT4 must be uint8");
+        TORCH_CHECK(q_int4.dim()==4 && k_int4.dim()==4 && v_int4.dim()==4, "must be 4D");
+        int B = q_int4.size(0);
+        int H = q_int4.size(1);
+        int Seq_Q = q_int4.size(2);
+        int Dim = q_int4.size(3) * 2;
+        int Seq_K = k_int4.size(2);
+        TORCH_CHECK(Dim == 64 || Dim == 128, "decode INT4 requires Dim 64 or 128");
+        TORCH_CHECK(k_int4.size(0)==B && k_int4.size(1)==H && k_int4.size(2)==Seq_K && k_int4.size(3)*2==Dim, "k shape mismatch");
+        TORCH_CHECK(v_int4.size(0)==B && v_int4.size(1)==H && v_int4.size(2)==Seq_K && v_int4.size(3)*2==Dim, "v shape mismatch");
+        auto opts=torch::TensorOptions().dtype(torch::kFloat32).device(q_int4.device());
+        torch::Tensor out=torch::empty({B,H,Seq_Q,Dim}, opts);
+        torch::Tensor lse=torch::empty({B,H,Seq_Q}, opts);
+        launch_wave_attn_decode(q_int4.data_ptr<uint8_t>(),k_int4.data_ptr<uint8_t>(),v_int4.data_ptr<uint8_t>(), out.data_ptr(),lse.data_ptr<float>(), B,H,Seq_Q,Seq_K,Dim,(float)softmax_scale,(float)q_scale,(float)k_scale,(float)v_scale,0,is_causal, current_stream());
+        return py::make_tuple(out,lse);
+    }, "WaveAttention decode inference kernel (Q_TILE=16, Q in regs, single K buffer, all-INT4 0.5B).", py::arg("q_int4"), py::arg("k_int4"), py::arg("v_int4"), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false);
+
+    m.def("wave_attn_long_forward", [](
+        torch::Tensor q_fp8, torch::Tensor k_fp8, torch::Tensor k_int4, torch::Tensor k_scales,
+        torch::Tensor v_fp8, torch::Tensor v_int4, torch::Tensor v_scales,
+        c10::optional<torch::Tensor> block_table,
+        double softmax_scale, double q_scale, double v_scale,
+        bool is_causal
+    ) {
+        TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dtype()==torch::kUInt8, "q_fp8 must be uint8 CUDA 4D");
+        TORCH_CHECK(k_fp8.is_cuda() && v_fp8.is_cuda(), "k_fp8/v_fp8 must be CUDA");
+        TORCH_CHECK(q_fp8.dim()==4, "q must be 4D");
+        int B=q_fp8.size(0), H=q_fp8.size(1), Seq_Q=q_fp8.size(2), Dim=q_fp8.size(3), Seq_K=k_fp8.size(2);
+        auto opts=torch::TensorOptions().dtype(torch::kFloat32).device(q_fp8.device());
+        torch::Tensor out=torch::empty({B,H,Seq_Q,Dim}, opts);
+        torch::Tensor lse=torch::empty({B,H,Seq_Q}, opts);
+        const int32_t* bt_ptr=nullptr;
+        torch::Tensor bt_keep;
+        if(block_table.has_value()){ bt_keep=block_table.value(); TORCH_CHECK(bt_keep.is_cuda() && bt_keep.dtype()==torch::kInt32, "block_table must be int32 CUDA"); bt_ptr=bt_keep.data_ptr<int32_t>(); }
+        const uint8_t* k_scales_ptr = k_scales.defined() ? k_scales.data_ptr<uint8_t>() : nullptr;
+        const uint8_t* v_scales_ptr = v_scales.defined() ? v_scales.data_ptr<uint8_t>() : nullptr;
+        launch_wave_attn_long(q_fp8.data_ptr<uint8_t>(), k_fp8.data_ptr<uint8_t>(), k_int4.defined()?k_int4.data_ptr<uint8_t>():nullptr, k_scales_ptr, v_fp8.data_ptr<uint8_t>(), v_int4.defined()?v_int4.data_ptr<uint8_t>():nullptr, v_scales_ptr, bt_ptr, out.data_ptr(),lse.data_ptr<float>(), B,H,Seq_Q,Seq_K,Dim,(float)softmax_scale,(float)q_scale,(float)v_scale,0,is_causal, current_stream());
+        return py::make_tuple(out,lse);
+    }, "WaveAttention long-context paged kernel (sinks FP8 + bulk block-INT4 4.25BPW + recent hybrid).", py::arg("q_fp8"), py::arg("k_fp8"), py::arg("k_int4"), py::arg("k_scales"), py::arg("v_fp8"), py::arg("v_int4"), py::arg("v_scales"), py::arg("block_table")=c10::optional<torch::Tensor>(), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false);
 
     m.def("wave_attn_diag", [](
         torch::Tensor Q_fp8, torch::Tensor K_fp8, torch::Tensor V_fp8,
