@@ -153,6 +153,24 @@ void launch_fp8_linear_forward_blockwise(
     int M, int N, int K, int blocks_per_row, int block_size,
     int c_dtype, int bias_dtype, bool has_bias,
     hipStream_t stream);
+
+constexpr int GGML_TYPE_Q4_0 = 2;
+constexpr int GGML_TYPE_Q4_1 = 3;
+constexpr int GGML_TYPE_Q5_0 = 6;
+constexpr int GGML_TYPE_Q5_1 = 7;
+constexpr int GGML_TYPE_Q8_0 = 8;
+constexpr int GGML_TYPE_Q8_1 = 9;
+constexpr int GGML_TYPE_Q2_K = 10;
+constexpr int GGML_TYPE_Q3_K = 11;
+constexpr int GGML_TYPE_Q4_K = 12;
+constexpr int GGML_TYPE_Q5_K = 13;
+constexpr int GGML_TYPE_Q6_K = 14;
+constexpr int GGML_TYPE_IQ4_NL = 20;
+constexpr int GGML_TYPE_IQ4_XS = 23;
+
+void launch_gemv_q_forward(
+    const void* input, const void* packed_weight, void* output, const void* bias,
+    int ggml_type, int N, int K, bool has_bias, hipStream_t stream);
 void launch_fp8_linear_backward_input(
     const void* grad_output, const void* weight, void* grad_input,
     int M, int N, int K, int grad_output_dtype, int weight_dtype,
@@ -1562,6 +1580,50 @@ torch::Tensor fp8_linear_forward_fp8_input_weight_packed(
     return output;
 }
 
+torch::Tensor gemv_q_forward(
+    torch::Tensor input,
+    torch::Tensor weight_packed,
+    int64_t ggml_type,
+    int64_t output_features,
+    c10::optional<torch::Tensor> bias
+) {
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
+                "gemv_q_forward: input must be a contiguous CUDA tensor");
+    TORCH_CHECK(weight_packed.is_cuda() && weight_packed.is_contiguous(),
+                "gemv_q_forward: weight_packed must be a contiguous CUDA tensor");
+    TORCH_CHECK(input.dim() == 2 && input.size(0) == 1,
+                "gemv_q_forward: input must be 2-D with M=1");
+    int64_t K = input.size(1);
+    int64_t N = output_features;
+    TORCH_CHECK(K % 32 == 0, "gemv_q_forward: K must be a multiple of 32");
+    TORCH_CHECK(N > 0, "gemv_q_forward: output_features must be positive");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16,
+                "gemv_q_forward: input must be float16");
+    TORCH_CHECK(weight_packed.scalar_type() == torch::kUInt8,
+                "gemv_q_forward: weight_packed must be uint8");
+    TORCH_CHECK(ggml_type == GGML_TYPE_Q8_0 || ggml_type == GGML_TYPE_Q4_0,
+                "gemv_q_forward: only Q8_0 and Q4_0 currently supported");
+    int bytes_per_block = (ggml_type == GGML_TYPE_Q8_0) ? 34 : 18;
+    int64_t expected_bytes = N * (K / 32) * bytes_per_block;
+    TORCH_CHECK(weight_packed.numel() >= expected_bytes,
+                "gemv_q_forward: weight_packed tensor size too small");
+
+    BiasLaunch bias_launch = validate_bias_for_forward(bias, N, input.device(), "gemv_q_forward");
+    auto output = torch::empty({1, N}, input.options());
+    launch_gemv_q_forward(
+        input.data_ptr(),
+        weight_packed.data_ptr(),
+        output.data_ptr(),
+        bias_launch.ptr,
+        (int)ggml_type,
+        (int)N,
+        (int)K,
+        bias_launch.has_bias,
+        current_stream()
+    );
+    return output;
+}
+
 torch::Tensor fp8_linear_forward_blockwise(
     torch::Tensor input_fp8,
     torch::Tensor input_scales,
@@ -2019,27 +2081,18 @@ torch::Tensor fp8_linear_forward_v2_input_weight(
 // ---------------------------------------------------------------------------
 // GGML Q-type -> FP8 direct dequantization (GPU-resident, zero copies)
 // ---------------------------------------------------------------------------
-constexpr int GGML_TYPE_Q4_0 = 2;
-constexpr int GGML_TYPE_Q4_1 = 3;
-constexpr int GGML_TYPE_Q5_0 = 6;
-constexpr int GGML_TYPE_Q5_1 = 7;
-constexpr int GGML_TYPE_Q8_0 = 8;
-constexpr int GGML_TYPE_Q8_1 = 9;
-constexpr int GGML_TYPE_Q2_K = 10;
-constexpr int GGML_TYPE_Q3_K = 11;
-constexpr int GGML_TYPE_Q4_K = 12;
-constexpr int GGML_TYPE_Q5_K = 13;
-constexpr int GGML_TYPE_Q6_K = 14;
 
 static inline int ggml_block_size(int type) {
     switch (type) {
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q8_1:
+        case GGML_TYPE_IQ4_NL:
             return 32;
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
             return 256;
         default: return 0;
     }
@@ -2058,6 +2111,8 @@ static inline int ggml_type_block_bytes(int type) {
         case GGML_TYPE_Q4_K: return 144;
         case GGML_TYPE_Q5_K: return 176;
         case GGML_TYPE_Q6_K: return 210;
+        case GGML_TYPE_IQ4_NL: return 18;
+        case GGML_TYPE_IQ4_XS: return 136;
         default: return 0;
     }
 }
@@ -2078,7 +2133,7 @@ torch::Tensor dequantize_q_to_fp8(
     int block_bytes = ggml_type_block_bytes(type);
     TORCH_CHECK(block_size > 0 && block_bytes > 0,
                 "dequantize_q_to_fp8: unsupported GGML type ", type,
-                ". Supported: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14)");
+                ". Supported: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14), IQ4_NL(20), IQ4_XS(23)");
 
     int iN = (int)n_per_row;
     TORCH_CHECK(iN > 0 && iN % block_size == 0,
@@ -2266,6 +2321,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input_fp8"), py::arg("weight_packed"), py::arg("output_dtype_source"),
           py::arg("output_features"), py::arg("weight_inv_scale"), py::arg("input_scale"),
           py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("gemv_q_forward", &gemv_q_forward,
+          "Dedicated AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights",
+          py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
+          py::arg("output_features"), py::arg("bias") = c10::optional<torch::Tensor>());
     m.def("fp8_linear_forward_v2_input_weight", &fp8_linear_forward_v2_input_weight,
           "V2 cooperative LDS-staged FP8 linear forward, pre-quantized E4M3 input+weight",
           py::arg("input_fp8"), py::arg("weight_fp8"), py::arg("output_dtype_source"),
@@ -2308,7 +2367,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("dequantize_q_to_fp8", &dequantize_q_to_fp8,
           "Dequantize GGML Q-type packed bytes (on GPU) directly to FP8 uint8 (on GPU), zero copies.\n"
-          "Supported types: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14).",
+          "Supported types: Q4_0(2), Q4_1(3), Q5_0(6), Q5_1(7), Q8_0(8), Q8_1(9), Q2_K(10)..Q6_K(14), IQ4_NL(20), IQ4_XS(23).",
           py::arg("packed"), py::arg("type_num"), py::arg("n_per_row"),
           py::arg("e5m2") = false);
     m.def("dequantize_mxfp4_to_fp8", &dequantize_mxfp4_to_fp8,

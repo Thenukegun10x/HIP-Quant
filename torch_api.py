@@ -764,6 +764,8 @@ GGML_Q_TO_FP8_SUPPORTED = {
     12: ("Q4_K", 256, 144),
     13: ("Q5_K", 256, 176),
     14: ("Q6_K", 256, 210),
+    20: ("IQ4_NL", 32, 18),
+    23: ("IQ4_XS", 256, 136),
 }
 
 
@@ -780,7 +782,8 @@ def dequantize_q_to_fp8(
     ``[nrows, n_per_row]`` uint8 CUDA tensor of raw FP8 bytes (E4M3 by
     default, E5M2 if ``e5m2=True``).
 
-    Supported types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K..Q6_K.
+    Supported types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K..Q6_K,
+    IQ4_NL, IQ4_XS.
     """
     return _load_extension().dequantize_q_to_fp8(
         packed.contiguous(), int(type_num), int(n_per_row), bool(e5m2)
@@ -2527,6 +2530,19 @@ def fp8_linear_forward_fp8_input_weight_packed(
     return _load_extension().fp8_linear_forward_fp8_input_weight_packed(
         input_fp8.contiguous(), weight_packed.contiguous(), output_dtype_source,
         int(output_features), float(weight_inv_scale), float(input_scale), bias
+    )
+
+
+def gemv_q_forward(
+    input: "torch.Tensor",
+    weight_packed: "torch.Tensor",
+    ggml_type: int,
+    output_features: int,
+    bias: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Fused AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights."""
+    return _load_extension().gemv_q_forward(
+        input.contiguous(), weight_packed.contiguous(), int(ggml_type), int(output_features), bias
     )
 
 

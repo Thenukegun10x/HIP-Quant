@@ -112,6 +112,7 @@ ext = CUDAExtension(
         "torch_ext/wave_attn_prefill.hip",
         "torch_ext/wave_attn_decode.hip",
         "torch_ext/wave_attn_long.hip",
+        "torch_ext/gemv_q_kernels.hip",
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags
