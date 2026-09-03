@@ -76,6 +76,7 @@ include-package-data = false
     "build.sh",
     "kernels/*.cu",
     "torch_ext/*.hip",
+    "torch_ext/*.h",
     "torch_ext/pytorch_bindings.cpp",
     "torch_ext/pytorch_bindings_hip.cpp",
     "torch_api.py",

@@ -9,7 +9,7 @@ include *.cpp
 include build.ps1
 include build.sh
 recursive-include kernels *.cu
-recursive-include torch_ext *.cpp *.hip
+recursive-include torch_ext *.cpp *.hip *.h
 recursive-include tests *.py
 recursive-include codebooks *.bin
 include torch_api.py
