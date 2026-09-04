@@ -1,28 +1,34 @@
-# TODO
+# TODO (Sep 2026)
 
-## PyTorch Training Extension
+The old PyTorch-extension plan (`PYTORCH_EXTENSION_PLAN.md`) is implemented:
+`torch_ext/` + `torch_api.py` + autograd FP8 linear (fwd/bwd) all exist. What
+remains, in priority order:
 
-`hip_quant` is currently an inference/conversion quantization library. It accepts NumPy arrays in CPU memory through `ctypes`, launches HIP kernels through `hip_quantize.dll`, and returns NumPy byte buffers. That path is useful for offline quantization, but it is not suitable for PyTorch FP8 training because it bypasses autograd and would require GPU tensors to round-trip through CPU RAM.
+## 1. imatrix fix sequence (`IMATRIX_PLAN.md`, P0 first)
+- P0: shape-check `quantize_from_fp8` imatrix (host/device OOB today); warn on
+  `None` for IQ2_XXS/XS/IQ1_S. No rebuild.
+- P1: accept llama per-column `(n_per_row,)` vectors (tile internally) + `.dat`
+  loader. No rebuild.
+- P2: per-column device upload + kernel row-stride flag (DLL rebuild).
+- P3: non-trivial-imatrix byte-exact tests vs `llama-quantize.exe`.
 
-See `PYTORCH_EXTENSION_PLAN.md` for the concrete implementation checklist and phased design.
+## 2. Decode throughput (Qwen3.8-27B at 5.4 tok/s, target 26)
+Profile with `python -m hip_inference.debug_decode --fine` before touching code.
+- IQ GEMV kernels at ~70 GB/s effective vs ~640 GB/s HBM roof (FFN is 64% of a
+  token). Target 250 GB/s effective.
+- LM head 9.3ms (Q4_K 248320x5120): dedicated tall-GEMV path, target <=3ms.
+  Also dominates the MTP draft cost (19.7ms).
+- HIP graph capture for the qwen35 decode step (~1000 launches/token;
+  qwen3 already has `_generate_graph`).
+- MTP accept-rate measurement (`draft_mtp` returned token 0 once — verify
+  quality before relying on the ~1.9x multiplier).
 
-### Goals
+## 3. Kernel hardening backlog
+- Same `TORCH_CHECK` treatment (dtype + numel) for remaining `torch_ext`
+  entries that reinterpret bits (`delta_net`, `fast_ssm_conv1d`, `gemv_q`).
+- C-side staged-size validation for quantize dispatch (defense in depth, IM-2).
 
-- Build a native PyTorch C++/HIP extension using `torch.utils.cpp_extension` / `torch::Tensor` APIs.
-- Accept and return GPU-resident `torch::Tensor` objects directly, without NumPy or host copies.
-- Expose FP8 E4M3 and E5M2 tensor quantization/dequantization functions for training workloads.
-- Wrap extension calls in `torch.autograd.Function` so forward and backward behavior is explicit and autograd-safe.
-- Support mixed FP8 training conventions:
-  - Forward path: activations and weights in `E4M3`.
-  - Backward path: gradients in `E5M2`, weights remaining in `E4M3`.
-- Add PyTorch tests that verify device placement, dtype/shape contracts, gradient flow, and numerical behavior.
-
-### Proposed Work Items
-
-- Create a separate `torch_ext/` or `hip_quant_torch/` module instead of overloading the existing NumPy API.
-- Refactor reusable FP8 encode/decode device helpers so both the DLL and PyTorch extension can include them.
-- Add C++ wrappers with `#include <torch/extension.h>` for GPU tensor input/output validation.
-- Add HIP kernels that operate on PyTorch tensor data pointers and write tensor outputs allocated by PyTorch.
-- Add Python `torch.autograd.Function` wrappers for FP8 quantized training paths.
-- Add packaging hooks for ROCm/PyTorch extension builds, likely separate from the current pure-Python wheel path.
-- Document the distinction between offline NumPy quantization and online PyTorch training extension usage.
+## 4. Docs discipline
+- Keep `IMATRIX_PLAN.md` appendix (per-type audit table) current as P3 lands.
+- `DOCUMENTATION.md` line counts are dated Sep 2026; refresh on big merges.
+- `Own Quant/` experiment logs are historical — do not rewrite.

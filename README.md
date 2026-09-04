@@ -165,6 +165,15 @@ Validated local test system:
 Non-linear quants that preserve quality at extreme low bits:
 - `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`
 
+imatrix contract: llama.cpp defines **one float per input column, shared
+across rows** (size `ne[0]`). hip_quant kernels index `imatrix + row*n_per_row`,
+so `quantize_numpy` requires `imatrix.shape == arr.shape` — tile a raw llama
+`.dat` column vector across rows first. Weighting math matches llama
+(`qw[i] * sqrt(sigma2 + x[i]^2)`); all-ones imatrix is the identity and is
+what the byte-exact tests use today. `quantize_from_fp8` does not yet validate
+imatrix shape (known gap — pass a full matrix). See `IMATRIX_PLAN.md` for the
+per-column-accept + non-trivial-imatrix test rollout.
+
 ### ⚖️ Ternary Quants
 For models trained to be ternary (BitNet, TriLM):
 - `TQ1_0` (1.69 bpw), `TQ2_0` (2.06 bpw)
@@ -790,6 +799,12 @@ All PyTorch extension functions are guarded against:
 - **Empty tensors** — `numel == 0` early-return before `dim3(0)` (UB in HIP)
 - **Positive finite scales** — invalid FP8 scales raise before launch / GEMM
 - **Nonfinite training step** — delayed scales and Adafactor refuse to poison state
+- **Gated-norm weight layout** — `fast_rms_norm_gated_forward` dispatches by
+  `w.numel()`: per-head `[H,D]` or shared `[D]` (stride 0). Anything else raises
+  instead of reading out of bounds (regression: Qwen3.5 shared `ssm_norm`)
+- **imatrix shape** — `quantize_numpy` requires `imatrix.shape == arr.shape`
+  (full matrix; tile llama per-column vectors first). `quantize_from_fp8`
+  does not validate yet — pass a full matrix there (see `IMATRIX_PLAN.md`)
 
 ---
 

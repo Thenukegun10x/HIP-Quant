@@ -1,5 +1,11 @@
 # PyTorch FP8 Training Extension Plan
 
+> STATUS (Sep 2026): IMPLEMENTED. `torch_ext/` (bindings + ~20 HIP files),
+> `torch_api.py`, autograd FP8 linear forward/backward, WaveAttention
+> forward/backward, native quantized GEMV, SSM kernels, and the
+> `hip_inference/` engine all exist. The phase checklist below is kept as a
+> design record; open work moved to `TODO.md`.
+
 This document describes what still needs to be implemented to make `hip_quant` usable inside PyTorch training loops without CPU/NumPy round-trips.
 
 ## Current State

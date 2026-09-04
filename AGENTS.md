@@ -58,6 +58,31 @@ gradient magnitude. `test_backward_correctness.py` covers the aligned unit-scale
 case; `test_backward_math.py` covers ragged lengths, non-unit `q/k/v` scales,
 and small-magnitude `dO`.
 
+## Gated RMSNorm shared weight (`torch_ext/ssm_kernels.hip`, Sep 2026)
+Qwen3.5 `ssm_norm` is a SHARED `[head_dim]` vector, but the gated kernel used
+to index `w[h*head_dim+i]` (per-head layout) — heads >= 1 read out of bounds.
+Prefill was immune (torch fallback broadcasts correctly); decode collapsed to
+garbage/NaN. Fixed on both sides: the kernel takes `w_stride` (0 = shared,
+dispatched by `w.numel()` in the binding with hard `TORCH_CHECK`s) and
+`hip_inference/core/norm.py` tiles once (cached) as defense-in-depth.
+Never pass a short `w` to a kernel that indexes per-head without a stride.
+
+## imatrix convention (quantize path)
+llama.cpp imatrix is ONE float per input COLUMN shared across rows
+(`quantize_iq2_xs` reuses the same pointer every row; size `ne[0]`).
+hip_quant kernels index `imatrix + row*n_per_row` (full-matrix layout).
+`quantize_numpy` therefore requires `imatrix.shape == arr.shape` — a raw
+llama `.dat` vector must be tiled first. `quantize_from_fp8` historically
+lacked that shape check (host/device OOB read); see `IMATRIX_PLAN.md` for
+the full fix sequence (shape checks → per-column accept → tests).
+
+## hip_inference (`hip_inference/`)
+Nested PyTorch inference engine (own repo + `AGENTS.md`). Notable: `qwen35.py`
+pre-casts all dense F32/BF16 weights to fp16 once at load (per-token `.to()`
+cost ~12ms/layer before); `debug_decode.py` (`python -m
+hip_inference.debug_decode`) is the permanent per-step latency + NaN/inf
+health profiler — use it before theorizing about tok/s.
+
 ## Agent Conventions
 - **Performance First**: Keep C++ kernels optimized for HIP and `gfx1201`. Memory throughput is key.
 - **Python-Native Interop**: When modifying Python code, ensure `ctypes` signatures perfectly match the types exposed by `hip_quantize.cpp` to prevent segfaults.

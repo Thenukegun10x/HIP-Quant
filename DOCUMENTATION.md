@@ -7,12 +7,22 @@
 It implements a wide variety of GGML-compatible quantization formats plus newer extensions:
 
 ### Supported Quantization Types
-- **Legacy/Standard**: Q4_0, Q4_1, Q5_0, Q5_1, Q6_K, Q8_0, Q8_1, F8_E4M3
+- **Legacy/Standard**: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q1_0, Q2_0, F8_E4M3
+- **K-Quants**: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K
 - **HQ Family (high quality)**: HQ2/AQ2, HQ3/AQ3, HQ8, IQ1_S, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS
 - **I-Quants (byte-exact vs llama.cpp)**: IQ2_S, IQ1_M
-- **Binary (byte-exact vs llama.cpp)**: Q1_0 (1.125 bpw, group 128), Q2_0 (2.25 bpw, group 64)
-- **Other**: Q8_K (intermediate 8.25 bpw, block 256), BF16 (2 B/element cast)
-- **FP8**: E4M3 and E5M2 (via MXFP4 bridge)
+- **Ternary**: TQ1_0, TQ2_0
+- **Other**: BF16 (2 B/element cast)
+- **FP8**: E4M3 and E5M2 (via MXFP4 bridge), MXFP8 microscaling
+
+#### imatrix contract (I-Quants)
+llama.cpp imatrix is one float per input column shared across rows
+(`quantize_iq2_xs` reuses the same pointer every row). hip_quant kernels
+index `imatrix + row*n_per_row`, so `quantize_numpy` requires a full
+`arr.shape` matrix — tile llama `.dat` column vectors across rows first.
+`quantize_from_fp8` does not validate imatrix shape yet (pass a full matrix).
+Weighting math matches llama; the byte-exact suite currently covers the
+all-ones (identity) case only. Full rollout: `IMATRIX_PLAN.md`.
 
 ### Key Features Added Since Last Documentation Update
 1. **WaveAttention FP8 Backward** (`torch_ext/wave_attn_backward.hip`, `wave_attn_diag.hip`) — native GFX12 WMMA backward for `_WaveAttentionFn` in `torch_api.py`. Computes dQ/dK/dV on-device without SDPA recomputation, with separate preprocess pass.
@@ -43,11 +53,13 @@ hip_quantize.cpp         # Native implementation of all quantization formats + F
 - `fp8_dequantize_linear_kernel_v2.hip` — v2 FP8 linear layer dequantization kernel
 - `mxfp4_to_fp32_kernels.hip` / `mx_f8_to_float_kernel.hip` — MXFP4 to float conversion kernels
 
-### PyTorch Extension (`torch_ext/`) — 5 HIP files for training-time operations:
+### PyTorch Extension (`torch_ext/`) — HIP files for training + inference:
 - `wave_attn_backward.hip` — Native GFX12 FP8 WMMA backward kernel for WaveAttention, computing dQ/dK/dV on-device. Follows FlashAttention-2 with separate preprocess pass. Requires exact wave-per-sub-tile alignment (`THREADS/32 == K_TILE/16`).
 - `wave_attn_diag.hip` — Diagonal preprocessing kernel supporting both FP8 E4M3 and BF16 formats, used by WaveAttention backward for computing D = sum_d(dO_id * O_id).
-- `fp8_linear_forward_kernel_v2.hip` / `fp8_linear_warmup_kernel_v2.hip` — Forward pass kernels with warmup support.
-- `mx_f8_to_float_kernel.hip` — MXFP4 to float conversion kernel for torch extension integration.
+- `ssm_kernels.hip` — Gated DeltaNet decode, SSM Conv1D, plain + gated RMSNorm for Qwen3.5/3.8 inference. The gated kernel supports shared `[D]` and per-head `[H,D]` weights via `w_stride` (dispatched + validated in the binding); passing any other size raises.
+- `gemv_q_kernels.hip` — Native AOT GEMV for quantized decode (Q4_0/Q8_0 and IQ/Q_K family) used by `hip_inference`.
+- `wave_attn*.hip`, `fp8_*`, `mxfp8*`, `hq*_linear*`, `q_to_fp8*` — WaveAttention forward variants (prefill/decode/INT4), FP8 linear + quant kernels, MXFP8, HQ linear paths, Q-to-FP8 conversion.
+- `pytorch_bindings.cpp` — Bindings with `TORCH_CHECK` validation (CUDA, contiguity, dtype, numel contracts) on every entry point.
 
 ### Python Modules (`hq2/`)
 ```
@@ -110,9 +122,20 @@ $env:HIP_QUANT_ENABLE_GFX12_WMMA='1'
 - ROCm SDK: version 7.1.x
 - VS Toolchain: x64 Developer Command Prompt (`vcvars64.bat`)
 
-## Line Counts (as of last update)
+## Line Counts (Sep 2026)
 | File | Lines |
 |------|-------|
-| `__init__.py` | ~1,136 |
-| `hip_quantize.cpp` | ~2,800+ |
-| `torch_api.py` | ~3,573 |
+| `__init__.py` | 1,208 |
+| `hip_quantize.cpp` | 1,887 |
+| `torch_api.py` | 3,697 |
+| `torch_ext/pytorch_bindings.cpp` | 2,973 |
+
+## Related: hip_inference
+
+Nested PyTorch inference engine (`hip_inference/`, own repo + README/AGENTS).
+Qwen3 dense + Qwen3.5/3.8 hybrid (SSM) runners on the native kernels.
+`python -m hip_inference.debug_decode` is the permanent per-step latency +
+NaN/inf health profiler — use it before theorizing about tok/s. Current
+decode profile (Qwen3.8-27B, Sep 2026): FFN ~64%, SSM ~30%, attention ~10%,
+LM head ~9ms; all quantized GEMVs run ~65-77 GB/s effective vs ~640 GB/s
+HBM roof (see `hip_inference/README.md`).
