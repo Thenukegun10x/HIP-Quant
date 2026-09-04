@@ -247,6 +247,7 @@ struct dot_q6_K {
 };
 
 struct dot_iq3_s {
+    // Vector L1 cached codebook
     const uint32_t* grid;
     __device__ __forceinline__ dot_iq3_s(const uint32_t* g = d_iq3s_grid) : grid(g) {}
     __device__ __forceinline__ float operator()(const block_iq3_s* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
@@ -293,7 +294,8 @@ struct dot_iq3_s {
             int qh_byte = (int)((qh_u64 >> (8 * ib)) & 0xff);
             int qh_bit = (qh_byte >> qh_bit_pos) & 1;
             int grid_idx = qs_bytes[ib] | (qh_bit << 8);
-            grid_vals[ib] = grid_i8[grid_idx * 4 + j_mod_4];
+            uint32_t grid_u32 = grid[grid_idx];
+            grid_vals[ib] = (int8_t)((grid_u32 >> (j_mod_4 * 8)) & 0xff);
         }
 
         // Stage 3: Compute signed weights and accumulate FMAs
