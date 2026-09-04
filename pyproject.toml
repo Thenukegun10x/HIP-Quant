@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "1.3.2"
-description = "GPU tensor quantization library for AMD ROCm. Native FP8 WMMA attention, HQ2/HQ3 learned-codebook formats, and portable HIP/ROCm kernels for RDNA3, RDNA4, and CDNA."
+version = "2.0.0"
+description = "High-performance GPU tensor quantization and inference engine for AMD ROCm. Native AOT GEMV (K-Quants & I-Quants), State Space Model (SSM/DeltaNet) kernels, FP8 WMMA WaveAttention, and portable HIP C++ kernels for RDNA4, RDNA3, and CDNA."
 readme = "README.md"
+
 license = { file = "LICENSE" }
 authors = [
   { name = "Thenukegun10x", email = "conormorris84@gmail.com" }
@@ -16,7 +17,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -80,6 +82,8 @@ include-package-data = false
     "torch_ext/pytorch_bindings.cpp",
     "torch_ext/pytorch_bindings_hip.cpp",
     "torch_api.py",
+    "gguf.py",
+    "gguf_loader.py",
     "wave_helpers.py",
     "smi.py",
     "tools/gpu-smi.exe",
@@ -90,6 +94,7 @@ include-package-data = false
     "tests/*.py",
     "tests/torch/*.py",
 ]
+
 
 [tool.pytest.ini_options]
 markers = [

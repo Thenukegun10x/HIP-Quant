@@ -3,7 +3,8 @@ import numpy as np
 import os
 import sys
 
-__version__ = "1.3.1"
+__version__ = "2.0.0"
+
 
 _TORCH_EXPORTS = {
     # ── High-Level QoL API ─────────────────────────────────

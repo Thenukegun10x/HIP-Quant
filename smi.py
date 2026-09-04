@@ -55,6 +55,7 @@ _CANDIDATES = [
 ]
 
 
+
 def _find_bin() -> Optional[pathlib.Path]:
     # explicit env override
     env = os.environ.get("HIP_QUANT_GPU_SMI_BIN") or os.environ.get("GPU_SMI_BIN")
@@ -173,12 +174,17 @@ def _fmt(v, suffix="", nil="-"):
 
 def format_gpu(g: Dict[str, Any]) -> str:
     """One-line clean status — not a wall of JSON."""
-    # e.g. RX 9070 XT | 842/16304 MB | 89% | 54C/70C | 3400/24MHz | 45.2W | hip+wmi+adl
+    # e.g. RX 9070 XT | 842/16304 MB (+213M pin) | 89% | 46C/50C/68C(v) | 3400/24MHz | 45.2W | hip+wmi+adl
     vram = f"{g.get('vram_used_mb',0)}/{g.get('vram_total_mb',0)} MB"
+    pinned = g.get("vram_pinned_mb")
+    if pinned:
+        vram += f" (+{pinned}M pin)"
     util = _fmt(g.get("gfx_util_percent"), "%")
     temp = _fmt(g.get("temp_edge_c"), "C")
     if g.get("temp_hotspot_c") is not None:
         temp += f"/{g['temp_hotspot_c']:.0f}C"
+    if g.get("temp_vram_c") is not None:
+        temp += f"/{g['temp_vram_c']:.0f}C(v)"
     clk = _fmt(g.get("gfx_clock_mhz"), "MHz")
     if g.get("mem_clock_mhz") is not None:
         clk += f"/{g['mem_clock_mhz']}MHz"
@@ -192,19 +198,40 @@ def format_gpu(g: Dict[str, Any]) -> str:
     # trim long names
     if len(name) > 22:
         name = name[:19] + "..."
-    return f"{name:<22} | {vram:<14} | {util:<4} | {temp:<9} | {clk:<14} | {power:<6} | {g.get('backend','')}"
+    return f"{name:<22} | {vram:<25} | {util:<4} | {temp:<14} | {clk:<14} | {power:<6} | {g.get('backend','')}"
 
 
-def format_table(gpus: List[Dict[str, Any]]) -> str:
-    hdr = f"{'GPU':<22} | {'VRAM':<14} | {'Util':<4} | {'Temp':<9} | {'Clocks':<14} | {'Power':<6} | Backend"
+def format_table(gpus: List[Dict[str, Any]], show_processes: bool = False) -> str:
+    hdr = f"{'GPU':<22} | {'VRAM':<25} | {'Util':<4} | {'Temp':<14} | {'Clocks':<14} | {'Power':<6} | Backend"
     sep = "-" * len(hdr)
     rows = [hdr, sep] + [format_gpu(g) for g in gpus]
+    if show_processes:
+        procs = []
+        for g in gpus:
+            idx = g.get("index", 0)
+            for p in g.get("processes", []):
+                procs.append((
+                    idx,
+                    p.get("pid", 0),
+                    p.get("proc_type", "G"),
+                    p.get("name", "unknown"),
+                    p.get("mem_used_mb", 0),
+                ))
+        if procs:
+            rows.append("")
+            rows.append("Processes:")
+            p_hdr = f"{'GPU':<4} | {'PID':<8} | {'Type':<4} | {'Name':<30} | Memory"
+            rows.append(p_hdr)
+            rows.append("-" * len(p_hdr))
+            for idx, pid, ptype, name, mem in sorted(procs, key=lambda x: x[4], reverse=True):
+                rows.append(f"{idx:<4} | {pid:<8} | {ptype:<4} | {name:<30} | {mem} MB")
     return "\n".join(rows)
 
 
-def status(compact: bool = True) -> str:
+def status(compact: bool = True, show_processes: bool = False) -> str:
     """Clean one-line per GPU — use while training: `print(smi.status())`."""
-    return format_table(query(compact=compact))
+    return format_table(query(compact=compact), show_processes=show_processes)
+
 
 
 def brief(index: int = 1) -> str:
@@ -303,7 +330,9 @@ class GpuMonitor:
         utils = [ (g.get("gfx_util_percent") or 0) for h in hist for g in h["gpus"] if g.get("gfx_util_percent") is not None ]
         powers = [ g.get("power_w") for h in hist for g in h["gpus"] if g.get("power_w") is not None ]
         temps = [ g.get("temp_edge_c") for h in hist for g in h["gpus"] if g.get("temp_edge_c") is not None ]
+        temp_vram = [ g.get("temp_vram_c") for h in hist for g in h["gpus"] if g.get("temp_vram_c") is not None ]
         vram_used = [ g.get("vram_used_mb") for h in hist for g in h["gpus"] if g.get("vram_used_mb") is not None ]
+        vram_pinned = [ g.get("vram_pinned_mb") for h in hist for g in h["gpus"] if g.get("vram_pinned_mb") is not None ]
         def _stats(xs):
             return {"min": min(xs) if xs else None, "max": max(xs) if xs else None, "avg": sum(xs)/len(xs) if xs else None}
         return {
@@ -312,7 +341,9 @@ class GpuMonitor:
             "util": _stats(utils),
             "power_w": _stats(powers) if powers else None,  # type: ignore[arg-type]
             "temp_edge_c": _stats(temps) if temps else None,  # type: ignore[arg-type]
+            "temp_vram_c": _stats(temp_vram) if temp_vram else None,  # type: ignore[arg-type]
             "vram_used_mb": _stats(vram_used) if vram_used else None,  # type: ignore[arg-type]
+            "vram_pinned_mb": _stats(vram_pinned) if vram_pinned else None,  # type: ignore[arg-type]
         }
 
     def summary_str(self) -> str:
@@ -324,11 +355,13 @@ class GpuMonitor:
             if not d or d["avg"] is None:
                 return "-"
             return f"{d['min']:.0f}-{d['max']:.0f} avg {d['avg']:.0f}{unit}"
+        pinned_part = f" (pin: {fmt(s['vram_pinned_mb'], 'MB')})" if s.get("vram_pinned_mb") and s["vram_pinned_mb"]["avg"] is not None else ""
+        vram_temp_part = f" (vram: {fmt(s['temp_vram_c'], 'C')})" if s.get("temp_vram_c") and s["temp_vram_c"]["avg"] is not None else ""
         return (
             f"{s['samples']} samples {s['duration_s']:.0f}s | "
-            f"VRAM {fmt(s['vram_used_mb'],'MB')} | "
+            f"VRAM {fmt(s['vram_used_mb'],'MB')}{pinned_part} | "
             f"Util {fmt(s['util'],'%')} | "
-            f"Temp {fmt(s['temp_edge_c'],'C')} | "
+            f"Temp {fmt(s['temp_edge_c'],'C')}{vram_temp_part} | "
             f"Power {fmt(s['power_w'],'W')}"
         )
 
@@ -363,12 +396,13 @@ def main():
     p.add_argument("--watch", nargs="?", const=1, type=int, metavar="SECS", help="realtime watch")
     p.add_argument("--serve", nargs="?", const=8080, type=int, metavar="PORT", help="headless HTTP")
     p.add_argument("--verbose", action="store_true", help="verbose table")
+    p.add_argument("--processes", action="store_true", help="show process VRAM usage")
     args = p.parse_args()
 
     bin_path = _find_bin()
     if bin_path is None:
         print("gpu-smi binary not found, using fallback query:")
-        print(json.dumps(query(), indent=2))
+        print(format_table(query(), show_processes=args.processes))
         return 0
     # delegate to binary for full features
     cmd = [str(bin_path)]
@@ -382,17 +416,20 @@ def main():
         cmd += ["--watch", str(args.watch)]
     if args.serve is not None:
         cmd += ["--serve", str(args.serve)]
-    if len(cmd) == 1:
-        # default table
-        pass
     try:
-        subprocess.run(cmd, check=False)
+        subprocess.run(cmd, check=False, stdout=sys.stdout, stderr=sys.stderr)
     except KeyboardInterrupt:
         pass
     return 0
 
 
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
 __all__ = [
     "query", "query_one", "brief", "status", "format_gpu", "format_table",
-    "GpuMonitor", "_find_bin", "_fallback_query",
+    "GpuMonitor", "_find_bin", "_fallback_query", "main",
 ]
+

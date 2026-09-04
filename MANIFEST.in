@@ -13,8 +13,16 @@ recursive-include torch_ext *.cpp *.hip *.h
 recursive-include tests *.py
 recursive-include codebooks *.bin
 include torch_api.py
+include wave_helpers.py
+include smi.py
+include gguf.py
+include gguf_loader.py
 include device_info.py
 include cdna_compat.py
 include setup_torch.py
 include DOCUMENTATION.md
+include tools/gpu-smi.exe
+include tools/gpu-smi
+recursive-include tools/mlp_codec *.py
 recursive-include hq2 *.py
+

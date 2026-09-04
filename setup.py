@@ -139,7 +139,14 @@ def _torch_extension_config():
             "torch_ext/wave_attn.hip",
             "torch_ext/wave_attn_backward.hip",
             "torch_ext/wave_attn_diag.hip",
+            "torch_ext/wave_attn_prefill.hip",
+            "torch_ext/wave_attn_decode.hip",
+            "torch_ext/wave_attn_long.hip",
+            "torch_ext/gemv_q_kernels.hip",
+            "torch_ext/ssm_kernels.hip",
+            "torch_ext/kv_iu4_kernels.hip",
         ],
+
         extra_compile_args={
             "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],
             "nvcc": [

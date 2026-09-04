@@ -1,21 +1,32 @@
 <div align="center">
-  <h1>🚀 hip-quant</h1>
-  <p><b>Blazing Fast On-Device Tensor Quantization for AMD GPUs</b></p>
+  <h1>🚀 hip-quant 2.0</h1>
+  <p><b>High-Performance On-Device Tensor Quantization & Inference Engine for AMD GPUs</b></p>
   <p>
     <img alt="ROCm 7.2.1" src="https://img.shields.io/badge/ROCm-7.2.1-ED1C24?logo=amd"/>
     <img alt="RDNA4" src="https://img.shields.io/badge/RDNA4-gfx1200%20%7C%20gfx1201-blue"/>
     <img alt="RDNA3" src="https://img.shields.io/badge/RDNA3-gfx1100%20%7C%20gfx1101%20%7C%20gfx1102%20%7C%20gfx1103-0096FF"/>
     <img alt="CDNA" src="https://img.shields.io/badge/CDNA-gfx90a%20%7C%20gfx942-purple"/>
-    <img alt="BF16 FP16" src="https://img.shields.io/badge/PyTorch-BF16%20%7C%20FP16-green"/>
-    <img alt="FP8" src="https://img.shields.io/badge/Attention-FP8%20WMMA-orange"/>
+    <img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"/>
     <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white"/>
     <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.9%2BROCm-EE4C2C?logo=pytorch"/>
   </p>
 </div>
 
-`hip-quant` is a standalone Python library and highly optimized HIP C++ backend that quantizes tensors directly on AMD GPUs with no CPU round-trips. The offline GGUF path consumes `float32`; the PyTorch FP8 training extension accepts `float32`, `float16`, and `bfloat16` tensors.
+`hip-quant` is a standalone Python library and highly optimized HIP C++ backend for tensor quantization and accelerated LLM inference on AMD GPUs with zero CPU round-trips.
+
+## 🌟 What's New in 2.0.0
+
+`hip-quant` 2.0.0 expands the project from an offline quantization tool into a **complete high-performance ROCm inference and kernel acceleration suite** for AMD GPUs (specifically targeting RDNA4 `gfx1201`/`gfx1200`, RDNA3, and CDNA):
+
+- **⚡ Native AOT GEMV Engine (400+ GB/s)**: Complete hardware-accelerated GEMV for GGUF formats (`Q4_0`, `Q8_0`, `Q2_K`..`Q6_K`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`). Zero register spills with single-launch long-K paths.
+- **🧠 Native State Space Model (SSM / DeltaNet) Suite**: Fused gating, fast 1D causal convolution, fused Delta-Net decode, and gated RMSNorm supporting shared and per-head layouts.
+- **🌊 Full WaveAttention FP8 WMMA Suite**: Native GFX12 FP8 WMMA attention calling `v_wmma_f32_16x16x16_fp8_fp8` across prefill, decode, long context, and native autograd backward.
+- **📦 Streaming Zero-Dependency GGUF Loader**: Native pure Python GGUF parser (`gguf.py`) and fast GPU tensor loader (`gguf_loader.py`) streaming gigabyte-scale weights directly to VRAM in seconds.
+- **📊 Bundled `gpu-smi` v1.2.0**: Zero-overhead single-binary monitor for dedicated VRAM, OS pinned memory, VRAM junction temperatures, and per-process memory tracking.
+- **📄 Apache 2.0 License**: Officially licensed under Apache 2.0.
 
 It ships **two independent APIs** that can be used together or separately:
+
 
 | API | Purpose | Requires |
 |---|---|---|
@@ -934,3 +945,9 @@ hip_quant/
 - **Phase 4 GEMM** includes gfx12 WMMA per-tensor-scale paths, packed-weight WMMA variants, and a correctness-first block-scaled FP8 linear path. Large training shapes prefer hipBLASLt via `torch._scaled_mm`; custom WMMA remains the fallback/small-shape path.
 - **Adafactor** provides a complete optimizer step in Python with nonfinite step skipping. GPU-side row/column mean-square reductions for 2-D gradients exist; a fully fused Adafactor update kernel is a future optimization target.
 - **Offline API unchanged** — the NumPy/ctypes path is untouched; both APIs coexist cleanly
+
+---
+
+## 📄 License
+This project is licensed under the **Apache License, Version 2.0**. See the [LICENSE](LICENSE) file for the full license text.
+
