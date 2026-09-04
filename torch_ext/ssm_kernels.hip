@@ -20,14 +20,15 @@ __device__ __forceinline__ float silu(float x) {
 // 1. Gated DeltaNet Single-Token Decode Recurrence Kernel
 // ---------------------------------------------------------------------------
 __global__ void delta_net_decode_kernel(
-    const float* __restrict__ q,       // [48, 128]
-    const float* __restrict__ k,       // [48, 128]
+    const float* __restrict__ q,       // [16 or 48, 128]
+    const float* __restrict__ k,       // [16 or 48, 128]
     const float* __restrict__ v,       // [48, 128]
     const float* __restrict__ decay,   // [48]
     const float* __restrict__ beta,    // [48]
     float*       __restrict__ S,       // [48, 128, 128]
     half*        __restrict__ y,       // [48, 128]
-    float scale
+    float scale,
+    int qk_heads = 48
 ) {
     int h = blockIdx.x;     // head 0..47
     int j = blockIdx.y;     // column 0..127
@@ -45,10 +46,13 @@ __global__ void delta_net_decode_kernel(
     float s3 = S[base_h + r3 * 128 + j];
 
     int base_vec = h * 128;
-    float k0 = k[base_vec + r0];
-    float k1 = k[base_vec + r1];
-    float k2 = k[base_vec + r2];
-    float k3 = k[base_vec + r3];
+    int qk_head = (qk_heads == 16) ? (h % 16) : h;
+    int base_qk = qk_head * 128;
+
+    float k0 = k[base_qk + r0];
+    float k1 = k[base_qk + r1];
+    float k2 = k[base_qk + r2];
+    float k3 = k[base_qk + r3];
 
     float kv_part = s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3;
     #pragma unroll
@@ -71,10 +75,10 @@ __global__ void delta_net_decode_kernel(
     S[base_h + r2 * 128 + j] = s2;
     S[base_h + r3 * 128 + j] = s3;
 
-    float q0 = q[base_vec + r0];
-    float q1 = q[base_vec + r1];
-    float q2 = q[base_vec + r2];
-    float q3 = q[base_vec + r3];
+    float q0 = q[base_qk + r0];
+    float q1 = q[base_qk + r1];
+    float q2 = q[base_qk + r2];
+    float q3 = q[base_qk + r3];
 
     float attn_part = s0 * q0 + s1 * q1 + s2 * q2 + s3 * q3;
     #pragma unroll
@@ -85,6 +89,88 @@ __global__ void delta_net_decode_kernel(
     if (lane == 0) {
         y[base_vec + j] = __float2half(attn_part * scale);
     }
+}
+
+// Fused DeltaNet Q/K normalization + V float conversion
+__global__ void fused_delta_net_prep_kernel(
+    const half* __restrict__ conv_out, // [10240]
+    float*      __restrict__ q_norm,   // [16, 128]
+    float*      __restrict__ k_norm,   // [16, 128]
+    float*      __restrict__ v_float   // [48, 128]
+) {
+    int head = blockIdx.x; // 0..79
+    int lane = threadIdx.x; // 0..31
+    if (head >= 80) return;
+
+    if (head < 16) {
+        const half* in_ptr = conv_out + head * 128;
+        float* out_ptr = q_norm + head * 128;
+        float v0 = __half2float(in_ptr[lane]);
+        float v1 = __half2float(in_ptr[lane + 32]);
+        float v2 = __half2float(in_ptr[lane + 64]);
+        float v3 = __half2float(in_ptr[lane + 96]);
+
+        float sum_sq = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down(sum_sq, offset, 32);
+        }
+        float inv_norm = rsqrtf(fmaxf(__shfl(sum_sq, 0, 32), 1e-12f));
+
+        out_ptr[lane]      = v0 * inv_norm;
+        out_ptr[lane + 32] = v1 * inv_norm;
+        out_ptr[lane + 64] = v2 * inv_norm;
+        out_ptr[lane + 96] = v3 * inv_norm;
+    } else if (head < 32) {
+        int k_head = head - 16;
+        const half* in_ptr = conv_out + 2048 + k_head * 128;
+        float* out_ptr = k_norm + k_head * 128;
+        float v0 = __half2float(in_ptr[lane]);
+        float v1 = __half2float(in_ptr[lane + 32]);
+        float v2 = __half2float(in_ptr[lane + 64]);
+        float v3 = __half2float(in_ptr[lane + 96]);
+
+        float sum_sq = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down(sum_sq, offset, 32);
+        }
+        float inv_norm = rsqrtf(fmaxf(__shfl(sum_sq, 0, 32), 1e-12f));
+
+        out_ptr[lane]      = v0 * inv_norm;
+        out_ptr[lane + 32] = v1 * inv_norm;
+        out_ptr[lane + 64] = v2 * inv_norm;
+        out_ptr[lane + 96] = v3 * inv_norm;
+    } else {
+        int v_head = head - 32;
+        const half* in_ptr = conv_out + 4096 + v_head * 128;
+        float* out_ptr = v_float + v_head * 128;
+
+        out_ptr[lane]      = __half2float(in_ptr[lane]);
+        out_ptr[lane + 32] = __half2float(in_ptr[lane + 32]);
+        out_ptr[lane + 64] = __half2float(in_ptr[lane + 64]);
+        out_ptr[lane + 96] = __half2float(in_ptr[lane + 96]);
+    }
+}
+
+// Fused SSM Gating: decay = exp(ssm_a * softplus(alpha + dt_bias)), beta = sigmoid(beta_raw)
+__global__ void fused_ssm_gating_kernel(
+    const half*  __restrict__ beta_raw,  // [48]
+    const half*  __restrict__ alpha_raw, // [48]
+    const float* __restrict__ dt_bias,   // [48]
+    const float* __restrict__ ssm_a,     // [48]
+    float*       __restrict__ decay_out, // [48]
+    float*       __restrict__ beta_out   // [48]
+) {
+    int i = threadIdx.x;
+    if (i >= 48) return;
+    float b = __half2float(beta_raw[i]);
+    float a = __half2float(alpha_raw[i]);
+    float a_biased = a + dt_bias[i];
+    float sp = (a_biased > 20.0f) ? a_biased : log1pf(expf(a_biased));
+    float gate = ssm_a[i] * sp;
+    decay_out[i] = expf(gate);
+    beta_out[i] = 1.0f / (1.0f + expf(-b));
 }
 
 // ---------------------------------------------------------------------------
@@ -243,11 +329,38 @@ void launch_delta_net_decode(
     float* S,
     void* y,
     float scale,
+    int qk_heads,
     hipStream_t stream
 ) {
     dim3 grid(48, 128);
     dim3 block(32, 1);
-    hipLaunchKernelGGL(delta_net_decode_kernel, grid, block, 0, stream, q, k, v, decay, beta, S, (half*)y, scale);
+    hipLaunchKernelGGL(delta_net_decode_kernel, grid, block, 0, stream, q, k, v, decay, beta, S, (half*)y, scale, qk_heads);
+}
+
+void launch_fused_delta_net_prep(
+    const void* conv_out,
+    float* q_norm,
+    float* k_norm,
+    float* v_float,
+    hipStream_t stream
+) {
+    dim3 grid(80);
+    dim3 block(32);
+    hipLaunchKernelGGL(fused_delta_net_prep_kernel, grid, block, 0, stream, (const half*)conv_out, q_norm, k_norm, v_float);
+}
+
+void launch_fused_ssm_gating(
+    const void* beta_raw,
+    const void* alpha_raw,
+    const float* dt_bias,
+    const float* ssm_a,
+    float* decay_out,
+    float* beta_out,
+    hipStream_t stream
+) {
+    dim3 grid(1);
+    dim3 block(64);
+    hipLaunchKernelGGL(fused_ssm_gating_kernel, grid, block, 0, stream, (const half*)beta_raw, (const half*)alpha_raw, dt_bias, ssm_a, decay_out, beta_out);
 }
 
 void launch_fast_ssm_conv1d(

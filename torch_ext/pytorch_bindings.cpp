@@ -197,7 +197,12 @@ void launch_dequant_embedding_forward(
 void launch_delta_net_decode(
     const float* q, const float* k, const float* v,
     const float* decay, const float* beta,
-    float* S, void* y, float scale, hipStream_t stream);
+    float* S, void* y, float scale, int qk_heads, hipStream_t stream);
+void launch_fused_delta_net_prep(
+    const void* conv_out, float* q_norm, float* k_norm, float* v_float, hipStream_t stream);
+void launch_fused_ssm_gating(
+    const void* beta_raw, const void* alpha_raw, const float* dt_bias, const float* ssm_a,
+    float* decay_out, float* beta_out, hipStream_t stream);
 void launch_fast_ssm_conv1d(
     const void* x, void* conv_state, const void* conv_weight,
     void* y, int num_channels, hipStream_t stream);
@@ -1938,7 +1943,8 @@ torch::Tensor delta_net_decode_forward(
     torch::Tensor decay,
     torch::Tensor beta,
     torch::Tensor S,
-    double scale
+    double scale,
+    c10::optional<torch::Tensor> out_opt = c10::nullopt
 ) {
     TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "delta_net_decode_forward: q must be contiguous CUDA tensor");
     TORCH_CHECK(k.is_cuda() && k.is_contiguous(), "delta_net_decode_forward: k must be contiguous CUDA tensor");
@@ -1947,7 +1953,10 @@ torch::Tensor delta_net_decode_forward(
     TORCH_CHECK(beta.is_cuda() && beta.is_contiguous(), "delta_net_decode_forward: beta must be contiguous CUDA tensor");
     TORCH_CHECK(S.is_cuda() && S.is_contiguous(), "delta_net_decode_forward: S must be contiguous CUDA tensor");
 
-    auto y = torch::empty({48, 128}, q.options().dtype(torch::kFloat16));
+    auto y = (out_opt.has_value() && out_opt->defined())
+        ? *out_opt
+        : torch::empty({48, 128}, q.options().dtype(torch::kFloat16));
+    int qk_heads = (int)(q.numel() / 128);
     launch_delta_net_decode(
         q.data_ptr<float>(),
         k.data_ptr<float>(),
@@ -1957,9 +1966,70 @@ torch::Tensor delta_net_decode_forward(
         S.data_ptr<float>(),
         y.data_ptr(),
         (float)scale,
+        qk_heads,
         current_stream()
     );
     return y;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_delta_net_prep_forward(
+    torch::Tensor conv_out,
+    c10::optional<torch::Tensor> q_norm_opt = c10::nullopt,
+    c10::optional<torch::Tensor> k_norm_opt = c10::nullopt,
+    c10::optional<torch::Tensor> v_float_opt = c10::nullopt
+) {
+    TORCH_CHECK(conv_out.is_cuda() && conv_out.is_contiguous(), "fused_delta_net_prep: conv_out must be contiguous CUDA");
+    TORCH_CHECK(conv_out.numel() >= 10240, "fused_delta_net_prep: conv_out must have >= 10240 elements");
+    auto q_norm = (q_norm_opt.has_value() && q_norm_opt->defined())
+        ? *q_norm_opt
+        : torch::empty({16, 128}, conv_out.options().dtype(torch::kFloat32));
+    auto k_norm = (k_norm_opt.has_value() && k_norm_opt->defined())
+        ? *k_norm_opt
+        : torch::empty({16, 128}, conv_out.options().dtype(torch::kFloat32));
+    auto v_float = (v_float_opt.has_value() && v_float_opt->defined())
+        ? *v_float_opt
+        : torch::empty({48, 128}, conv_out.options().dtype(torch::kFloat32));
+
+    launch_fused_delta_net_prep(
+        conv_out.data_ptr(),
+        q_norm.data_ptr<float>(),
+        k_norm.data_ptr<float>(),
+        v_float.data_ptr<float>(),
+        current_stream()
+    );
+    return std::make_tuple(q_norm, k_norm, v_float);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_ssm_gating_forward(
+    torch::Tensor beta_raw,
+    torch::Tensor alpha_raw,
+    torch::Tensor dt_bias,
+    torch::Tensor ssm_a,
+    c10::optional<torch::Tensor> decay_opt = c10::nullopt,
+    c10::optional<torch::Tensor> beta_out_opt = c10::nullopt
+) {
+    TORCH_CHECK(beta_raw.is_cuda() && beta_raw.is_contiguous(), "fused_ssm_gating: beta_raw must be contiguous CUDA");
+    TORCH_CHECK(alpha_raw.is_cuda() && alpha_raw.is_contiguous(), "fused_ssm_gating: alpha_raw must be contiguous CUDA");
+    TORCH_CHECK(dt_bias.is_cuda() && dt_bias.is_contiguous(), "fused_ssm_gating: dt_bias must be contiguous CUDA");
+    TORCH_CHECK(ssm_a.is_cuda() && ssm_a.is_contiguous(), "fused_ssm_gating: ssm_a must be contiguous CUDA");
+
+    auto decay_out = (decay_opt.has_value() && decay_opt->defined())
+        ? *decay_opt
+        : torch::empty({48}, dt_bias.options().dtype(torch::kFloat32));
+    auto beta_out = (beta_out_opt.has_value() && beta_out_opt->defined())
+        ? *beta_out_opt
+        : torch::empty({48}, dt_bias.options().dtype(torch::kFloat32));
+
+    launch_fused_ssm_gating(
+        beta_raw.data_ptr(),
+        alpha_raw.data_ptr(),
+        dt_bias.data_ptr<float>(),
+        ssm_a.data_ptr<float>(),
+        decay_out.data_ptr<float>(),
+        beta_out.data_ptr<float>(),
+        current_stream()
+    );
+    return std::make_tuple(decay_out, beta_out);
 }
 
 torch::Tensor fast_ssm_conv1d_forward(
@@ -2773,9 +2843,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Zero-copy on-the-fly embedding lookup and dequantization directly to FP16",
           py::arg("weight_packed"), py::arg("token_ids"), py::arg("ggml_type"), py::arg("K"));
     m.def("delta_net_decode_forward", &delta_net_decode_forward,
-          "Fused single-token Gated DeltaNet recurrence for Qwen 3.5/3.8 (48 heads x 128 dim)",
+          "Fused single-token Gated DeltaNet recurrence for Qwen 3.5/3.8 (16 or 48 heads x 128 dim)",
           py::arg("q"), py::arg("k"), py::arg("v"),
-          py::arg("decay"), py::arg("beta"), py::arg("S"), py::arg("scale"));
+          py::arg("decay"), py::arg("beta"), py::arg("S"), py::arg("scale"),
+          py::arg("out") = c10::optional<torch::Tensor>());
+    m.def("fused_delta_net_prep_forward", &fused_delta_net_prep_forward,
+          "Fused DeltaNet Q/K normalization + V float conversion",
+          py::arg("conv_out"),
+          py::arg("q_norm") = c10::optional<torch::Tensor>(),
+          py::arg("k_norm") = c10::optional<torch::Tensor>(),
+          py::arg("v_float") = c10::optional<torch::Tensor>());
+    m.def("fused_ssm_gating_forward", &fused_ssm_gating_forward,
+          "Fused SSM Gating: decay = exp(ssm_a * softplus(alpha + dt_bias)), beta = sigmoid(beta_raw)",
+          py::arg("beta_raw"), py::arg("alpha_raw"), py::arg("dt_bias"), py::arg("ssm_a"),
+          py::arg("decay_out") = c10::optional<torch::Tensor>(),
+          py::arg("beta_out") = c10::optional<torch::Tensor>());
     m.def("fast_ssm_conv1d_forward", &fast_ssm_conv1d_forward,
           "Fused depthwise Conv1D shift and SiLU for SSM (10240 channels)",
           py::arg("x"), py::arg("conv_state"), py::arg("conv_weight"));

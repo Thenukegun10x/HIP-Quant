@@ -423,6 +423,11 @@ def _load_extension() -> object:
             "PyTorch is not installed. Install torch with ROCm support first."
         )
     try:
+        from hip_quant import device_info
+        device_info._add_dll_directories()
+    except Exception:
+        pass
+    try:
         from hip_quant import _C as _ext  # type: ignore[attr-defined]
         _C = _ext
     except ImportError:
@@ -741,6 +746,33 @@ def swiglu_forward(
     """Fused SwiGLU activation: out = silu(g) * u (fp16, optional in-place)."""
     return _load_extension().swiglu_forward(
         g.contiguous(), u.contiguous(), out if out is not None else None
+    )
+
+
+def fused_delta_net_prep(
+    conv_out: "torch.Tensor",
+    q_norm: Optional["torch.Tensor"] = None,
+    k_norm: Optional["torch.Tensor"] = None,
+    v_float: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Fused DeltaNet Q/K normalization + V float conversion."""
+    return _load_extension().fused_delta_net_prep_forward(
+        conv_out.contiguous(), q_norm, k_norm, v_float
+    )
+
+
+def fused_ssm_gating(
+    beta_raw: "torch.Tensor",
+    alpha_raw: "torch.Tensor",
+    dt_bias: "torch.Tensor",
+    ssm_a: "torch.Tensor",
+    decay_out: Optional["torch.Tensor"] = None,
+    beta_out: Optional["torch.Tensor"] = None,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Fused SSM Gating: decay = exp(ssm_a * softplus(alpha + dt_bias)), beta = sigmoid(beta_raw)."""
+    return _load_extension().fused_ssm_gating_forward(
+        beta_raw.contiguous(), alpha_raw.contiguous(), dt_bias.contiguous(), ssm_a.contiguous(),
+        decay_out, beta_out
     )
 
 
