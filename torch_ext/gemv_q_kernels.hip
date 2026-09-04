@@ -250,32 +250,59 @@ struct dot_iq3_s {
     const uint32_t* grid;
     __device__ __forceinline__ dot_iq3_s(const uint32_t* g = d_iq3s_grid) : grid(g) {}
     __device__ __forceinline__ float operator()(const block_iq3_s* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
-        const block_iq3_s& blk = *blk_ptr; // alias: fields load on demand, no struct copy
+        const block_iq3_s& blk = *blk_ptr;
         float d = fp16_to_fp32(blk.d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
-        const int grid_pos = j & 3;
+        const int j_mod_4 = j & 3;
+        const int qh_bit_pos = 2 * l + (j >= 4 ? 1 : 0);
+        const int qs_sub_offset = (j >= 4 ? 1 : 0);
 
-        float sum = 0.0f;
+        // 1. Single 32-bit load for 4-byte scales: precompute all 8 db values
+        uint32_t scales_u32;
+        memcpy(&scales_u32, blk.scales, 4);
+        float db[8];
         #pragma unroll
-        for (int ib32 = 0; ib32 < 8; ++ib32) {
-            int pair = ib32 >> 1;
-            bool is_first = ((ib32 & 1) == 0);
-            uint8_t sc_raw = is_first ? (blk.scales[pair] & 0x0f) : (blk.scales[pair] >> 4);
-            float db = d * (float)(1 + 2 * sc_raw);
+        for (int ib = 0; ib < 8; ++ib) {
+            uint8_t sc_raw = (scales_u32 >> (ib * 4)) & 0x0f;
+            db[ib] = d * (float)(1 + 2 * sc_raw);
+        }
 
-            int qh_byte = (int)blk.qh[ib32];
-            int grid_idx = (j < 4)
-                ? (int)(blk.qs[8 * ib32 + 2 * l + 0] | (((qh_byte << (8 - 2 * l)) & 256)))
-                : (int)(blk.qs[8 * ib32 + 2 * l + 1] | (((qh_byte << (7 - 2 * l)) & 256)));
+        // 2. Single 64-bit load for 8-byte qh
+        uint64_t qh_u64;
+        memcpy(&qh_u64, blk.qh, 8);
 
-            uint32_t grid_u32 = grid[grid_idx];
-            int8_t grid_val = (int8_t)((grid_u32 >> (grid_pos * 8)) & 0xff);
-            uint8_t signs_byte = blk.signs[4 * ib32 + l];
-            float sign = ((signs_byte >> j) & 1) ? -db : db;
-            float w = sign * (float)grid_val;
+        // 3. Load 32-byte signs array into registers once per superblock
+        uint32_t signs_words[8];
+        memcpy(signs_words, blk.signs, 32);
 
-            sum = fmaf(w, __half2float(x_sb[ib32 * 32 + lane_id]), sum);
+        const int8_t* grid_i8 = reinterpret_cast<const int8_t*>(grid);
+        float sum = 0.0f;
+
+        // Stage 1: Issue all 8 qs loads up-front into the memory pipeline concurrently
+        int qs_bytes[8];
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            qs_bytes[ib] = (int)blk.qs[8 * ib + 2 * l + qs_sub_offset];
+        }
+
+        // Stage 2: Compute grid indices and issue all grid table lookups into L1 concurrently
+        int8_t grid_vals[8];
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            int qh_byte = (int)((qh_u64 >> (8 * ib)) & 0xff);
+            int qh_bit = (qh_byte >> qh_bit_pos) & 1;
+            int grid_idx = qs_bytes[ib] | (qh_bit << 8);
+            grid_vals[ib] = grid_i8[grid_idx * 4 + j_mod_4];
+        }
+
+        // Stage 3: Compute signed weights and accumulate FMAs
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            int sign_bit = (signs_words[ib] >> lane_id) & 1;
+            float sign = sign_bit ? -db[ib] : db[ib];
+            float w = sign * (float)grid_vals[ib];
+            sum = fmaf(w, __half2float(x_sb[ib * 32 + lane_id]), sum);
         }
         return sum;
     }
@@ -344,20 +371,23 @@ struct dot_q2_K {
 
 struct dot_iq4_xs {
     __device__ __forceinline__ float operator()(const block_iq4_xs* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
-        const block_iq4_xs& blk = *blk_ptr; // alias: fields load on demand, no struct copy
-        float d = fp16_to_fp32(blk.d);
-        float sum = 0.0f;
+        uint64_t header = *reinterpret_cast<const uint64_t*>(blk_ptr);
+        uint16_t d_u16 = (uint16_t)(header & 0xffff);
+        float d = fp16_to_fp32(d_u16);
+        uint32_t scales_h = (uint32_t)((header >> 16) & 0xffff);
+        uint32_t scales_l = (uint32_t)(header >> 32);
 
+        float sum = 0.0f;
         #pragma unroll
         for (int ib = 0; ib < 8; ++ib) {
-            int nibble = (lane_id < 16)
-                ? (blk.qs[16 * ib + lane_id] & 0x0f)
-                : (blk.qs[16 * ib + (lane_id - 16)] >> 4);
-
-            int ls_low = (blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
-            int ls_high = (blk.scales_h >> (2 * ib)) & 3;
+            int ls_low = (scales_l >> (4 * ib)) & 0x0f;
+            int ls_high = (scales_h >> (2 * ib)) & 0x03;
             int ls = ls_low | (ls_high << 4);
             float dl = d * (float)(ls - 32);
+
+            int byte_idx = 16 * ib + (lane_id & 15);
+            uint8_t q_byte = blk_ptr->qs[byte_idx];
+            int nibble = (lane_id < 16) ? (q_byte & 0x0f) : (q_byte >> 4);
 
             float w = dl * (float)d_kvalues_iq4nl[nibble];
             sum += w * __half2float(x_sb[ib * 32 + lane_id]);
@@ -769,19 +799,10 @@ __global__ void gemv_iq3s_kernel(
     bool has_bias,
     bool use_lds
 ) {
-    __shared__ uint32_t s_grid[512];
     extern __shared__ half x_shared[];
     const half* x0_vec = x;
     const half* x1_vec = (M == 2) ? (x + K_full) : nullptr;
     int tid = threadIdx.y * 32 + threadIdx.x;
-
-    // Cooperatively load 512 entries (2 KB) of grid table into LDS
-    if (tid < 128) {
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            s_grid[tid * 4 + i] = d_iq3s_grid[tid * 4 + i];
-        }
-    }
 
     if (use_lds) {
         // Chunk-aware staging (see gemv_q_kernel): x1's slice is at x + K_full.
@@ -809,7 +830,7 @@ __global__ void gemv_iq3s_kernel(
     int num_superblocks = K / 256;
     const block_iq3_s* row = weights + (size_t)n * row_stride_sb;
 
-    dot_iq3_s dot_op(s_grid);
+    dot_iq3_s dot_op(d_iq3s_grid);
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int b = 0; b < num_superblocks; ++b) {
@@ -920,6 +941,107 @@ __global__ void gemv_iq3xxs_kernel(
     }
 }
 
+template <int ROWS_PER_BLOCK = 4, int M = 1>
+__global__ void gemv_iq4xs_kernel(
+    const half* __restrict__ x,
+    const block_iq4_xs* __restrict__ weights,
+    half* __restrict__ y,
+    const half* __restrict__ bias,
+    int N, int K,
+    int K_full, int row_stride_sb,
+    bool has_bias,
+    bool use_lds
+) {
+    __shared__ float s_kvalues[32];
+    extern __shared__ half x_shared[];
+    const half* x0_vec = x;
+    const half* x1_vec = (M == 2) ? (x + K_full) : nullptr;
+    int tid = threadIdx.y * 32 + threadIdx.x;
+
+    if (tid < 16) {
+        float val = (float)d_kvalues_iq4nl[tid];
+        s_kvalues[tid] = val;
+        s_kvalues[tid + 16] = val;
+    }
+
+    if (use_lds) {
+        int block_threads = 32 * ROWS_PER_BLOCK;
+        for (int i = tid; i < K; i += block_threads) {
+            x_shared[i] = x[i];
+        }
+        if constexpr (M == 2) {
+            for (int i = tid; i < K; i += block_threads) {
+                x_shared[K + i] = x[K_full + i];
+            }
+        }
+        x0_vec = x_shared;
+        if constexpr (M == 2) {
+            x1_vec = x_shared + K;
+        }
+    }
+    __syncthreads();
+
+    int wave_id = threadIdx.y;
+    int lane_id = threadIdx.x;
+    int n = blockIdx.x * ROWS_PER_BLOCK + wave_id;
+    if (n >= N) return;
+
+    int num_superblocks = K / 256;
+    const block_iq4_xs* row = weights + (size_t)n * row_stride_sb;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int b = 0; b < num_superblocks; ++b) {
+        const block_iq4_xs* blk_ptr = row + b;
+        uint64_t header = *reinterpret_cast<const uint64_t*>(blk_ptr);
+        uint16_t d_u16 = (uint16_t)(header & 0xffff);
+        float d = fp16_to_fp32(d_u16);
+        uint32_t scales_h = (uint32_t)((header >> 16) & 0xffff);
+        uint32_t scales_l = (uint32_t)(header >> 32);
+
+        const half* x0_sb = &x0_vec[b * 256];
+        const half* x1_sb = (M == 2) ? &x1_vec[b * 256] : nullptr;
+
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            int ls_low = (scales_l >> (4 * ib)) & 0x0f;
+            int ls_high = (scales_h >> (2 * ib)) & 0x03;
+            int ls = ls_low | (ls_high << 4);
+            float dl = d * (float)(ls - 32);
+
+            int byte_idx = 16 * ib + (lane_id & 15);
+            uint8_t q_byte = blk_ptr->qs[byte_idx];
+            int nibble = (lane_id < 16) ? (q_byte & 0x0f) : (q_byte >> 4);
+
+            float w = dl * s_kvalues[nibble];
+            sum0 += w * __half2float(x0_sb[ib * 32 + lane_id]);
+            if constexpr (M == 2) {
+                sum1 += w * __half2float(x1_sb[ib * 32 + lane_id]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down(sum0, offset, 32);
+        if constexpr (M == 2) {
+            sum1 += __shfl_down(sum1, offset, 32);
+        }
+    }
+
+    if (lane_id == 0) {
+        if (has_bias) {
+            float b_val = __half2float(bias[n]);
+            sum0 += b_val;
+            if constexpr (M == 2) sum1 += b_val;
+        }
+        y[n] = __float2half(sum0);
+        if constexpr (M == 2) {
+            y[N + n] = __float2half(sum1);
+        }
+    }
+}
+
 } // namespace
 
 template <int M>
@@ -985,9 +1107,12 @@ static void dispatch_gemv_q(
             N, K, K_full, row_stride_sb, has_bias, use_lds
         );
     } else if (ggml_type == GGML_TYPE_IQ3_S) {
+        constexpr int ROWS_8 = 8;
+        dim3 block_8(32, ROWS_8);
+        dim3 grid_8((N + ROWS_8 - 1) / ROWS_8);
         hipLaunchKernelGGL(
-            (gemv_iq3s_kernel<ROWS_PER_BLOCK, M>),
-            grid, block, shared_bytes, stream,
+            (gemv_iq3s_kernel<ROWS_8, M>),
+            grid_8, block_8, shared_bytes, stream,
             (const half*)input, (const block_iq3_s*)packed_weight, (half*)output, (const half*)bias,
             N, K, K_full, row_stride_sb, has_bias, use_lds
         );
@@ -1000,7 +1125,7 @@ static void dispatch_gemv_q(
         );
     } else if (ggml_type == GGML_TYPE_IQ4_XS) {
         hipLaunchKernelGGL(
-            (gemv_qk_kernel<block_iq4_xs, dot_iq4_xs, ROWS_PER_BLOCK, M>),
+            (gemv_iq4xs_kernel<ROWS_PER_BLOCK, M>),
             grid, block, shared_bytes, stream,
             (const half*)input, (const block_iq4_xs*)packed_weight, (half*)output, (const half*)bias,
             N, K, K_full, row_stride_sb, has_bias, use_lds
