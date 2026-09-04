@@ -1662,12 +1662,14 @@ torch::Tensor gemv_q_forward(
 
     BiasLaunch bias_launch = validate_bias_for_forward(bias, N, input.device(), "gemv_q_forward");
     auto output = torch::empty({M, N}, input.options());
-    // Long-K rows (K > 8192) cannot use the LDS x-staging path; split K
-    // into LDS-sized chunks with partials + reduce. The M*K <= 8192 single
-    // path is untouched (in particular M=2,K<=8192 keeps today's speed).
+    // Long-K rows (M==1, K > 8192) cannot use the LDS x-staging path; split K
+    // into LDS-sized chunks with partials + reduce. M==2 reuses each weight
+    // block across both rows, so the single launch already amortizes traffic
+    // better than chunking would (measured 1.36x vs 2.1x of M=1) — never split
+    // M==2. The M*K <= 8192 single path is untouched.
     // HIP_QUANT_GEMV_NOSPLIT=1 forces the legacy single launch for A/B.
     static const bool gemv_nosplit = (std::getenv("HIP_QUANT_GEMV_NOSPLIT") != nullptr);
-    int nchunks = (!gemv_nosplit && K > 8192) ? gemv_q_split_chunks((int)M, (int)K) : 1;
+    int nchunks = (!gemv_nosplit && M == 1 && K > 8192) ? gemv_q_split_chunks(1, (int)K) : 1;
     if (nchunks > 1) {
         auto scratch = torch::empty({(int64_t)nchunks * M * N}, input.options());
         launch_gemv_q_split_forward(
