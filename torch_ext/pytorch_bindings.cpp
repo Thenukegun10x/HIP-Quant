@@ -167,10 +167,31 @@ constexpr int GGML_TYPE_Q5_K = 13;
 constexpr int GGML_TYPE_Q6_K = 14;
 constexpr int GGML_TYPE_IQ4_NL = 20;
 constexpr int GGML_TYPE_IQ4_XS = 23;
-
 void launch_gemv_q_forward(
-    const void* input, const void* packed_weight, void* output, const void* bias,
-    int ggml_type, int N, int K, bool has_bias, hipStream_t stream);
+    const void* input, const void* packed_weight, void* output,
+    const void* bias, int ggml_type, int M, int N, int K,
+    bool has_bias, hipStream_t stream);
+int gemv_q_split_chunks(int M, int K);
+void launch_gemv_q_split_forward(
+    const void* input, const void* packed_weight, void* partials_scratch,
+    void* output, const void* bias, int ggml_type, int M, int N, int K, int C,
+    bool has_bias, hipStream_t stream);
+void launch_dequant_embedding_forward(
+    const void* packed_weight, const int64_t* token_ids, void* output,
+    int ggml_type, int num_tokens, int K, hipStream_t stream);
+void launch_delta_net_decode(
+    const float* q, const float* k, const float* v,
+    const float* decay, const float* beta,
+    float* S, void* y, float scale, hipStream_t stream);
+void launch_fast_ssm_conv1d(
+    const void* x, void* conv_state, const void* conv_weight,
+    void* y, int num_channels, hipStream_t stream);
+void launch_fast_rms_norm(
+    const void* x, const void* w, void* y,
+    int rows, int D, float eps, hipStream_t stream);
+void launch_fast_rms_norm_gated(
+    const void* x, const void* w, const void* gate,
+    void* y, int num_heads, int head_dim, float eps, int w_stride, hipStream_t stream);
 void launch_fp8_linear_backward_input(
     const void* grad_output, const void* weight, void* grad_input,
     int M, int N, int K, int grad_output_dtype, int weight_dtype,
@@ -247,10 +268,11 @@ void launch_wave_attn_prefill(
     int out_dtype, bool is_causal, bool use_int4, hipStream_t stream);
 void launch_wave_attn_decode(
     const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V_int4,
+    const float* k_scales,
     void* Out, float* LSE,
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
-    int out_dtype, bool is_causal, hipStream_t stream);
+    int out_dtype, bool is_causal, bool v_is_fp8, hipStream_t stream);
 void launch_wave_attn_long(
     const uint8_t* Q_fp8,
     const uint8_t* K_fp8, const uint8_t* K_int4, const uint8_t* K_scales,
@@ -1591,8 +1613,9 @@ torch::Tensor gemv_q_forward(
                 "gemv_q_forward: input must be a contiguous CUDA tensor");
     TORCH_CHECK(weight_packed.is_cuda() && weight_packed.is_contiguous(),
                 "gemv_q_forward: weight_packed must be a contiguous CUDA tensor");
-    TORCH_CHECK(input.dim() == 2 && input.size(0) == 1,
-                "gemv_q_forward: input must be 2-D with M=1");
+    int64_t M = input.size(0);
+    TORCH_CHECK(input.dim() == 2 && (M == 1 || M == 2),
+                "gemv_q_forward: input must be 2-D with M=1 or M=2");
     int64_t K = input.size(1);
     int64_t N = output_features;
     TORCH_CHECK(K % 32 == 0, "gemv_q_forward: K must be a multiple of 32");
@@ -1601,27 +1624,234 @@ torch::Tensor gemv_q_forward(
                 "gemv_q_forward: input must be float16");
     TORCH_CHECK(weight_packed.scalar_type() == torch::kUInt8,
                 "gemv_q_forward: weight_packed must be uint8");
-    TORCH_CHECK(ggml_type == GGML_TYPE_Q8_0 || ggml_type == GGML_TYPE_Q4_0,
-                "gemv_q_forward: only Q8_0 and Q4_0 currently supported");
-    int bytes_per_block = (ggml_type == GGML_TYPE_Q8_0) ? 34 : 18;
-    int64_t expected_bytes = N * (K / 32) * bytes_per_block;
+    int block_size = 32;
+    int bytes_per_block = 0;
+    if (ggml_type == GGML_TYPE_Q8_0) {
+        block_size = 32; bytes_per_block = 34;
+    } else if (ggml_type == GGML_TYPE_Q4_0) {
+        block_size = 32; bytes_per_block = 18;
+    } else if (ggml_type == 10) { // GGML_TYPE_Q2_K
+        block_size = 256; bytes_per_block = 84;
+    } else if (ggml_type == 12) { // GGML_TYPE_Q4_K
+        block_size = 256; bytes_per_block = 144;
+    } else if (ggml_type == 13) { // GGML_TYPE_Q5_K
+        block_size = 256; bytes_per_block = 176;
+    } else if (ggml_type == 14) { // GGML_TYPE_Q6_K
+        block_size = 256; bytes_per_block = 210;
+    } else if (ggml_type == 16) { // GGML_TYPE_IQ2_XXS
+        block_size = 256; bytes_per_block = 66;
+    } else if (ggml_type == 17) { // GGML_TYPE_IQ2_XS
+        block_size = 256; bytes_per_block = 74;
+    } else if (ggml_type == 18) { // GGML_TYPE_IQ3_XXS
+        block_size = 256; bytes_per_block = 98;
+    } else if (ggml_type == 21) { // GGML_TYPE_IQ3_S
+        block_size = 256; bytes_per_block = 110;
+    } else if (ggml_type == 22) { // GGML_TYPE_IQ2_S
+        block_size = 256; bytes_per_block = 82;
+    } else if (ggml_type == 23) { // GGML_TYPE_IQ4_XS
+        block_size = 256; bytes_per_block = 136;
+    } else if (ggml_type == 29) { // GGML_TYPE_IQ1_M
+        block_size = 256; bytes_per_block = 56;
+    } else {
+        TORCH_CHECK(false, "gemv_q_forward: unsupported ggml_type ", ggml_type);
+    }
+    TORCH_CHECK(K % block_size == 0, "gemv_q_forward: K must be a multiple of ", block_size);
+    int64_t expected_bytes = N * (K / block_size) * bytes_per_block;
     TORCH_CHECK(weight_packed.numel() >= expected_bytes,
                 "gemv_q_forward: weight_packed tensor size too small");
 
     BiasLaunch bias_launch = validate_bias_for_forward(bias, N, input.device(), "gemv_q_forward");
-    auto output = torch::empty({1, N}, input.options());
+    auto output = torch::empty({M, N}, input.options());
+    // Long-K rows (K > 8192) cannot use the LDS x-staging path; split K
+    // into LDS-sized chunks with partials + reduce. The M*K <= 8192 single
+    // path is untouched (in particular M=2,K<=8192 keeps today's speed).
+    // HIP_QUANT_GEMV_NOSPLIT=1 forces the legacy single launch for A/B.
+    static const bool gemv_nosplit = (std::getenv("HIP_QUANT_GEMV_NOSPLIT") != nullptr);
+    int nchunks = (!gemv_nosplit && K > 8192) ? gemv_q_split_chunks((int)M, (int)K) : 1;
+    if (nchunks > 1) {
+        auto scratch = torch::empty({(int64_t)nchunks * M * N}, input.options());
+        launch_gemv_q_split_forward(
+            input.data_ptr(),
+            weight_packed.data_ptr(),
+            scratch.data_ptr(),
+            output.data_ptr(),
+            bias_launch.ptr,
+            (int)ggml_type,
+            (int)M,
+            (int)N,
+            (int)K,
+            nchunks,
+            bias_launch.has_bias,
+            current_stream()
+        );
+        return output;
+    }
     launch_gemv_q_forward(
         input.data_ptr(),
         weight_packed.data_ptr(),
         output.data_ptr(),
         bias_launch.ptr,
         (int)ggml_type,
+        (int)M,
         (int)N,
         (int)K,
         bias_launch.has_bias,
         current_stream()
     );
     return output;
+}
+
+torch::Tensor dequant_embedding_forward(
+    torch::Tensor weight_packed,
+    torch::Tensor token_ids,
+    int64_t ggml_type,
+    int64_t K
+) {
+    TORCH_CHECK(weight_packed.is_cuda() && weight_packed.is_contiguous(),
+                "dequant_embedding_forward: weight_packed must be contiguous CUDA tensor");
+    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous(),
+                "dequant_embedding_forward: token_ids must be contiguous CUDA tensor");
+    TORCH_CHECK(token_ids.dtype() == torch::kInt64,
+                "dequant_embedding_forward: token_ids must be int64");
+    TORCH_CHECK(weight_packed.dtype() == torch::kUInt8,
+                "dequant_embedding_forward: weight_packed must be uint8");
+
+    int64_t num_tokens = token_ids.numel();
+    auto output = torch::empty({num_tokens, K}, weight_packed.options().dtype(torch::kFloat16));
+
+    launch_dequant_embedding_forward(
+        weight_packed.data_ptr(),
+        token_ids.data_ptr<int64_t>(),
+        output.data_ptr(),
+        (int)ggml_type,
+        (int)num_tokens,
+        (int)K,
+        current_stream()
+    );
+    return output;
+}
+
+torch::Tensor delta_net_decode_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor decay,
+    torch::Tensor beta,
+    torch::Tensor S,
+    double scale
+) {
+    TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "delta_net_decode_forward: q must be contiguous CUDA tensor");
+    TORCH_CHECK(k.is_cuda() && k.is_contiguous(), "delta_net_decode_forward: k must be contiguous CUDA tensor");
+    TORCH_CHECK(v.is_cuda() && v.is_contiguous(), "delta_net_decode_forward: v must be contiguous CUDA tensor");
+    TORCH_CHECK(decay.is_cuda() && decay.is_contiguous(), "delta_net_decode_forward: decay must be contiguous CUDA tensor");
+    TORCH_CHECK(beta.is_cuda() && beta.is_contiguous(), "delta_net_decode_forward: beta must be contiguous CUDA tensor");
+    TORCH_CHECK(S.is_cuda() && S.is_contiguous(), "delta_net_decode_forward: S must be contiguous CUDA tensor");
+
+    auto y = torch::empty({48, 128}, q.options().dtype(torch::kFloat16));
+    launch_delta_net_decode(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        decay.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        S.data_ptr<float>(),
+        y.data_ptr(),
+        (float)scale,
+        current_stream()
+    );
+    return y;
+}
+
+torch::Tensor fast_ssm_conv1d_forward(
+    torch::Tensor x,
+    torch::Tensor conv_state,
+    torch::Tensor conv_weight
+) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "fast_ssm_conv1d_forward: x must be contiguous CUDA tensor");
+    TORCH_CHECK(conv_state.is_cuda() && conv_state.is_contiguous(), "fast_ssm_conv1d_forward: conv_state must be contiguous CUDA tensor");
+    TORCH_CHECK(conv_weight.is_cuda() && conv_weight.is_contiguous(), "fast_ssm_conv1d_forward: conv_weight must be contiguous CUDA tensor");
+
+    auto y = torch::empty_like(x);
+    launch_fast_ssm_conv1d(
+        x.data_ptr(),
+        conv_state.data_ptr(),
+        conv_weight.data_ptr(),
+        y.data_ptr(),
+        (int)x.numel(),
+        current_stream()
+    );
+    return y;
+}
+
+torch::Tensor fast_rms_norm_forward(
+    torch::Tensor x,
+    torch::Tensor w,
+    double eps
+) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "fast_rms_norm_forward: x must be contiguous CUDA tensor");
+    TORCH_CHECK(w.is_cuda() && w.is_contiguous(), "fast_rms_norm_forward: w must be contiguous CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && w.scalar_type() == torch::kHalf,
+                "fast_rms_norm_forward: x/w must be FP16 (kernel reinterprets bits as half)");
+
+    auto y = torch::empty_like(x);
+    int D = (int)w.numel();
+    TORCH_CHECK(D > 0 && x.numel() % D == 0, "fast_rms_norm_forward: x.numel() (", x.numel(),
+                ") must be a multiple of w.numel() (", D, ")");
+    int rows = (int)(x.numel() / D);
+    launch_fast_rms_norm(
+        x.data_ptr(),
+        w.data_ptr(),
+        y.data_ptr(),
+        rows,
+        D,
+        (float)eps,
+        current_stream()
+    );
+    return y;
+}
+
+torch::Tensor fast_rms_norm_gated_forward(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor gate,
+    int64_t num_heads,
+    int64_t head_dim,
+    double eps
+) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "fast_rms_norm_gated_forward: x must be contiguous CUDA tensor");
+    TORCH_CHECK(w.is_cuda() && w.is_contiguous(), "fast_rms_norm_gated_forward: w must be contiguous CUDA tensor");
+    TORCH_CHECK(gate.is_cuda() && gate.is_contiguous(), "fast_rms_norm_gated_forward: gate must be contiguous CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && w.scalar_type() == torch::kHalf && gate.scalar_type() == torch::kHalf,
+                "fast_rms_norm_gated_forward: x/w/gate must be FP16 (kernel reinterprets bits as half)");
+    const int64_t full = num_heads * head_dim;
+    TORCH_CHECK(x.numel() == full, "fast_rms_norm_gated_forward: x must hold num_heads*head_dim elements, got ",
+                x.numel(), " for heads=", num_heads, " dim=", head_dim);
+    TORCH_CHECK(gate.numel() == full, "fast_rms_norm_gated_forward: gate must hold num_heads*head_dim elements, got ",
+                gate.numel());
+    // w is either per-head [num_heads, head_dim] or shared [head_dim] (broadcast).
+    // Anything else used to silently read out of bounds for heads >= 1.
+    int w_stride = -1;
+    if (w.numel() == full) {
+        w_stride = (int)head_dim;
+    } else if (w.numel() == head_dim) {
+        w_stride = 0;
+    }
+    TORCH_CHECK(w_stride >= 0, "fast_rms_norm_gated_forward: w must be [head_dim] shared or [num_heads, head_dim], got ",
+                w.numel(), " elements for heads=", num_heads, " dim=", head_dim);
+
+    auto y = torch::empty_like(x);
+    launch_fast_rms_norm_gated(
+        x.data_ptr(),
+        w.data_ptr(),
+        gate.data_ptr(),
+        y.data_ptr(),
+        (int)num_heads,
+        (int)head_dim,
+        (float)eps,
+        w_stride,
+        current_stream()
+    );
+    return y;
 }
 
 torch::Tensor fp8_linear_forward_blockwise(
@@ -2325,6 +2555,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Dedicated AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights",
           py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
           py::arg("output_features"), py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("dequant_embedding_forward", &dequant_embedding_forward,
+          "Zero-copy on-the-fly embedding lookup and dequantization directly to FP16",
+          py::arg("weight_packed"), py::arg("token_ids"), py::arg("ggml_type"), py::arg("K"));
+    m.def("delta_net_decode_forward", &delta_net_decode_forward,
+          "Fused single-token Gated DeltaNet recurrence for Qwen 3.5/3.8 (48 heads x 128 dim)",
+          py::arg("q"), py::arg("k"), py::arg("v"),
+          py::arg("decay"), py::arg("beta"), py::arg("S"), py::arg("scale"));
+    m.def("fast_ssm_conv1d_forward", &fast_ssm_conv1d_forward,
+          "Fused depthwise Conv1D shift and SiLU for SSM (10240 channels)",
+          py::arg("x"), py::arg("conv_state"), py::arg("conv_weight"));
+    m.def("fast_rms_norm_forward", &fast_rms_norm_forward,
+          "Fast fused cooperative RMSNorm in FP16",
+          py::arg("x"), py::arg("w"), py::arg("eps") = 1e-6);
+    m.def("fast_rms_norm_gated_forward", &fast_rms_norm_gated_forward,
+          "Fast fused cooperative Gated RMSNorm in FP16 for SSM heads "
+          "(w: per-head [H,D] or shared [D] broadcast)",
+          py::arg("x"), py::arg("w"), py::arg("gate"),
+          py::arg("num_heads"), py::arg("head_dim"), py::arg("eps") = 1e-6);
     m.def("fp8_linear_forward_v2_input_weight", &fp8_linear_forward_v2_input_weight,
           "V2 cooperative LDS-staged FP8 linear forward, pre-quantized E4M3 input+weight",
           py::arg("input_fp8"), py::arg("weight_fp8"), py::arg("output_dtype_source"),
@@ -2650,27 +2898,52 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     }, "WaveAttention prefill inference kernel (adaptive Q_TILE, INT4 QK/FP8 V hybrid).", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false, py::arg("use_int4")=true);
 
     m.def("wave_attn_decode_forward", [](
-        torch::Tensor q_int4, torch::Tensor k_int4, torch::Tensor v_int4,
+        torch::Tensor q_int4, torch::Tensor k_int4, torch::Tensor v_tensor,
         double softmax_scale, double q_scale, double k_scale, double v_scale,
-        bool is_causal
+        bool is_causal,
+        c10::optional<torch::Tensor> k_scales
     ) {
-        TORCH_CHECK(q_int4.is_cuda() && k_int4.is_cuda() && v_int4.is_cuda(), "q/k/v must be CUDA");
-        TORCH_CHECK(q_int4.dtype()==torch::kUInt8 && k_int4.dtype()==torch::kUInt8 && v_int4.dtype()==torch::kUInt8, "q/k/v INT4 must be uint8");
-        TORCH_CHECK(q_int4.dim()==4 && k_int4.dim()==4 && v_int4.dim()==4, "must be 4D");
+        TORCH_CHECK(q_int4.is_cuda() && k_int4.is_cuda() && v_tensor.is_cuda(), "q/k/v must be CUDA");
+        TORCH_CHECK(q_int4.dtype()==torch::kUInt8 && k_int4.dtype()==torch::kUInt8 && v_tensor.dtype()==torch::kUInt8, "q/k/v must be uint8");
+        TORCH_CHECK(q_int4.dim()==4 && k_int4.dim()==4 && v_tensor.dim()==4, "must be 4D");
         int B = q_int4.size(0);
         int H = q_int4.size(1);
         int Seq_Q = q_int4.size(2);
         int Dim = q_int4.size(3) * 2;
         int Seq_K = k_int4.size(2);
-        TORCH_CHECK(Dim == 64 || Dim == 128, "decode INT4 requires Dim 64 or 128");
+        TORCH_CHECK(Dim == 64 || Dim == 128, "decode requires Dim 64 or 128");
         TORCH_CHECK(k_int4.size(0)==B && k_int4.size(1)==H && k_int4.size(2)==Seq_K && k_int4.size(3)*2==Dim, "k shape mismatch");
-        TORCH_CHECK(v_int4.size(0)==B && v_int4.size(1)==H && v_int4.size(2)==Seq_K && v_int4.size(3)*2==Dim, "v shape mismatch");
+        
+        bool v_is_fp8 = (v_tensor.size(3) == Dim);
+        if (!v_is_fp8) {
+            TORCH_CHECK(v_tensor.size(3)*2 == Dim, "v shape mismatch: last dim must be Dim (FP8) or Dim/2 (INT4)");
+        }
+        TORCH_CHECK(v_tensor.size(0)==B && v_tensor.size(1)==H && v_tensor.size(2)==Seq_K, "v shape mismatch");
+        
+        const float* k_scales_ptr = nullptr;
+        torch::Tensor k_scales_contig;
+        if (k_scales.has_value() && k_scales.value().defined()) {
+            k_scales_contig = k_scales.value().contiguous();
+            TORCH_CHECK(k_scales_contig.is_cuda() && k_scales_contig.dtype() == torch::kFloat32, "k_scales must be float32 CUDA");
+            k_scales_ptr = k_scales_contig.data_ptr<float>();
+        }
+
         auto opts=torch::TensorOptions().dtype(torch::kFloat32).device(q_int4.device());
         torch::Tensor out=torch::empty({B,H,Seq_Q,Dim}, opts);
         torch::Tensor lse=torch::empty({B,H,Seq_Q}, opts);
-        launch_wave_attn_decode(q_int4.data_ptr<uint8_t>(),k_int4.data_ptr<uint8_t>(),v_int4.data_ptr<uint8_t>(), out.data_ptr(),lse.data_ptr<float>(), B,H,Seq_Q,Seq_K,Dim,(float)softmax_scale,(float)q_scale,(float)k_scale,(float)v_scale,0,is_causal, current_stream());
-        return py::make_tuple(out,lse);
-    }, "WaveAttention decode inference kernel (Q_TILE=16, Q in regs, single K buffer, all-INT4 0.5B).", py::arg("q_int4"), py::arg("k_int4"), py::arg("v_int4"), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false);
+        launch_wave_attn_decode(
+            q_int4.data_ptr<uint8_t>(), k_int4.data_ptr<uint8_t>(), v_tensor.data_ptr<uint8_t>(),
+            k_scales_ptr,
+            out.data_ptr(), lse.data_ptr<float>(),
+            B, H, Seq_Q, Seq_K, Dim,
+            (float)softmax_scale, (float)q_scale, (float)k_scale, (float)v_scale,
+            0, is_causal, v_is_fp8, current_stream()
+        );
+        return py::make_tuple(out, lse);
+    }, "WaveAttention decode inference kernel (Q_TILE=16, Q in regs, single K buffer, INT4 QK + FP8/INT4 V).",
+       py::arg("q_int4"), py::arg("k_int4"), py::arg("v_int4"),
+       py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0,
+       py::arg("is_causal")=false, py::arg("k_scales")=c10::nullopt);
 
     m.def("wave_attn_long_forward", [](
         torch::Tensor q_fp8, torch::Tensor k_fp8, torch::Tensor k_int4, torch::Tensor k_scales,
