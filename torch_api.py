@@ -424,7 +424,7 @@ def _load_extension() -> object:
         )
     try:
         from hip_quant import device_info
-        device_info._add_dll_directories()
+        device_info._add_runtime_dll_dirs()
     except Exception:
         pass
     try:
@@ -438,8 +438,9 @@ def _load_extension() -> object:
             _C = _ext
         except ImportError as exc:
             raise ImportError(
-                "hip_quant._C extension not found. "
-                "Build it first with:\n"
+                f"hip_quant._C extension failed to load ({exc}). "
+                "Ensure PyTorch with ROCm is installed and matches the extension ABI, "
+                "or rebuild for this environment with:\n"
                 "  python setup_torch.py build_ext --inplace"
             ) from exc
     return _C

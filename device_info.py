@@ -54,6 +54,8 @@ def _add_runtime_dll_dirs():
         seen.add(path)
         _DLL_DIR_HANDLES.append(os.add_dll_directory(path))
 
+_add_dll_directories = _add_runtime_dll_dirs
+
 # Architecture family classifications
 ARCH_FAMILIES = {
     "gfx9":  {"family": "CDNA",  "note": "CDNA 1 (MI100/MI50)"},
