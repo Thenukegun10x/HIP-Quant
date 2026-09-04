@@ -103,7 +103,7 @@ def _configure_windows_toolchain():
     if os.environ.get("VSCMD_VER"):
         os.environ.setdefault("DISTUTILS_USE_SDK", "1")
 
-    os.environ.setdefault("MAX_JOBS", "1")
+    os.environ.setdefault("MAX_JOBS", "4")
 
 
 _configure_windows_toolchain()
@@ -113,6 +113,22 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_pat
 
 # Convert all torch include paths to Windows 8.3 short paths to avoid space-related build failures
 torch_includes = [_short_path(p) for p in include_paths()]
+
+arch_env = os.environ.get("HIP_QUANT_ARCH")
+if arch_env:
+    target_archs = [a.strip() for a in arch_env.split(",") if a.strip()]
+else:
+    target_archs = [
+        "gfx90a",
+        "gfx942",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1200",
+        "gfx1201",
+    ]
+offload_args = [f"--offload-arch={a}" for a in target_archs]
 
 ext = CUDAExtension(
     # The extension will be importable as  hip_quant._C
@@ -149,8 +165,7 @@ ext = CUDAExtension(
             # One-pass FP8 conversion has no in-kernel reuse.  Clang lowers
             # the guarded helpers to AMDGPU non-temporal memory operations.
             "-DHIP_QUANT_ENABLE_NONTEMPORAL=1",
-            "--offload-arch=gfx1200",
-            "--offload-arch=gfx1201",
+        ] + offload_args + [
             # Allow device code to include project headers via relative paths
             "-I.",
         ] + [f"-I{p}" for p in torch_includes],

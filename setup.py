@@ -122,6 +122,22 @@ def _torch_extension_config():
 
     torch_includes = [_short_path(p) for p in include_paths()]
 
+    arch_env = os.environ.get("HIP_QUANT_ARCH")
+    if arch_env:
+        target_archs = [a.strip() for a in arch_env.split(",") if a.strip()]
+    else:
+        target_archs = [
+            "gfx90a",
+            "gfx942",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1103",
+            "gfx1200",
+            "gfx1201",
+        ]
+    offload_args = [f"--offload-arch={a}" for a in target_archs]
+
     ext = CUDAExtension(
         name="hip_quant._C",
         sources=[
@@ -147,14 +163,14 @@ def _torch_extension_config():
             "torch_ext/kv_iu4_kernels.hip",
         ],
 
+
         extra_compile_args={
             "cxx": ["-O3", "-DHIP_QUANT_ENABLE_NONTEMPORAL=1"],
             "nvcc": [
                 "-O3",
                 "-mno-wavefrontsize64",
                 "-DHIP_QUANT_ENABLE_NONTEMPORAL=1",
-                "--offload-arch=gfx1200",
-                "--offload-arch=gfx1201",
+            ] + offload_args + [
                 "-I.",
             ] + [f"-I{p}" for p in torch_includes],
         },
