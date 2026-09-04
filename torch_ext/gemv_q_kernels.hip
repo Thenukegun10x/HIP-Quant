@@ -48,7 +48,8 @@ __device__ inline uint8_t unpack_k4_min(const uint8_t *scales, int group) {
 
 struct dot_q8_0 {
     static constexpr int BLOCK_SIZE = 32;
-    __device__ __forceinline__ float operator()(const block_q8_0& blk, const half* x) const {
+    __device__ __forceinline__ float operator()(const block_q8_0* __restrict__ blk_ptr, const half* x) const {
+        const block_q8_0& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float sum = 0.0f;
         #pragma unroll
@@ -61,7 +62,8 @@ struct dot_q8_0 {
 
 struct dot_q4_0 {
     static constexpr int BLOCK_SIZE = 32;
-    __device__ __forceinline__ float operator()(const block_q4_0& blk, const half* x) const {
+    __device__ __forceinline__ float operator()(const block_q4_0* __restrict__ blk_ptr, const half* x) const {
+        const block_q4_0& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float sum0 = 0.0f;
         float sum1 = 0.0f;
@@ -124,10 +126,9 @@ __global__ void gemv_q_kernel(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int b = lane_id; b < num_blocks; b += 32) {
-        BlockType blk = row[b];
-        sum0 += dot_op(blk, &x0_vec[b * DotOp::BLOCK_SIZE]);
+        sum0 += dot_op(row + b, &x0_vec[b * DotOp::BLOCK_SIZE]);
         if constexpr (M == 2) {
-            sum1 += dot_op(blk, &x1_vec[b * DotOp::BLOCK_SIZE]);
+            sum1 += dot_op(row + b, &x1_vec[b * DotOp::BLOCK_SIZE]);
         }
     }
 
@@ -157,7 +158,8 @@ __global__ void gemv_q_kernel(
 // -------------------------------------------------------------------------
 
 struct dot_q4_K {
-    __device__ __forceinline__ float operator()(const block_q4_K& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_q4_K* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_q4_K& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float dmin = fp16_to_fp32(blk.dmin);
         float sc[8], m[8];
@@ -183,7 +185,8 @@ struct dot_q4_K {
 };
 
 struct dot_q5_K {
-    __device__ __forceinline__ float operator()(const block_q5_K& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_q5_K* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_q5_K& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float dmin = fp16_to_fp32(blk.dmin);
         float sc[8], m[8];
@@ -212,7 +215,8 @@ struct dot_q5_K {
 };
 
 struct dot_q6_K {
-    __device__ __forceinline__ float operator()(const block_q6_K& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_q6_K* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_q6_K& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float sum = 0.0f;
         int lane_hi = (lane_id >= 16) ? 1 : 0;
@@ -245,7 +249,8 @@ struct dot_q6_K {
 struct dot_iq3_s {
     const uint32_t* grid;
     __device__ __forceinline__ dot_iq3_s(const uint32_t* g = d_iq3s_grid) : grid(g) {}
-    __device__ __forceinline__ float operator()(const block_iq3_s& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq3_s* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq3_s& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
@@ -279,7 +284,8 @@ struct dot_iq3_s {
 struct dot_iq3_xxs {
     const uint32_t* grid;
     __device__ __forceinline__ dot_iq3_xxs(const uint32_t* g = d_iq3xxs_grid) : grid(g) {}
-    __device__ __forceinline__ float operator()(const block_iq3_xxs& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq3_xxs* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq3_xxs& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
@@ -312,7 +318,8 @@ struct dot_iq3_xxs {
 };
 
 struct dot_q2_K {
-    __device__ __forceinline__ float operator()(const block_q2_K& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_q2_K* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_q2_K& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float dmin = fp16_to_fp32(blk.dmin);
 
@@ -336,7 +343,8 @@ struct dot_q2_K {
 };
 
 struct dot_iq4_xs {
-    __device__ __forceinline__ float operator()(const block_iq4_xs& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq4_xs* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq4_xs& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         float sum = 0.0f;
 
@@ -359,7 +367,8 @@ struct dot_iq4_xs {
 };
 
 struct dot_iq2_xxs {
-    __device__ __forceinline__ float operator()(const block_iq2_xxs& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq2_xxs* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq2_xxs& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
@@ -384,7 +393,8 @@ struct dot_iq2_xxs {
 };
 
 struct dot_iq2_xs {
-    __device__ __forceinline__ float operator()(const block_iq2_xs& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq2_xs* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq2_xs& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         float d = fp16_to_fp32(blk.d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
@@ -412,23 +422,27 @@ struct dot_iq2_xs {
 };
 
 struct dot_iq2_s {
-    __device__ __forceinline__ float operator()(const block_iq2_s& blk, const half* x_sb, int lane_id) const {
-        float d = fp16_to_fp32(blk.d);
+    // NOTE: block arrives by pointer and fields load on demand. Materializing
+    // the whole 82-byte struct per thread blew the VGPR budget and spilled
+    // (20 static scratch ops); all lanes read the same block, so these loads
+    // broadcast through L2 instead of living in registers.
+    __device__ __forceinline__ float operator()(const block_iq2_s* __restrict__ blk, const half* x_sb, int lane_id) const {
+        float d = fp16_to_fp32(blk->d);
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
 
         float sum = 0.0f;
-        #pragma unroll
+        #pragma unroll 2
         for (int ib = 0; ib < 8; ++ib) {
-            const float db0 = d * (0.5f + (float)(blk.scales[ib] & 0x0f)) * 0.25f;
-            const float db1 = d * (0.5f + (float)(blk.scales[ib] >> 4)) * 0.25f;
+            const float db0 = d * (0.5f + (float)(blk->scales[ib] & 0x0f)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(blk->scales[ib] >> 4)) * 0.25f;
             const float dl = (l < 2) ? db0 : db1;
 
-            const int grid_idx = (int)blk.qs[4 * ib + l] | ((int)(blk.qh[ib] << (8 - 2 * l)) & 0x300);
+            const int grid_idx = (int)blk->qs[4 * ib + l] | ((int)(blk->qh[ib] << (8 - 2 * l)) & 0x300);
             uint64_t grid_u64 = d_iq2s_grid[grid_idx];
             int8_t grid_val = (int8_t)((grid_u64 >> (j * 8)) & 0xff);
 
-            const uint8_t sign_byte = blk.qs[32 + 4 * ib + l];
+            const uint8_t sign_byte = blk->qs[32 + 4 * ib + l];
             float sign = ((sign_byte >> j) & 1) ? -dl : dl;
             float w = sign * (float)grid_val;
 
@@ -439,7 +453,8 @@ struct dot_iq2_s {
 };
 
 struct dot_iq1_m {
-    __device__ __forceinline__ float operator()(const block_iq1_m& blk, const half* x_sb, int lane_id) const {
+    __device__ __forceinline__ float operator()(const block_iq1_m* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq1_m& blk = *blk_ptr; // alias: fields load on demand, no struct copy
         const int l = lane_id >> 3; // 0..3
         const int j = lane_id & 7;  // 0..7
 
@@ -515,10 +530,9 @@ __global__ void gemv_qk_kernel(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int b = 0; b < num_superblocks; ++b) {
-        BlockType blk = row[b];
-        sum0 += dot_op(blk, &x0_vec[b * 256], lane_id);
+        sum0 += dot_op(row + b, &x0_vec[b * 256], lane_id);
         if constexpr (M == 2) {
-            sum1 += dot_op(blk, &x1_vec[b * 256], lane_id);
+            sum1 += dot_op(row + b, &x1_vec[b * 256], lane_id);
         }
     }
 
@@ -598,10 +612,9 @@ __global__ void gemv_iq3s_kernel(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int b = 0; b < num_superblocks; ++b) {
-        block_iq3_s blk = row[b];
-        sum0 += dot_op(blk, &x0_vec[b * 256], lane_id);
+        sum0 += dot_op(row + b, &x0_vec[b * 256], lane_id);
         if constexpr (M == 2) {
-            sum1 += dot_op(blk, &x1_vec[b * 256], lane_id);
+            sum1 += dot_op(row + b, &x1_vec[b * 256], lane_id);
         }
     }
 
@@ -679,10 +692,9 @@ __global__ void gemv_iq3xxs_kernel(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int b = 0; b < num_superblocks; ++b) {
-        block_iq3_xxs blk = row[b];
-        sum0 += dot_op(blk, &x0_vec[b * 256], lane_id);
+        sum0 += dot_op(row + b, &x0_vec[b * 256], lane_id);
         if constexpr (M == 2) {
-            sum1 += dot_op(blk, &x1_vec[b * 256], lane_id);
+            sum1 += dot_op(row + b, &x1_vec[b * 256], lane_id);
         }
     }
 
