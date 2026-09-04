@@ -76,7 +76,23 @@ GGML_TYPE_BLOCK_BYTES = {
 
 IMATRIX_REQUIRED_TYPES = {16, 17, 19}
 
-_DEFAULT_ROCM_BIN = r"C:\Program Files\AMD\ROCm\7.1\bin"
+def _find_default_rocm_bin():
+    import glob
+    for env in ("HIP_QUANT_ROCM_BIN", "ROCM_PATH", "HIP_PATH", "ROCM_HOME", "HIP_QUANT_ROCM_HOME"):
+        val = os.environ.get(env)
+        if val:
+            p = val if val.endswith("bin") else os.path.join(val, "bin")
+            if os.path.isdir(p):
+                return p
+    if os.name == "nt":
+        candidates = sorted(glob.glob(r"C:\Program Files\AMD\ROCm\*\bin"), reverse=True)
+        if candidates:
+            return candidates[0]
+        return r"C:\Program Files\AMD\ROCm\7.1\bin"
+    rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
+    return os.path.join(rocm_home, "bin")
+
+_DEFAULT_ROCM_BIN = _find_default_rocm_bin()
 
 
 def normalize_type(type_id):

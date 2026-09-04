@@ -709,6 +709,41 @@ def dequantize_e5m2_blockwise(
     )
 
 
+def kv_quant_v_i4(
+    x: "torch.Tensor",
+    groups: int = 4,
+) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Quantize V rows ``[H, S, D]`` to asymmetric UINT4 nibbles (IU4 KV cache).
+
+    Returns ``(packed, scales, zp)``: ``packed`` uint8 ``[H, S, D/2]`` (low
+    nibble = even channel), ``scales`` fp16 ``[H, S, G]``, ``zp`` uint8
+    ``[H, S, G]``. Wire format: ``real = (nibble - zp) * scale``.
+    """
+    return _load_extension().kv_quant_v_i4(x.contiguous(), int(groups))
+
+
+def kv_dequant_v_i4(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    zp: "torch.Tensor",
+) -> "torch.Tensor":
+    """Dequantize IU4 KV-cache V rows to fp16 on-device (LDS-LUT path)."""
+    return _load_extension().kv_dequant_v_i4(
+        packed.contiguous(), scales.contiguous(), zp.contiguous()
+    )
+
+
+def swiglu_forward(
+    g: "torch.Tensor",
+    u: "torch.Tensor",
+    out: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Fused SwiGLU activation: out = silu(g) * u (fp16, optional in-place)."""
+    return _load_extension().swiglu_forward(
+        g.contiguous(), u.contiguous(), out if out is not None else None
+    )
+
+
 def quantize_mxfp8_e4m3(
     x: "torch.Tensor",
 ) -> Tuple["torch.Tensor", "torch.Tensor"]:
@@ -2543,6 +2578,16 @@ def gemv_q_forward(
     """Fused AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights."""
     return _load_extension().gemv_q_forward(
         input.contiguous(), weight_packed.contiguous(), int(ggml_type), int(output_features), bias
+    )
+def dequant_embedding_forward(
+    weight_packed: "torch.Tensor",
+    token_ids: "torch.Tensor",
+    ggml_type: int,
+    K: int,
+) -> "torch.Tensor":
+    """Zero-copy on-the-fly embedding lookup and dequantization directly to FP16."""
+    return _load_extension().dequant_embedding_forward(
+        weight_packed.contiguous(), token_ids.contiguous(), int(ggml_type), int(K)
     )
 
 

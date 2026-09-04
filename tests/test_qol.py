@@ -1,4 +1,5 @@
-import sys; sys.path.insert(0, r'C:\Users\armor\Desktop\hip_quant')
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import torch, torch.nn.functional as F
 import torch_api as hq
 

@@ -46,13 +46,12 @@ _PKG_DIR = pathlib.Path(__file__).parent if pathlib.Path(__file__).parent.name !
 _BIN_LOCK = threading.Lock()
 
 _CANDIDATES = [
-    pathlib.Path(__file__).parent / "tools" / "gpu-smi.exe",
-    pathlib.Path(__file__).parent / "tools" / "gpu-smi",
-    pathlib.Path(__file__).parent / "gpu-smi.exe",
-    pathlib.Path(__file__).parent / "gpu-smi",
-    pathlib.Path(__file__).parent / "gpu-smi-src" / "target" / "release" / "gpu-smi.exe",
-    pathlib.Path(__file__).parent / "gpu-smi-src" / "target" / "release" / "gpu-smi",
-    pathlib.Path("C:/Users/armor/Desktop/hip_quant/tools/gpu-smi.exe"),
+    pathlib.Path(__file__).resolve().parent / "tools" / "gpu-smi.exe",
+    pathlib.Path(__file__).resolve().parent / "tools" / "gpu-smi",
+    pathlib.Path(__file__).resolve().parent / "gpu-smi.exe",
+    pathlib.Path(__file__).resolve().parent / "gpu-smi",
+    pathlib.Path(__file__).resolve().parent / "gpu-smi-src" / "target" / "release" / "gpu-smi.exe",
+    pathlib.Path(__file__).resolve().parent / "gpu-smi-src" / "target" / "release" / "gpu-smi",
 ]
 
 

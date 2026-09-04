@@ -44,7 +44,30 @@ def _configure_windows_toolchain():
     if os.name != "nt":
         return
 
-    rocm_home = Path(os.environ.get("HIP_QUANT_ROCM_HOME", r"C:\Program Files\AMD\ROCm\7.1"))
+    rocm_home = None
+    for env_var in ("HIP_QUANT_ROCM_HOME", "ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        val = os.environ.get(env_var)
+        if val and Path(val).exists():
+            rocm_home = Path(val)
+            break
+    if rocm_home is None:
+        try:
+            import torch
+            if getattr(torch.version, "hip", None):
+                major_minor = ".".join(str(torch.version.hip).split(".")[:2])
+                matched = Path(f"C:/Program Files/AMD/ROCm/{major_minor}")
+                if matched.is_dir() and (matched / "bin" / "hipcc.exe").exists():
+                    rocm_home = matched
+        except Exception:
+            pass
+    if rocm_home is None:
+        candidates = sorted(glob.glob(r"C:\Program Files\AMD\ROCm\*"), reverse=True)
+        for c in candidates:
+            if Path(c).is_dir() and (Path(c) / "bin" / "hipcc.exe").exists():
+                rocm_home = Path(c)
+                break
+    if rocm_home is None:
+        rocm_home = Path(r"C:\Program Files\AMD\ROCm\7.1")
     if rocm_home.exists():
         rocm_home_short = _short_path(rocm_home)
         hip_clang_path = rocm_home / "lib" / "llvm" / "bin"
@@ -113,6 +136,8 @@ ext = CUDAExtension(
         "torch_ext/wave_attn_decode.hip",
         "torch_ext/wave_attn_long.hip",
         "torch_ext/gemv_q_kernels.hip",
+        "torch_ext/ssm_kernels.hip",
+        "torch_ext/kv_iu4_kernels.hip",
     ],
     extra_compile_args={
         # Host (clang++ / g++) flags

@@ -61,12 +61,13 @@ template <int K_TILE>
 __global__ __launch_bounds__(32, 4) void wave_attn_decode_int4(
     const uint8_t* __restrict__ Q_int4,
     const uint8_t* __restrict__ K_int4,
-    const uint8_t* __restrict__ V_int4,
+    const uint8_t* __restrict__ V,
+    const float* __restrict__ k_scales,
     void* __restrict__ Out,
     float* __restrict__ LSE,
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
-    int out_dtype, bool is_causal
+    int out_dtype, bool is_causal, bool v_is_fp8
 ) {
     static_assert(K_TILE == 64 || K_TILE == 128, "K_TILE 64/128 only");
     constexpr int NUM_K_SUBS = K_TILE / 16;
@@ -98,7 +99,7 @@ __global__ __launch_bounds__(32, 4) void wave_attn_decode_int4(
     int64_t v_off = ((int64_t)b * H + h) * Seq_K * Dim;
     int64_t o_off = ((int64_t)b * H + h) * Seq_Q * Dim;
     float cscale = softmax_scale * q_scale * k_scale;
-    float pscale = 16.0f;
+    float pscale = 64.0f;
     int num_d = (Dim + 15) / 16;
     int num_d_i4 = (Dim + 31) / 32;
     // Load Q once -> regs (decode unique: no per-dt reload)
@@ -158,7 +159,13 @@ __global__ __launch_bounds__(32, 4) void wave_attn_decode_int4(
         v8f sacc[NUM_K_SUBS];
         for(int k=0;k<NUM_K_SUBS;k++) {
             #pragma unroll
-            for(int i=0;i<8;i++) sacc[k][i] = float(sacc_i[k][i]) * cscale;
+            for(int i=0;i<8;i++) {
+                int kc = ks + k*16 + lg*8 + i;
+                float cur_k_scale = (k_scales != nullptr && kc < Seq_K)
+                    ? k_scales[((int64_t)b * H + h) * Seq_K + kc]
+                    : k_scale;
+                sacc[k][i] = float(sacc_i[k][i]) * (softmax_scale * q_scale * cur_k_scale);
+            }
         }
         // Causal + Seq_K mask - wave_id 0 only, q_r is lane uniform per sub-tile
         float tile_max = WAVE_ATTN_NEG_INF;
@@ -200,7 +207,11 @@ __global__ __launch_bounds__(32, 4) void wave_attn_decode_int4(
             }
         }
 
-        load_v_int4_transposed_dequant<K_TILE,LDV>(V_int4 + (v_off>>1), smem_V, ks, K_TILE, Dim, Seq_K, tid, THREADS);
+        if (v_is_fp8) {
+            load_v_tile_transposed_wave_fast_vec<K_TILE,LDV>(V + v_off, smem_V, ks, K_TILE, Dim, Seq_K, tid, THREADS, THREADS);
+        } else {
+            load_v_int4_transposed_dequant<K_TILE,LDV>(V + (v_off>>1), smem_V, ks, K_TILE, Dim, Seq_K, tid, THREADS);
+        }
         cta.sync();
         for(int dt=0;dt<num_d;dt++){
             int doff=dt*16;int vc=doff+lw;
@@ -246,15 +257,23 @@ __global__ __launch_bounds__(32, 4) void wave_attn_decode_int4(
 }
 
 extern "C" void launch_wave_attn_decode(
-    const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V_int4,
+    const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V,
+    const float* k_scales,
     void* Out, float* LSE,
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
-    int out_dtype, bool is_causal, hipStream_t stream
+    int out_dtype, bool is_causal, bool v_is_fp8, hipStream_t stream
 ) {
     int gfx_ver = 1201;
-    { hipDeviceProp_t prop; if (hipGetDeviceProperties(&prop, 0)==hipSuccess) { if (strstr(prop.gcnArchName,"gfx1200")!=nullptr) gfx_ver=1200; } }
-    // All-INT4 V to hit 3.5x (0.5B KV) 1B total vs hybrid 1.5B.
+    {
+        int cur_dev = 0;
+        if (hipGetDevice(&cur_dev) == hipSuccess) {
+            hipDeviceProp_t prop;
+            if (hipGetDeviceProperties(&prop, cur_dev) == hipSuccess) {
+                if (strstr(prop.gcnArchName, "gfx1200") != nullptr) gfx_ver = 1200;
+            }
+        }
+    }
     bool use128 = (Seq_K >= 1024) || (Dim <= 64 && Seq_K >= (gfx_ver==1200 ? 96 : 128));
     bool large_k = use128;
     int K_TILE = large_k ? 128 : 64;
@@ -264,6 +283,6 @@ extern "C" void launch_wave_attn_decode(
     size_t ld4 = (size_t)(Dim >> 1) + WAVE_ATTN_LDS_PAD;
     size_t ldv = (size_t)K_TILE + WAVE_ATTN_LDS_PAD;
     size_t smem_bytes = 16 * ld4 + (size_t)K_TILE * ld4 + (size_t)Dim * ldv; // single K buffer for 128
-    if (K_TILE == 128) hipLaunchKernelGGL((wave_attn_decode_int4<128>), grid, block, smem_bytes, stream, Q_int4, K_int4, V_int4, Out, LSE, B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale, out_dtype, is_causal);
-    else hipLaunchKernelGGL((wave_attn_decode_int4<64>), grid, block, smem_bytes, stream, Q_int4, K_int4, V_int4, Out, LSE, B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale, out_dtype, is_causal);
+    if (K_TILE == 128) hipLaunchKernelGGL((wave_attn_decode_int4<128>), grid, block, smem_bytes, stream, Q_int4, K_int4, V, k_scales, Out, LSE, B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale, out_dtype, is_causal, v_is_fp8);
+    else hipLaunchKernelGGL((wave_attn_decode_int4<64>), grid, block, smem_bytes, stream, Q_int4, K_int4, V, k_scales, Out, LSE, B, H, Seq_Q, Seq_K, Dim, softmax_scale, q_scale, k_scale, v_scale, out_dtype, is_causal, v_is_fp8);
 }

@@ -557,6 +557,207 @@ __global__ void gemv_qk_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batched GEMM over quantized weights (P-prefill-1). Decode kernels above
+// are sacred (M=1/2, LDS-staged x); these are NEW kernels for S>1 prefill.
+//
+// Design: one block handles ROWS_PER_BLOCK N-rows x one MTILE slab of M.
+// Weight blocks stream global->LDS ONCE per K-chunk and fan out to all
+// MTILE dots (the entire win: row-loop GEMV re-streams weights per token).
+// x rows stay in global (L2-cached across N-blocks; x is small vs weights).
+// Per-thread float sum[MTILE]; lane 0 writes y[m*N+n] (strided, tiny).
+//
+// LDS layout: extern bytes, weight area 16-aligned, per-row stride padded
+// to 16B (Q6_K's 210B blocks would otherwise misalign rows>0).
+// ---------------------------------------------------------------------------
+
+template <typename BlockType, typename DotOp, int ROWS_PER_BLOCK = 4, int MTILE = 16>
+__global__ void gemm_qk_kernel(
+    const half* __restrict__ x,       // [M, K_full] row-major
+    const BlockType* __restrict__ weights, // [N, row_stride_sb]
+    half* __restrict__ y,            // [M, N]
+    const half* __restrict__ bias,
+    int N, int K, int Mrows,
+    int K_full, int row_stride_sb,
+    int blk_bytes,
+    bool has_bias
+) {
+    extern __shared__ uint8_t ws_base[];
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int block_threads = 32 * ROWS_PER_BLOCK;
+    const int wave_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int n = blockIdx.x * ROWS_PER_BLOCK + wave_id;
+    const int m_base = blockIdx.y * MTILE;
+    const bool n_valid = (n < N);
+
+    // K-chunk sized so ROWS rows of blocks fit ~48KB LDS.
+    const int num_sb = K / 256;
+    int chunk_sb = (49152 / ROWS_PER_BLOCK) / blk_bytes;
+    if (chunk_sb < 1) chunk_sb = 1;
+    if (chunk_sb > num_sb) chunk_sb = num_sb;
+    const size_t row_stride_B = ((size_t)chunk_sb * (size_t)blk_bytes + 15) & ~(size_t)15;
+
+    DotOp dot_op;
+    float sum[MTILE];
+    #pragma unroll
+    for (int j = 0; j < MTILE; ++j) sum[j] = 0.0f;
+
+    for (int sb0 = 0; sb0 < num_sb; sb0 += chunk_sb) {
+        int cur_sb = num_sb - sb0;
+        if (cur_sb > chunk_sb) cur_sb = chunk_sb;
+        // Cooperative global->LDS stage of ROWS rows x cur_sb blocks,
+        // row by row (division-free): packed block widths (98..210B) are
+        // rarely 16-aligned, so vectorized staging would fault; staging
+        // traffic is negligible next to the dot FLOPs -- keep it simple.
+        for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            int n_r = blockIdx.x * ROWS_PER_BLOCK + r;
+            size_t valid = (n_r < N) ? (size_t)cur_sb * (size_t)blk_bytes : 0;
+            size_t base = (size_t)r * row_stride_B;
+            const uint8_t* src_r = (const uint8_t*)weights
+                + ((size_t)n_r * row_stride_sb + sb0) * blk_bytes;
+            for (size_t i = tid; i < valid; i += (size_t)block_threads) {
+                ws_base[base + i] = src_r[i];
+            }
+        }
+        __syncthreads();
+
+        if (n_valid) {
+            const BlockType* wrow = (const BlockType*)(ws_base + (size_t)wave_id * row_stride_B);
+            const int x_col0 = sb0 * 256;
+            #pragma unroll
+            for (int j = 0; j < MTILE; ++j) {
+                int m = m_base + j;
+                if (m >= Mrows) continue;
+                const half* xm = x + (size_t)m * K_full + x_col0;
+                float acc = 0.0f;
+                for (int b = 0; b < cur_sb; ++b) {
+                    acc += dot_op(wrow + b, &xm[b * 256], lane_id);
+                }
+                sum[j] += acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!n_valid) return;
+    #pragma unroll
+    for (int j = 0; j < MTILE; ++j) {
+        float s = sum[j];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            s += __shfl_down(s, offset, 32);
+        }
+        int m = m_base + j;
+        if (lane_id == 0 && m < Mrows) {
+            if (has_bias) s += __half2float(bias[n]);
+            y[(size_t)m * N + n] = __float2half(s);
+        }
+    }
+}
+
+// Same batched-GEMM design for the grid-table I-quants (IQ3_S / IQ3_XXS).
+// Dynamic shared starts AFTER static: ws_dyn[0] already sits past s_grid,
+// so NO extra offset (an earlier +GRID_BYTES revision double-counted and
+// overflowed LDS by 2KB -> cross-block corruption, nondeterministic garbage;
+// decode's s_grid+x_shared pattern proves the rule).
+template <typename BlockType, typename DotOp, int ROWS_PER_BLOCK = 4, int MTILE = 16>
+__global__ void gemm_iq3_kernel(
+    const half* __restrict__ x,
+    const BlockType* __restrict__ weights,
+    half* __restrict__ y,
+    const half* __restrict__ bias,
+    int N, int K, int Mrows,
+    int K_full, int row_stride_sb,
+    int blk_bytes,
+    bool has_bias
+) {
+    __shared__ uint32_t s_grid[512];  // max(512 iq3s, 256 iq3xxs) words
+    extern __shared__ uint8_t ws_dyn[];
+    uint8_t* ws_base = ws_dyn;  // dynamic base is already past static s_grid
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int block_threads = 32 * ROWS_PER_BLOCK;
+    const int wave_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int n = blockIdx.x * ROWS_PER_BLOCK + wave_id;
+    const int m_base = blockIdx.y * MTILE;
+    const bool n_valid = (n < N);
+
+    if constexpr (std::is_same_v<BlockType, block_iq3_s>) {
+        if (tid < 128) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s_grid[tid * 4 + i] = d_iq3s_grid[tid * 4 + i];
+            }
+        }
+    } else {
+        if (tid < 128) {
+            s_grid[tid * 2 + 0] = d_iq3xxs_grid[tid * 2 + 0];
+            s_grid[tid * 2 + 1] = d_iq3xxs_grid[tid * 2 + 1];
+        }
+    }
+    __syncthreads();
+
+    const int num_sb = K / 256;
+    int chunk_sb = (49152 / ROWS_PER_BLOCK) / blk_bytes;
+    if (chunk_sb < 1) chunk_sb = 1;
+    if (chunk_sb > num_sb) chunk_sb = num_sb;
+    const size_t row_stride_B = ((size_t)chunk_sb * (size_t)blk_bytes + 15) & ~(size_t)15;
+
+    DotOp dot_op(s_grid);
+    float sum[MTILE];
+    #pragma unroll
+    for (int j = 0; j < MTILE; ++j) sum[j] = 0.0f;
+
+    for (int sb0 = 0; sb0 < num_sb; sb0 += chunk_sb) {
+        int cur_sb = num_sb - sb0;
+        if (cur_sb > chunk_sb) cur_sb = chunk_sb;
+        for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            int n_r = blockIdx.x * ROWS_PER_BLOCK + r;
+            size_t valid = (n_r < N) ? (size_t)cur_sb * (size_t)blk_bytes : 0;
+            size_t base = (size_t)r * row_stride_B;
+            const uint8_t* src_r = (const uint8_t*)weights
+                + ((size_t)n_r * row_stride_sb + sb0) * blk_bytes;
+            for (size_t i = tid; i < valid; i += (size_t)block_threads) {
+                ws_base[base + i] = src_r[i];
+            }
+        }
+        __syncthreads();
+
+        if (n_valid) {
+            const BlockType* wrow = (const BlockType*)(ws_base + (size_t)wave_id * row_stride_B);
+            const int x_col0 = sb0 * 256;
+            #pragma unroll
+            for (int j = 0; j < MTILE; ++j) {
+                int m = m_base + j;
+                if (m >= Mrows) continue;
+                const half* xm = x + (size_t)m * K_full + x_col0;
+                float acc = 0.0f;
+                for (int b = 0; b < cur_sb; ++b) {
+                    acc += dot_op(wrow + b, &xm[b * 256], lane_id);
+                }
+                sum[j] += acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!n_valid) return;
+    #pragma unroll
+    for (int j = 0; j < MTILE; ++j) {
+        float s = sum[j];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            s += __shfl_down(s, offset, 32);
+        }
+        int m = m_base + j;
+        if (lane_id == 0 && m < Mrows) {
+            if (has_bias) s += __half2float(bias[n]);
+            y[(size_t)m * N + n] = __float2half(s);
+        }
+    }
+}
+
 template <int ROWS_PER_BLOCK = 4, int M = 1>
 __global__ void gemv_iq3s_kernel(
     const half* __restrict__ x,
@@ -835,6 +1036,141 @@ static void dispatch_gemv_q(
     }
 }
 
+// Batched-GEMM dispatch (P-prefill-1, qk flavor). MTILE=16 slabs over M;
+// shared_bytes must match the kernel's chunk formula exactly.
+// (gemv_q_sb_elems / gemv_q_block_bytes are defined below with decode.)
+static int gemv_q_sb_elems(int ggml_type);
+static int gemv_q_block_bytes(int ggml_type);
+template <int MTILE>
+static void dispatch_gemm_qk(
+    const void* input,
+    const void* packed_weight,
+    void* output,
+    const void* bias,
+    int ggml_type,
+    int N, int K, int Mrows,
+    int K_full, int row_stride_sb,
+    int blk_bytes,
+    bool has_bias,
+    hipStream_t stream
+) {
+    constexpr int ROWS_PER_BLOCK = 4;
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK,
+              (Mrows + MTILE - 1) / MTILE);
+    int num_sb = K / 256;
+    int chunk_sb = (49152 / ROWS_PER_BLOCK) / blk_bytes;
+    if (chunk_sb < 1) chunk_sb = 1;
+    if (chunk_sb > num_sb) chunk_sb = num_sb;
+    size_t row_stride_B = ((size_t)chunk_sb * (size_t)blk_bytes + 15) & ~(size_t)15;
+    size_t shared_bytes = (size_t)ROWS_PER_BLOCK * row_stride_B;
+
+    if (ggml_type == GGML_TYPE_Q4_K) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_q4_K, dot_q4_K, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_q4_K*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_Q5_K) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_q5_K, dot_q5_K, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_q5_K*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_Q6_K) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_q6_K, dot_q6_K, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_q6_K*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_Q2_K) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_q2_K, dot_q2_K, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_q2_K*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ4_XS) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq4_xs, dot_iq4_xs, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq4_xs*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ2_XXS) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq2_xxs, dot_iq2_xxs, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq2_xxs*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ2_XS) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq2_xs, dot_iq2_xs, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq2_xs*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ2_S) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq2_s, dot_iq2_s, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ1_M) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq1_m, dot_iq1_m, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq1_m*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    }
+}
+
+extern "C" {
+
+void launch_gemm_q_forward(
+    const void* input,
+    const void* packed_weight,
+    void* output,
+    const void* bias,
+    int ggml_type,
+    int Mrows,
+    int N,
+    int K,
+    bool has_bias,
+    hipStream_t stream
+) {
+    int sb = gemv_q_sb_elems(ggml_type);
+    int blk = gemv_q_block_bytes(ggml_type);
+    if (sb <= 0 || blk <= 0 || Mrows <= 0 || N <= 0 || K <= 0) return;
+    int row_stride_sb = K / sb;
+    if (ggml_type == GGML_TYPE_IQ3_S || ggml_type == GGML_TYPE_IQ3_XXS) {
+        constexpr int ROWS = 4, MT = 16;
+        dim3 block(32, ROWS);
+        dim3 grid((N + ROWS - 1) / ROWS, (Mrows + MT - 1) / MT);
+        int num_sb = K / 256;
+        int chunk_sb = (49152 / ROWS) / blk;
+        if (chunk_sb < 1) chunk_sb = 1;
+        if (chunk_sb > num_sb) chunk_sb = num_sb;
+        size_t row_stride_B = ((size_t)chunk_sb * (size_t)blk + 15) & ~(size_t)15;
+        size_t shared_bytes = (size_t)ROWS * row_stride_B;
+        if (ggml_type == GGML_TYPE_IQ3_S) {
+            hipLaunchKernelGGL(
+                (gemm_iq3_kernel<block_iq3_s, dot_iq3_s, ROWS, MT>),
+                grid, block, shared_bytes, stream,
+                (const half*)input, (const block_iq3_s*)packed_weight, (half*)output,
+                (const half*)bias, N, K, Mrows, K, row_stride_sb, blk, has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (gemm_iq3_kernel<block_iq3_xxs, dot_iq3_xxs, ROWS, MT>),
+                grid, block, shared_bytes, stream,
+                (const half*)input, (const block_iq3_xxs*)packed_weight, (half*)output,
+                (const half*)bias, N, K, Mrows, K, row_stride_sb, blk, has_bias);
+        }
+        return;
+    }
+    dispatch_gemm_qk<16>(input, packed_weight, output, bias, ggml_type,
+                         N, K, Mrows, K, row_stride_sb, blk, has_bias, stream);
+}
+
+} // extern "C"
+
 // Superblock (row-chunk) width per type: 32-elem blocks for Q8_0/Q4_0,
 // 256-elem superblocks for all K-quants and I-quants.
 static int gemv_q_sb_elems(int ggml_type) {
@@ -1101,6 +1437,61 @@ void launch_dequant_embedding_forward(
             (const block_q8_0*)packed_weight, token_ids, (half*)output, K, blocks_per_row
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused SwiGLU activation: out = silu(g) * u (fp16, vectorized 8x half)
+// Supports out == g or out == u for zero-allocation in-place execution.
+// ---------------------------------------------------------------------------
+__global__ void swiglu_kernel(
+    const half* __restrict__ g,
+    const half* __restrict__ u,
+    half* __restrict__ out,
+    int64_t total_elements
+) {
+    int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t idx = t * 8;
+    if (idx >= total_elements) return;
+
+    if (idx + 8 <= total_elements) {
+        float4 g_raw = *reinterpret_cast<const float4*>(g + idx);
+        float4 u_raw = *reinterpret_cast<const float4*>(u + idx);
+        const half* gh = reinterpret_cast<const half*>(&g_raw);
+        const half* uh = reinterpret_cast<const half*>(&u_raw);
+        float4 out_raw;
+        half* outh = reinterpret_cast<half*>(&out_raw);
+
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float gf = __half2float(gh[k]);
+            float uf = __half2float(uh[k]);
+            float s = gf / (1.0f + expf(-gf));
+            outh[k] = __float2half(s * uf);
+        }
+        *reinterpret_cast<float4*>(out + idx) = out_raw;
+    } else {
+        for (int64_t i = idx; i < total_elements; ++i) {
+            float gf = __half2float(g[i]);
+            float uf = __half2float(u[i]);
+            float s = gf / (1.0f + expf(-gf));
+            out[i] = __float2half(s * uf);
+        }
+    }
+}
+
+void launch_swiglu_forward(
+    const void* g,
+    const void* u,
+    void* out,
+    int64_t total_elements,
+    hipStream_t stream
+) {
+    if (total_elements <= 0) return;
+    int threads = 256;
+    int64_t n_threads = (total_elements + 7) / 8;
+    int blocks = (int)((n_threads + threads - 1) / threads);
+    hipLaunchKernelGGL(swiglu_kernel, dim3(blocks), dim3(threads), 0, stream,
+                       (const half*)g, (const half*)u, (half*)out, total_elements);
 }
 
 } // extern "C"

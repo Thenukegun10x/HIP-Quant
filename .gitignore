@@ -57,6 +57,7 @@ __pycache__/
 *.obj
 *.bc
 *.hsaco
+*.hipfb
 *.o
 *.a
 

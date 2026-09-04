@@ -81,7 +81,8 @@ def _load_tensor(gf: gguf.GGUFFile, t: gguf.GGUFTensor,
             warnings.simplefilter("ignore")
             cpu = torch.frombuffer(raw, dtype=_PLAIN_DTYPES[t.type_name])
         return cpu.reshape(t.shape).to(device)
-    if native_q and t.ggml_type in (2, 8) and len(t.shape) == 2 and "blk." in t.name:  # GGML_TYPE_Q4_0, GGML_TYPE_Q8_0
+    NATIVE_GGML_TYPES = {2, 8, 10, 12, 13, 14, 16, 17, 18, 21, 22, 23, 29}
+    if native_q and t.ggml_type in NATIVE_GGML_TYPES:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             staged = torch.frombuffer(raw, dtype=torch.uint8).to(device)

@@ -110,6 +110,13 @@ void launch_dequant_e5m2_blockwise(const uint8_t* src, const float* scales, floa
 void launch_adafactor_row_col_mean_square(const void* grad, float* row_out, float* col_out,
                                           int64_t rows, int64_t cols, int dtype,
                                           float eps, hipStream_t stream);
+void launch_kv_quant_v_i4(const void* src, uint8_t* packed, uint16_t* scales,
+                          uint8_t* zp, int64_t H, int64_t S, int64_t D,
+                          int groups, int dtype, hipStream_t stream);
+void launch_kv_dequant_v_i4(const uint8_t* packed, const uint16_t* scales,
+                            const uint8_t* zp, uint16_t* dst,
+                            int64_t H, int64_t S, int64_t D, int groups,
+                            hipStream_t stream);
 
 void launch_fp8_linear_forward(
     const void* A, const void* B, void* C, const void* bias,
@@ -172,6 +179,14 @@ void launch_gemv_q_forward(
     const void* bias, int ggml_type, int M, int N, int K,
     bool has_bias, hipStream_t stream);
 int gemv_q_split_chunks(int M, int K);
+void launch_gemm_q_forward(
+    const void* input, const void* packed_weight, void* output,
+    const void* bias, int ggml_type, int Mrows, int N, int K,
+    bool has_bias, hipStream_t stream);
+void launch_swiglu_forward(
+    const void* g, const void* u, void* out,
+    int64_t total_elements, hipStream_t stream);
+// 
 void launch_gemv_q_split_forward(
     const void* input, const void* packed_weight, void* partials_scratch,
     void* output, const void* bias, int ggml_type, int M, int N, int K, int C,
@@ -1196,6 +1211,77 @@ torch::Tensor dequantize_e5m2_blockwise(
 }
 
 // ---------------------------------------------------------------------------
+// IU4 KV cache (P1: V side) — asymmetric UINT4 nibbles, per-(head,token,group)
+// ---------------------------------------------------------------------------
+static inline void check_kv_i4_shape(const char* name, int64_t H, int64_t S,
+                                     int64_t D, int64_t groups) {
+    TORCH_CHECK(H > 0 && S > 0, name, ": H and S must be positive");
+    TORCH_CHECK(D > 0 && D <= 512 && (D & 1) == 0,
+                name, ": head_dim D must be even and <= 512");
+    TORCH_CHECK(groups == 1 || groups == 2 || groups == 4 || groups == 8,
+                name, ": groups must be 1, 2, 4, or 8");
+    TORCH_CHECK(D % groups == 0, name, ": head_dim must be divisible by groups");
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> kv_quant_v_i4(
+    torch::Tensor input,
+    int64_t groups
+) {
+    TORCH_CHECK(input.is_cuda(),       "kv_quant_v_i4: input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "kv_quant_v_i4: input must be contiguous");
+    TORCH_CHECK(input.dim() == 3,      "kv_quant_v_i4: input must be [H, S, D]");
+    int input_dtype = float_dtype_code(input, "kv_quant_v_i4: input");
+    int64_t H = input.size(0), S = input.size(1), D = input.size(2);
+    check_kv_i4_shape("kv_quant_v_i4", H, S, D, groups);
+
+    auto packed = torch::empty({H, S, D / 2}, input.options().dtype(torch::kUInt8));
+    auto scales = torch::empty({H, S, groups}, input.options().dtype(torch::kFloat16));
+    auto zp     = torch::empty({H, S, groups}, input.options().dtype(torch::kUInt8));
+    launch_kv_quant_v_i4(
+        input.data_ptr(), packed.data_ptr<uint8_t>(),
+        reinterpret_cast<uint16_t*>(scales.data_ptr<at::Half>()),
+        zp.data_ptr<uint8_t>(), H, S, D, (int)groups, input_dtype,
+        current_stream());
+    return std::make_tuple(packed, scales, zp);
+}
+
+torch::Tensor kv_dequant_v_i4(
+    torch::Tensor packed,
+    torch::Tensor scales,
+    torch::Tensor zp
+) {
+    TORCH_CHECK(packed.is_cuda() && packed.is_contiguous(),
+                "kv_dequant_v_i4: packed must be a contiguous HIP/CUDA tensor");
+    TORCH_CHECK(packed.scalar_type() == torch::kUInt8,
+                "kv_dequant_v_i4: packed must be uint8");
+    TORCH_CHECK(packed.dim() == 3, "kv_dequant_v_i4: packed must be [H, S, D/2]");
+    TORCH_CHECK(scales.is_cuda() && scales.is_contiguous() &&
+                scales.scalar_type() == torch::kFloat16,
+                "kv_dequant_v_i4: scales must be contiguous CUDA float16");
+    TORCH_CHECK(zp.is_cuda() && zp.is_contiguous() &&
+                zp.scalar_type() == torch::kUInt8,
+                "kv_dequant_v_i4: zp must be contiguous CUDA uint8");
+    TORCH_CHECK(packed.device() == scales.device() && packed.device() == zp.device(),
+                "kv_dequant_v_i4: packed, scales, and zp must be on the same device");
+    int64_t H = packed.size(0), S = packed.size(1), D = packed.size(2) * 2;
+    int64_t groups = scales.size(2);
+    TORCH_CHECK(scales.size(0) == H && scales.size(1) == S && scales.dim() == 3,
+                "kv_dequant_v_i4: scales must be [H, S, G]");
+    TORCH_CHECK(zp.sizes() == scales.sizes(),
+                "kv_dequant_v_i4: zp must match scales shape [H, S, G]");
+    check_kv_i4_shape("kv_dequant_v_i4", H, S, D, groups);
+
+    auto output = torch::empty({H, S, D}, packed.options().dtype(torch::kFloat16));
+    launch_kv_dequant_v_i4(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(scales.data_ptr<at::Half>()),
+        zp.data_ptr<uint8_t>(),
+        reinterpret_cast<uint16_t*>(output.data_ptr<at::Half>()),
+        H, S, D, (int)groups, current_stream());
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // MXFP8 OCP — true UE8M0, block=32, 8.25 bpw, not a FP32-scale emulation
 // ---------------------------------------------------------------------------
 std::tuple<torch::Tensor, torch::Tensor> quantize_mxfp8_e4m3(torch::Tensor input) {
@@ -1668,6 +1754,9 @@ torch::Tensor gemv_q_forward(
     // better than chunking would (measured 1.36x vs 2.1x of M=1) — never split
     // M==2. The M*K <= 8192 single path is untouched.
     // HIP_QUANT_GEMV_NOSPLIT=1 forces the legacy single launch for A/B.
+    // NOTE (measured Sep 2026): a persistent scratch cache instead of the
+    // per-call torch::empty showed no measurable win (79.87 -> 79.40ms is
+    // run noise), so the plain per-call alloc stays. Revisit only with data.
     static const bool gemv_nosplit = (std::getenv("HIP_QUANT_GEMV_NOSPLIT") != nullptr);
     int nchunks = (!gemv_nosplit && M == 1 && K > 8192) ? gemv_q_split_chunks(1, (int)K) : 1;
     if (nchunks > 1) {
@@ -1701,6 +1790,115 @@ torch::Tensor gemv_q_forward(
         current_stream()
     );
     return output;
+}
+
+// ---------------------------------------------------------------------------
+// P-prefill-1: batched GEMM over K-quant weights (S>1 prefill). v1 covers
+// the qk flavor (Q2/Q4/Q5/Q6_K, IQ2_XXS/XS/S, IQ4_XS, IQ1_M); other flavors
+// stay on the row-loop GEMV until their GEMM kernels land (dispatch_linear
+// routes by type, never silently).
+// ---------------------------------------------------------------------------
+torch::Tensor gemm_q_forward(
+    torch::Tensor input,
+    torch::Tensor weight_packed,
+    int64_t ggml_type,
+    int64_t output_features,
+    c10::optional<torch::Tensor> bias
+) {
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
+                "gemm_q_forward: input must be a contiguous CUDA tensor");
+    TORCH_CHECK(weight_packed.is_cuda() && weight_packed.is_contiguous(),
+                "gemm_q_forward: weight_packed must be a contiguous CUDA tensor");
+    TORCH_CHECK(input.dim() == 2, "gemm_q_forward: input must be 2-D [M, K]");
+    int64_t M = input.size(0);
+    int64_t K = input.size(1);
+    int64_t N = output_features;
+    TORCH_CHECK(M > 0 && N > 0, "gemm_q_forward: M and N must be positive");
+    TORCH_CHECK(K % 256 == 0, "gemm_q_forward: K must be a multiple of 256");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16,
+                "gemm_q_forward: input must be float16");
+    TORCH_CHECK(weight_packed.scalar_type() == torch::kUInt8,
+                "gemm_q_forward: weight_packed must be uint8");
+    int bytes_per_block = 0;
+    if (ggml_type == 10) { // GGML_TYPE_Q2_K
+        bytes_per_block = 84;
+    } else if (ggml_type == 12) { // GGML_TYPE_Q4_K
+        bytes_per_block = 144;
+    } else if (ggml_type == 13) { // GGML_TYPE_Q5_K
+        bytes_per_block = 176;
+    } else if (ggml_type == 14) { // GGML_TYPE_Q6_K
+        bytes_per_block = 210;
+    } else if (ggml_type == 16) { // GGML_TYPE_IQ2_XXS
+        bytes_per_block = 66;
+    } else if (ggml_type == 17) { // GGML_TYPE_IQ2_XS
+        bytes_per_block = 74;
+    } else if (ggml_type == 18) { // GGML_TYPE_IQ3_XXS
+        bytes_per_block = 98;
+    } else if (ggml_type == 21) { // GGML_TYPE_IQ3_S
+        bytes_per_block = 110;
+    } else if (ggml_type == 22) { // GGML_TYPE_IQ2_S
+        bytes_per_block = 82;
+    } else if (ggml_type == 23) { // GGML_TYPE_IQ4_XS
+        bytes_per_block = 136;
+    } else if (ggml_type == 29) { // GGML_TYPE_IQ1_M
+        bytes_per_block = 56;
+    } else {
+        TORCH_CHECK(false, "gemm_q_forward: ggml_type ", ggml_type,
+                    " has no GEMM kernel yet (row-loop GEMV fallback)");
+    }
+    int64_t expected_bytes = N * (K / 256) * bytes_per_block;
+    TORCH_CHECK(weight_packed.numel() >= expected_bytes,
+                "gemm_q_forward: weight_packed tensor size too small");
+
+    BiasLaunch bias_launch = validate_bias_for_forward(bias, N, input.device(), "gemm_q_forward");
+    auto output = torch::empty({M, N}, input.options());
+    launch_gemm_q_forward(
+        input.data_ptr(),
+        weight_packed.data_ptr(),
+        output.data_ptr(),
+        bias_launch.ptr,
+        (int)ggml_type,
+        (int)M,
+        (int)N,
+        (int)K,
+        bias_launch.has_bias,
+        current_stream()
+    );
+    return output;
+}
+
+torch::Tensor swiglu_forward(
+    torch::Tensor g,
+    torch::Tensor u,
+    c10::optional<torch::Tensor> out_opt
+) {
+    TORCH_CHECK(g.is_cuda() && g.is_contiguous(), "swiglu_forward: g must be a contiguous CUDA tensor");
+    TORCH_CHECK(u.is_cuda() && u.is_contiguous(), "swiglu_forward: u must be a contiguous CUDA tensor");
+    TORCH_CHECK(g.scalar_type() == torch::kFloat16, "swiglu_forward: g must be float16");
+    TORCH_CHECK(u.scalar_type() == torch::kFloat16, "swiglu_forward: u must be float16");
+    TORCH_CHECK(g.numel() == u.numel(), "swiglu_forward: g and u must have the same number of elements");
+
+    torch::Tensor out;
+    if (out_opt.has_value() && out_opt.value().defined()) {
+        out = out_opt.value();
+        TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "swiglu_forward: out must be a contiguous CUDA tensor");
+        TORCH_CHECK(out.scalar_type() == torch::kFloat16, "swiglu_forward: out must be float16");
+        TORCH_CHECK(out.numel() == g.numel(), "swiglu_forward: out must have the same number of elements as g");
+    } else {
+        out = torch::empty_like(g);
+    }
+
+    int64_t numel = g.numel();
+    if (numel > 0) {
+        launch_swiglu_forward(
+            g.data_ptr(),
+            u.data_ptr(),
+            out.data_ptr(),
+            numel,
+            current_stream()
+        );
+    }
+    return out;
 }
 
 torch::Tensor dequant_embedding_forward(
@@ -2504,6 +2702,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequantize_e5m2_blockwise", &dequantize_e5m2_blockwise,
           "Block-wise dequantize FP8 E5M2 data using FP32 scales",
           py::arg("input"), py::arg("scales"), py::arg("block_size") = 32);
+    m.def("kv_quant_v_i4", &kv_quant_v_i4,
+          "Quantize V rows [H,S,D] to asymmetric UINT4 nibbles + fp16 scales/u8 zp",
+          py::arg("input"), py::arg("groups") = 4);
+    m.def("kv_dequant_v_i4", &kv_dequant_v_i4,
+          "Dequantize IU4 KV-cache V rows to fp16 via LDS LUT",
+          py::arg("packed"), py::arg("scales"), py::arg("zp"));
     m.def("quantize_mxfp8_e4m3", &quantize_mxfp8_e4m3,
           "OCP MXFP8 E4M3 quantize with UE8M0 scale per 32 (8.25bpw) — true microscaling",
           py::arg("input"));
@@ -2557,6 +2761,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Dedicated AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights",
           py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
           py::arg("output_features"), py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("gemm_q_forward", &gemm_q_forward,
+          "Batched GEMM over K-quant weights for S>1 prefill (LDS-staged weights, M-tiled)",
+          py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
+          py::arg("output_features"), py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("swiglu_forward", &swiglu_forward,
+          "Fused SwiGLU activation: out = silu(g) * u (fp16, optional in-place)",
+          py::arg("g"), py::arg("u"), py::arg("out") = c10::optional<torch::Tensor>());
+    
     m.def("dequant_embedding_forward", &dequant_embedding_forward,
           "Zero-copy on-the-fly embedding lookup and dequantization directly to FP16",
           py::arg("weight_packed"), py::arg("token_ids"), py::arg("ggml_type"), py::arg("K"));

@@ -28,7 +28,23 @@ function Get-ShortPath([string]$Path) {
 }
 
 if ([string]::IsNullOrWhiteSpace($RocmBin)) {
-    $RocmBin = "C:\Program Files\AMD\ROCm\7.1\bin"
+    if ($env:HIP_QUANT_ROCM_BIN -and (Test-Path $env:HIP_QUANT_ROCM_BIN)) {
+        $RocmBin = $env:HIP_QUANT_ROCM_BIN
+    } elseif ($env:ROCM_PATH -and (Test-Path (Join-Path $env:ROCM_PATH "bin"))) {
+        $RocmBin = Join-Path $env:ROCM_PATH "bin"
+    } elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin"))) {
+        $RocmBin = Join-Path $env:HIP_PATH "bin"
+    } else {
+        $rocmCandidates = Get-ChildItem -Path "C:\Program Files\AMD\ROCm" -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "bin" } |
+            Where-Object { Test-Path (Join-Path $_ "hipcc.exe") }
+        if ($rocmCandidates) {
+            $RocmBin = $rocmCandidates[0]
+        } else {
+            $RocmBin = "C:\Program Files\AMD\ROCm\7.1\bin"
+        }
+    }
 }
 
 $hipcc = Join-Path $RocmBin "hipcc.exe"
@@ -134,8 +150,7 @@ if (-not $SkipSmi) {
     $toolsDir = Join-Path $src_dir "tools"
     if (!(Test-Path $toolsDir)) { New-Item -ItemType Directory -Path $toolsDir | Out-Null }
     $cargoCandidates = @(
-        "C:\Users\armor\.cargo\bin\cargo.exe",
-        "$env:USERPROFILE\.cargo\bin\cargo.exe",
+        (Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"),
         (Get-Command cargo -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique -First 1
     if (-not $cargoCandidates) { $cargoCandidates = "cargo" }

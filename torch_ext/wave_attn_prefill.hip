@@ -443,10 +443,13 @@ extern "C" void launch_wave_attn_prefill(
     // Runtime auto-detect gfx1200 vs 1201 for blind tuning (56 vs 64 CU, lower BW needs wave earlier)
     int gfx_ver = 1201;
     {
-        hipDeviceProp_t prop;
-        if (hipGetDeviceProperties(&prop, 0) == hipSuccess) {
-            if (strstr(prop.gcnArchName, "gfx1200") != nullptr) gfx_ver = 1200;
-            else if (strstr(prop.gcnArchName, "gfx1201") != nullptr) gfx_ver = 1201;
+        int cur_dev = 0;
+        if (hipGetDevice(&cur_dev) == hipSuccess) {
+            hipDeviceProp_t prop;
+            if (hipGetDeviceProperties(&prop, cur_dev) == hipSuccess) {
+                if (strstr(prop.gcnArchName, "gfx1200") != nullptr) gfx_ver = 1200;
+                else if (strstr(prop.gcnArchName, "gfx1201") != nullptr) gfx_ver = 1201;
+            }
         }
     }
     int Q_TILE, K_TILE, THREADS;
