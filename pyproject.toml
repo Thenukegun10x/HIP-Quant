@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "2.0.0"
+version = "2.0.0.post215"
 description = "High-performance GPU tensor quantization and inference engine for AMD ROCm. Native AOT GEMV (K-Quants & I-Quants), State Space Model (SSM/DeltaNet) kernels, FP8 WMMA WaveAttention, and portable HIP C++ kernels for RDNA4, RDNA3, and CDNA."
 readme = "README.md"
 

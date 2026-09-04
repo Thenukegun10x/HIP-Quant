@@ -54,10 +54,14 @@ def _configure_windows_toolchain():
         try:
             import torch
             if getattr(torch.version, "hip", None):
-                major_minor = ".".join(str(torch.version.hip).split(".")[:2])
-                matched = Path(f"C:/Program Files/AMD/ROCm/{major_minor}")
-                if matched.is_dir() and (matched / "bin" / "hipcc.exe").exists():
-                    rocm_home = matched
+                hip_v = str(torch.version.hip)
+                if (hip_v.startswith("7.14") or "rock" in hip_v.lower()) and Path("C:/TheRock/build/bin/hipcc.exe").exists():
+                    rocm_home = Path("C:/TheRock/build")
+                else:
+                    major_minor = ".".join(hip_v.split(".")[:2])
+                    matched = Path(f"C:/Program Files/AMD/ROCm/{major_minor}")
+                    if matched.is_dir() and (matched / "bin" / "hipcc.exe").exists():
+                        rocm_home = matched
         except Exception:
             pass
     if rocm_home is None:
