@@ -821,8 +821,8 @@ __global__ void gemv_iq3s_kernel(
         if constexpr (M == 2) {
             x1_vec = x_shared + K;
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     int wave_id = threadIdx.y;
     int lane_id = threadIdx.x;
@@ -1114,9 +1114,9 @@ static void dispatch_gemv_q(
         dim3 grid_8((N + ROWS_8 - 1) / ROWS_8);
         hipLaunchKernelGGL(
             (gemv_iq3s_kernel<ROWS_8, M>),
-            grid_8, block_8, shared_bytes, stream,
+            grid_8, block_8, 0, stream,
             (const half*)input, (const block_iq3_s*)packed_weight, (half*)output, (const half*)bias,
-            N, K, K_full, row_stride_sb, has_bias, use_lds
+            N, K, K_full, row_stride_sb, has_bias, false
         );
     } else if (ggml_type == GGML_TYPE_IQ3_XXS) {
         hipLaunchKernelGGL(
