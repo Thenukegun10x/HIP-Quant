@@ -34,6 +34,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+scratch/
 
 # Tests - scratch / unpackaged test artifacts
 /test_*.py

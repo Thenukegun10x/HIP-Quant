@@ -4,7 +4,7 @@
 // single-token decode (M=1) on AMD RDNA 4 (gfx1201 / Wave32).
 //
 // Features:
-// - Direct streaming of native GGUF blocks (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ3_S, IQ3_XXS) from VRAM.
+// - Direct streaming of native GGUF blocks (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ1_S, IQ3_S, IQ3_XXS) from VRAM.
 // - Cooperative LDS caching of activation vector x with automatic global-memory fallback for huge K.
 // - 1 Wave (32 threads) per output row N; fast 5-cycle __shfl_down reduction.
 // - Zero host-device synchronization, zero shared-memory bank conflicts.
@@ -25,6 +25,7 @@
 #define GGML_TYPE_IQ2_XXS 16
 #define GGML_TYPE_IQ2_XS 17
 #define GGML_TYPE_IQ3_XXS 18
+#define GGML_TYPE_IQ1_S 19
 #define GGML_TYPE_IQ3_S 21
 #define GGML_TYPE_IQ2_S 22
 #define GGML_TYPE_IQ4_XS 23
@@ -505,12 +506,36 @@ struct dot_iq1_m {
 
             const int qh_byte = blk.qh[2 * ib + l / 2];
             const int grid_idx = (int)blk.qs[4 * ib + l] | ((qh_byte << (8 - 4 * (l % 2))) & 0x700);
-            uint64_t grid_u64 = d_iq1s_grid[grid_idx];
-            int8_t grid_val = (int8_t)((grid_u64 >> (j * 8)) & 0xff);
+            const uint64_t grid_u64 = d_iq1s_grid[grid_idx];
+            const int8_t grid_val = (int8_t)((grid_u64 >> (j * 8)) & 0xff);
 
             const float delta = (qh_byte & (l % 2 == 0 ? 0x08 : 0x80)) ? -0.125f : 0.125f;
             float w = dl * ((float)grid_val + delta);
 
+            sum = fmaf(w, __half2float(x_sb[ib * 32 + lane_id]), sum);
+        }
+        return sum;
+    }
+};
+
+struct dot_iq1_s {
+    __device__ __forceinline__ float operator()(const block_iq1_s* __restrict__ blk_ptr, const half* x_sb, int lane_id) const {
+        const block_iq1_s& blk = *blk_ptr;
+        const int l = lane_id >> 3; // 0..3
+        const int j = lane_id & 7;  // 0..7
+        const float d = fp16_to_fp32(blk.d);
+        float sum = 0.0f;
+
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint16_t qh_entry = blk.qh[ib];
+            const float dl = d * (float)(2 * ((qh_entry >> 12) & 7) + 1);
+            const float delta = (qh_entry & 0x8000) ? -0.125f : 0.125f;
+            const int grid_high = (qh_entry >> (3 * l)) & 7;
+            const int grid_idx = (int)blk.qs[4 * ib + l] | (grid_high << 8);
+            const uint64_t grid_u64 = d_iq1s_grid[grid_idx];
+            const int8_t grid_val = (int8_t)((grid_u64 >> (j * 8)) & 0xff);
+            const float w = dl * ((float)grid_val + delta);
             sum = fmaf(w, __half2float(x_sb[ib * 32 + lane_id]), sum);
         }
         return sum;
@@ -1125,6 +1150,13 @@ static void dispatch_gemv_q(
             (const half*)input, (const block_iq3_xxs*)packed_weight, (half*)output, (const half*)bias,
             N, K, K_full, row_stride_sb, has_bias, use_lds
         );
+    } else if (ggml_type == GGML_TYPE_IQ1_S) {
+        hipLaunchKernelGGL(
+            (gemv_qk_kernel<block_iq1_s, dot_iq1_s, ROWS_PER_BLOCK, M>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq1_s*)packed_weight, (half*)output, (const half*)bias,
+            N, K, K_full, row_stride_sb, has_bias, use_lds
+        );
     } else if (ggml_type == GGML_TYPE_IQ4_XS) {
         hipLaunchKernelGGL(
             (gemv_iq4xs_kernel<ROWS_PER_BLOCK, M>),
@@ -1246,6 +1278,12 @@ static void dispatch_gemm_qk(
             grid, block, shared_bytes, stream,
             (const half*)input, (const block_iq1_m*)packed_weight, (half*)output, (const half*)bias,
             N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
+    } else if (ggml_type == GGML_TYPE_IQ1_S) {
+        hipLaunchKernelGGL(
+            (gemm_qk_kernel<block_iq1_s, dot_iq1_s, ROWS_PER_BLOCK, MTILE>),
+            grid, block, shared_bytes, stream,
+            (const half*)input, (const block_iq1_s*)packed_weight, (half*)output, (const half*)bias,
+            N, K, Mrows, K_full, row_stride_sb, blk_bytes, has_bias);
     }
 }
 
@@ -1318,6 +1356,7 @@ static int gemv_q_block_bytes(int ggml_type) {
         case 16: return 66;   // IQ2_XXS
         case 17: return 74;   // IQ2_XS
         case 18: return 98;   // IQ3_XXS
+        case 19: return 50;   // IQ1_S
         case 21: return 110;  // IQ3_S
         case 22: return 82;   // IQ2_S
         case 23: return 136;  // IQ4_XS

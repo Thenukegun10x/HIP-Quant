@@ -1,11 +1,12 @@
 // torch_ext/wave_attn_prefill.hip
 // Prefill / Chunked-Prefill inference kernel for GFX12.
 // Fork of wave_attn.hip:304 wave_attn_kernel_templated + wave_attn_kernel_templated_int4_native:765
-// INT4 Q/K (wmmma_i32 16x16x32) + FP8 V (wmmma_f32 16x16x16) hybrid is the default.
-// FP8 Q/K/V kept as fallback when !use_int4 or Dim>128.
-// Paged K/V support: if block_table != nullptr, K/V loads index via block_table[batch*num_blocks + block_id].
+// Inference GQA path: FP8 Q/K, FP8 or packed asymmetric IU4 V, FP16 output.
+// Legacy entry point also supports signed INT4 Q/K + FP8 V.
+// Inputs are contiguous KV views; block_table is a legacy unused parameter.
 
 #include "wave_attn_common.h"
+#include <hip/hip_fp16.h>
 
 // Re-export split reduce kernel (shared across all three)
 // Defined in wave_attn.hip:953 - duplicate here to keep prefill self-contained
@@ -49,8 +50,8 @@ __global__ void wave_attn_prefill_split_reduce_kernel(
 }
 
 // Prefill FP8 kernel - identical to wave_attn.hip:304 but renamed + block_table hook
-template <int Q_TILE, int K_TILE, int THREADS_PER_BLOCK>
-__global__ void wave_attn_prefill_fp8(
+template <int Q_TILE, int K_TILE, int THREADS_PER_BLOCK, int HEAD_DIM = 0, bool V_IU4 = false>
+__global__ __launch_bounds__(THREADS_PER_BLOCK) void wave_attn_prefill_fp8(
     const uint8_t * __restrict__ Q_fp8,
     const uint8_t * __restrict__ K_fp8,
     const uint8_t * __restrict__ V_fp8,
@@ -59,11 +60,21 @@ __global__ void wave_attn_prefill_fp8(
     float         * __restrict__ Partial_Max,
     float         * __restrict__ Partial_Sum,
     float         * __restrict__ Partial_Out,
-    int B, int H, int Seq_Q, int Seq_K, int Dim,
+    int B, int H, int Seq_Q, int Seq_K, int dim_arg,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
-    int out_dtype, bool is_causal, int num_splits,
-    const int32_t* __restrict__ block_table, int block_size
+    int out_dtype_arg, bool is_causal, int num_splits_arg,
+    const int32_t* __restrict__ block_table, int block_size,
+    int H_KV = 0, const uint16_t* __restrict__ v_scales = nullptr,
+    const uint8_t* __restrict__ v_zp = nullptr, int v_groups = 4
 ) {
+    const int Dim = HEAD_DIM ? HEAD_DIM : dim_arg;
+    constexpr int MAX_D = HEAD_DIM ? HEAD_DIM / 16 : 16;
+    // D=256 needs 128 FP32 accumulator registers per lane. Splitting the
+    // output columns between two blocks avoids spilling these fragments.
+    constexpr int ACC_D = HEAD_DIM == 256 ? 8 : MAX_D;
+    const int output_start = HEAD_DIM == 256 ? blockIdx.z * 128 : 0;
+    const int out_dtype = HEAD_DIM ? HIP_QUANT_DTYPE_F16 : out_dtype_arg;
+    const int num_splits = HEAD_DIM ? 1 : num_splits_arg;
     constexpr int NUM_K_SUBS = K_TILE / 16;
     const int LDK = Dim + WAVE_ATTN_LDS_PAD;
     constexpr int LDV = K_TILE + WAVE_ATTN_LDS_PAD;
@@ -83,17 +94,22 @@ __global__ void wave_attn_prefill_fp8(
     int b = bh_idx / H;
     int h = bh_idx % H;
     int64_t q_off = ((int64_t)b * H + h) * Seq_Q * Dim;
-    int64_t k_off = ((int64_t)b * H + h) * Seq_K * Dim;
-    int64_t v_off = ((int64_t)b * H + h) * Seq_K * Dim;
+    const int kv_heads = H_KV ? H_KV : H;
+    const int kv_h = h / (H / kv_heads);
+    int64_t k_off = ((int64_t)b * kv_heads + kv_h) * Seq_K * Dim;
+    int64_t v_off = ((int64_t)b * kv_heads + kv_h) * Seq_K * (V_IU4 ? Dim / 2 : Dim);
+    int64_t vs_off = ((int64_t)b * kv_heads + kv_h) * Seq_K * v_groups;
     int64_t o_off = ((int64_t)b * H + h) * Seq_Q * Dim;
     float cscale = softmax_scale * q_scale * k_scale;
     float pscale = 16.0f;
     int num_d = (Dim + 15) / 16;
+    const int num_out_d = HEAD_DIM == 256 ? 8 : num_d;
+    const int v_columns = HEAD_DIM == 256 ? 128 : Dim;
     int num_q_waves = Q_TILE >> 4;
     const uint8_t* __restrict__ Q_base = Q_fp8 + q_off;
-    v8f acc_o[16];
+    v8f acc_o[ACC_D];
     #pragma unroll
-    for (int d = 0; d < 16; d++) acc_o[d] = (v8f){};
+    for (int d = 0; d < ACC_D; d++) acc_o[d] = (v8f){};
     float row_max = WAVE_ATTN_NEG_INF;
     float row_sum = 0.0f;
     int total_k_tiles = (Seq_K + K_TILE - 1) / K_TILE;
@@ -106,7 +122,7 @@ __global__ void wave_attn_prefill_fp8(
     const int q_start = (Seq_K > Seq_Q) ? (Seq_K - Seq_Q) : 0;
     if (is_causal) {
         int max_q_in_block = q_start + q_block_start + Q_TILE - 1;
-        int m = (max_q_in_block + K_TILE - 1) / K_TILE;
+        int m = (max_q_in_block + K_TILE) / K_TILE;
         if (kt_end > m) kt_end = m;
     }
     for (int kt = kt_start; kt < kt_end; kt++) {
@@ -120,7 +136,7 @@ __global__ void wave_attn_prefill_fp8(
         #pragma unroll
         for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) sacc[k_sub] = (v8f){};
         #pragma unroll
-        for (int dt = 0; dt < 16; dt++) {
+        for (int dt = 0; dt < MAX_D; dt++) {
             if (dt >= num_d) break;
             int doff = dt * 16;
             v2i qv = (v2i){0, 0};
@@ -180,12 +196,41 @@ __global__ void wave_attn_prefill_fp8(
             float corr_alpha = __shfl_sync(0xFFFFFFFFFFFFFFFFULL, alpha, lg * 8 + i);
             corr_alpha = wave_attn_scale_ftz(corr_alpha, 0.0f); // keep FTZ semantics
             #pragma unroll
-            for (int d = 0; d < 16; d++) acc_o[d][i] *= corr_alpha;
+            for (int d = 0; d < ACC_D; d++) acc_o[d][i] *= corr_alpha;
         }
-        load_v_tile_transposed_wave_fast<K_TILE, LDV>(V_fp8 + v_off, smem_K, ks, K_TILE, Dim, Seq_K, tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+        // K and V alias LDS. All waves must finish reading K before any
+        // wave overwrites it (ragged query rows still participate).
         cta.sync();
-        for (int dt = 0; dt < num_d; dt++) {
-            int doff = dt * 16;
+        if constexpr (V_IU4) {
+            // Packed asymmetric UINT4 V is expanded only in LDS. Preserve
+            // kv_dequant_v_i4's fp16 rounding before FP8 conversion.
+            for (int i = tid; i < K_TILE * v_columns / 2; i += THREADS_PER_BLOCK) {
+                const int r = i / (v_columns / 2);
+                const int c = output_start + (i % (v_columns / 2)) * 2;
+                uint32_t pair = 0;
+                if (ks + r < Seq_K) {
+                    const int group = c / (Dim / v_groups);
+                    const int64_t si = vs_off + (int64_t)(ks + r) * v_groups + group;
+                    const float vs = __half2float(reinterpret_cast<const half*>(v_scales)[si]);
+                    const int zp = v_zp[si];
+                    const uint8_t packed = V_fp8[v_off + (int64_t)(ks + r) * (Dim / 2) + c / 2];
+                    const float a = __half2float(__float2half_rn(((int)(packed & 15) - zp) * vs));
+                    const float bval = __half2float(__float2half_rn(((int)(packed >> 4) - zp) * vs));
+                    pair = fast_pack_2float_to_fp8_e4m3_wave(a, bval);
+                }
+                smem_K[c * LDV + r] = pair & 255;
+                smem_K[(c + 1) * LDV + r] = (pair >> 8) & 255;
+            }
+        } else if constexpr (HEAD_DIM) {
+            load_v_tile_transposed_wave_fast_vec<K_TILE, LDV>(V_fp8 + v_off, smem_K, ks, K_TILE, Dim, Seq_K,
+                tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK, output_start, v_columns);
+        } else {
+            load_v_tile_transposed_wave_fast<K_TILE, LDV>(V_fp8 + v_off, smem_K, ks, K_TILE, Dim, Seq_K, tid, THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+        }
+        cta.sync();
+        #pragma unroll
+        for (int dt = 0; dt < num_out_d; dt++) {
+            int doff = output_start + dt * 16;
             int vc = doff + lw;
             #pragma unroll
             for (int k_sub = 0; k_sub < NUM_K_SUBS; k_sub++) {
@@ -204,8 +249,9 @@ __global__ void wave_attn_prefill_fp8(
     if (wave_id >= num_q_waves) return;
     float total_row_sum = row_sum + __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, row_sum, 16);
     if (num_splits == 1) {
-        for (int dt = 0; dt < num_d; dt++) {
-            int doff = dt * 16;
+        #pragma unroll
+        for (int dt = 0; dt < num_out_d; dt++) {
+            int doff = output_start + dt * 16;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 int orr = q_block_start + wave_id * 16 + lg * 8 + i;
@@ -215,7 +261,10 @@ __global__ void wave_attn_prefill_fp8(
                 float inv = (rsum > 0.0f) ? (1.0f / (rsum * pscale)) : 0.0f;
                 if (orr < Seq_Q && oc < Dim) {
                     float fval = acc_o[dt][i] * inv * v_scale;
-                    store_attn_output_wave(Out, out_dtype, o_off + (int64_t)orr * Dim + oc, fval);
+                    if constexpr (HEAD_DIM)
+                        reinterpret_cast<half*>(Out)[o_off + (int64_t)orr * Dim + oc] = __float2half_rn(fval);
+                    else
+                        store_attn_output_wave(Out, out_dtype, o_off + (int64_t)orr * Dim + oc, fval);
                 }
                 if (LSE != nullptr && oc == 0 && dt == 0 && orr < Seq_Q) {
                     float lse_val = (rsum > 0.0f) ? (rmax + logf(rsum + 1e-12f)) : __int_as_float(0xFF800000);
@@ -224,6 +273,7 @@ __global__ void wave_attn_prefill_fp8(
             }
         }
     } else {
+        #pragma unroll
         for (int dt = 0; dt < num_d; dt++) {
             int doff = dt * 16;
             #pragma unroll
@@ -246,7 +296,64 @@ __global__ void wave_attn_prefill_fp8(
     }
 }
 
-// Hybrid INT4 Q/K + FP8 V - default prefill path
+// Dimension-specialized GQA dispatch. A compile-time head dimension keeps
+// output fragments in VGPRs instead of dynamically indexing a scratch array.
+// KV heads stay shared; no repeat_interleave materialization is required.
+template <int D, bool V_IU4, int Q_TILE>
+static void launch_prefill_gqa_tile(
+    const uint8_t* Q, const uint8_t* K, const uint8_t* V,
+    const uint16_t* vs, const uint8_t* vz, int groups,
+    void* Out, float* LSE, int B, int H, int HK, int SQ, int SK,
+    float scale, float qs, float ks, float vscl, int out_dtype,
+    bool causal, hipStream_t stream
+) {
+    constexpr int KT = 64;
+    constexpr int THREADS = Q_TILE * 2;
+    constexpr size_t LDS = D * (KT + WAVE_ATTN_LDS_PAD) > KT * (D + WAVE_ATTN_LDS_PAD)
+        ? D * (KT + WAVE_ATTN_LDS_PAD) : KT * (D + WAVE_ATTN_LDS_PAD);
+    hipLaunchKernelGGL((wave_attn_prefill_fp8<Q_TILE, KT, THREADS, D, V_IU4>),
+        dim3(B * H, (SQ + Q_TILE - 1) / Q_TILE, D == 256 ? 2 : 1), dim3(THREADS), LDS, stream,
+        Q, K, V, Out, LSE, nullptr, nullptr, nullptr, B, H, SQ, SK, D,
+        scale, qs, ks, vscl, out_dtype, causal, 1, nullptr, 0, HK, vs, vz, groups);
+}
+
+template <int D, bool V_IU4>
+static void launch_prefill_gqa_dim(
+    const uint8_t* Q, const uint8_t* K, const uint8_t* V,
+    const uint16_t* vs, const uint8_t* vz, int groups,
+    void* Out, float* LSE, int B, int H, int HK, int SQ, int SK,
+    float scale, float qs, float ks, float vscl, int out_dtype,
+    bool causal, hipStream_t stream
+) {
+    if (SQ <= 32)
+        launch_prefill_gqa_tile<D, V_IU4, 16>(Q,K,V,vs,vz,groups,Out,LSE,B,H,HK,SQ,SK,scale,qs,ks,vscl,out_dtype,causal,stream);
+    else if (SQ <= 128)
+        launch_prefill_gqa_tile<D, V_IU4, 64>(Q,K,V,vs,vz,groups,Out,LSE,B,H,HK,SQ,SK,scale,qs,ks,vscl,out_dtype,causal,stream);
+    else
+        launch_prefill_gqa_tile<D, V_IU4, 128>(Q,K,V,vs,vz,groups,Out,LSE,B,H,HK,SQ,SK,scale,qs,ks,vscl,out_dtype,causal,stream);
+}
+
+extern "C" void launch_wave_attn_prefill_gqa(
+    const uint8_t* Q, const uint8_t* K, const uint8_t* V,
+    const uint16_t* vs, const uint8_t* vz, int groups,
+    void* Out, float* LSE, int B, int H, int HK, int SQ, int SK, int D,
+    float scale, float qs, float ks, float vscl, int out_dtype,
+    bool causal, hipStream_t stream
+) {
+    #define DISPATCH_GQA(DIM, IU4) launch_prefill_gqa_dim<DIM, IU4>(Q,K,V,vs,vz,groups,Out,LSE,B,H,HK,SQ,SK,scale,qs,ks,vscl,out_dtype,causal,stream)
+    if (vs) {
+        if (D == 64) DISPATCH_GQA(64, true);
+        else if (D == 128) DISPATCH_GQA(128, true);
+        else if (D == 256) DISPATCH_GQA(256, true);
+    } else {
+        if (D == 64) DISPATCH_GQA(64, false);
+        else if (D == 128) DISPATCH_GQA(128, false);
+        else if (D == 256) DISPATCH_GQA(256, false);
+    }
+    #undef DISPATCH_GQA
+}
+
+// Hybrid INT4 Q/K + FP8 V - legacy prefill path
 template <int Q_TILE, int K_TILE, int THREADS_PER_BLOCK>
 __global__ void wave_attn_prefill_int4(
     const uint8_t* __restrict__ Q_int4,

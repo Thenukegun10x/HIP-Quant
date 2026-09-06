@@ -187,17 +187,18 @@ __device__ inline void load_v_tile_transposed_wave_fast_vec(
     const uint8_t* __restrict__ src_global,
     uint8_t* __restrict__ dst_lds,
     int g_row_start, int num_rows, int dim, int total_g_rows,
-    int tid_start, int tid_stride, int tid_count
+    int tid_start, int tid_stride, int tid_count,
+    int col_start = 0, int col_count = 0
 ) {
     const uint4* g_u4 = (const uint4*)src_global;
-    int blocks_per_row = dim >> 4;
+    int blocks_per_row = (col_count ? col_count : dim) >> 4;
     int block_rows = K_TILE >> 2;
     int total_blocks = block_rows * blocks_per_row;
     for (int b = tid_start; b < total_blocks; b += tid_stride) {
         int block_r = b / blocks_per_row;
         int block_c = b % blocks_per_row;
         int r0 = block_r * 4;
-        int c0 = block_c * 16;
+        int c0 = col_start + block_c * 16;
         int g_r0 = g_row_start + r0;
         uint4 u4_0, u4_1, u4_2, u4_3;
         if (g_r0 < total_g_rows) u4_0 = (c0 < dim) ? g_u4[((g_r0)*dim + c0)>>4] : make_uint4(0,0,0,0);

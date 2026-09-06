@@ -3201,6 +3201,54 @@ class _WaveAttentionFn(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
+def wave_attn_prefill(
+    q: "torch.Tensor", k: "torch.Tensor", v: "torch.Tensor", *,
+    softmax_scale: Optional[float] = None, is_causal: bool = True,
+    v_scales: Optional["torch.Tensor"] = None,
+    v_zp: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Inference FP8 prefill with native GQA and optional packed IU4 V.
+
+    Q/K are floating-point [B,H,S,D] and [B,Hkv,Sk,D]. V is either floating
+    point or packed uint8 [B,Hkv,Sk,D/2] with fp16 scales and uint8 zero
+    points [B,Hkv,Sk,groups]. Causal queries align to the end of the KV
+    prefix. No KV-head expansion or full IU4 dequantization is performed.
+    """
+    _require_gfx12_fp8_wmma(q)
+    if (v_scales is None) != (v_zp is None):
+        raise ValueError("IU4 V needs both scales and zero points")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("prefill q/k/v must be four dimensional")
+    if q.dtype == torch.uint8:
+        raise ValueError("prefill q must be floating point")
+    if (v.dtype == torch.uint8 and v.shape[-1] != q.shape[-1]) and (v_scales is None):
+        raise ValueError("packed IU4 V requires scales and zero points")
+    sq = 0.5
+    q8 = quantize_e4m3(q / sq)
+    if k.dtype == torch.uint8:
+        k8 = k.contiguous()
+        sk = 1.0
+    else:
+        sk = 0.5
+        k8 = quantize_e4m3(k / sk)
+    if v.dtype == torch.uint8:
+        v8 = v.contiguous()
+        sv = 1.0
+    else:
+        v8 = quantize_e4m3(v)
+        sv = 1.0
+    out, _ = _load_extension().wave_attn_prefill_gqa_forward(
+        q8, k8, v8, softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+        sq, sk, sv, is_causal,
+        v_scales.contiguous() if v_scales is not None else None,
+        v_zp.contiguous() if v_zp is not None else None,
+    )
+    return out.to(q.dtype)
+
+
+wave_attn_gqa_decode = wave_attn_prefill
+
+
 def wave_attn_int4(
     q: "torch.Tensor",
     k: "torch.Tensor",
