@@ -14,6 +14,13 @@
 
 `hip-quant` is a standalone Python library and highly optimized HIP C++ backend for tensor quantization and accelerated LLM inference on AMD GPUs with zero CPU round-trips.
 
+## 🌟 What's New in 2.1.0
+
+- **🌊 GQA prefill with LSE**: exposed the missing `wave_attn_prefill_gqa_forward` native binding and added `wave_attn_prefill_with_lse`, returning `(output, log-sum-exp)` so independently computed KV pages can be combined with an online-softmax reduction. Plain `wave_attn_prefill` keeps its output-only signature.
+- **⚡ Zero-spill FP16 dequant prefill path**: new native `dequant_q_to_fp16` kernels plus GEMV/SSM/prefill pipeline optimizations.
+- **📦 GGUF loader**: `IQ1_S` (GGML type 19) takes the native quantized path.
+- **🧪 Tests**: new CPU-safe contract suite for the prefill Python API (`tests/test_prefill_with_lse.py`).
+
 ## 🌟 What's New in 2.0.0
 
 `hip-quant` 2.0.0 expands the project from an offline quantization tool into a **complete high-performance ROCm inference and kernel acceleration suite** for AMD GPUs (specifically targeting RDNA4 `gfx1201`/`gfx1200`, RDNA3, and CDNA):

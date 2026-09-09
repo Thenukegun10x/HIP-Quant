@@ -89,3 +89,6 @@ SmolLM2-135M/
 # Nested hip_inference repo (separately versioned; see hip_inference/.git)
 /hip_inference/
 
+# Large local text fixture accidentally committed in 9fbeef4 (2.7MB, unreferenced)
+/monte_cristo.txt
+

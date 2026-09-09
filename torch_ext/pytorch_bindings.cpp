@@ -294,6 +294,12 @@ void launch_wave_attn_prefill(
     int B, int H, int Seq_Q, int Seq_K, int Dim,
     float softmax_scale, float q_scale, float k_scale, float v_scale,
     int out_dtype, bool is_causal, bool use_int4, hipStream_t stream);
+extern "C" void launch_wave_attn_prefill_gqa(
+    const uint8_t* Q, const uint8_t* K, const uint8_t* V,
+    const uint16_t* v_scales, const uint8_t* v_zp, int v_groups,
+    void* Out, float* LSE, int B, int H, int H_KV, int Seq_Q, int Seq_K, int Dim,
+    float softmax_scale, float q_scale, float k_scale, float v_scale,
+    int out_dtype, bool is_causal, hipStream_t stream);
 void launch_wave_attn_decode(
     const uint8_t* Q_int4, const uint8_t* K_int4, const uint8_t* V_int4,
     const float* k_scales,
@@ -3337,6 +3343,62 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         launch_wave_attn_prefill(q.data_ptr<uint8_t>(),k.data_ptr<uint8_t>(),v.data_ptr<uint8_t>(), out.data_ptr(),lse.data_ptr<float>(),pmp,psp,pop, B,H,Seq_Q,Seq_K,Dim,(float)softmax_scale,(float)q_scale,(float)k_scale,(float)v_scale,0,is_causal,use_int4, current_stream());
         return py::make_tuple(out,lse);
     }, "WaveAttention prefill inference kernel (adaptive Q_TILE, INT4 QK/FP8 V hybrid).", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("softmax_scale"), py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0, py::arg("is_causal")=false, py::arg("use_int4")=true);
+
+    // Expose per-page LSE as well as normalized output. Strict host KV uses
+    // logaddexp to combine independently streamed pages without omitting
+    // positions or materialising a full [query,key] score matrix.
+    m.def("wave_attn_prefill_gqa_forward", [](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        double softmax_scale, double q_scale, double k_scale, double v_scale,
+        bool is_causal,
+        c10::optional<torch::Tensor> v_scales,
+        c10::optional<torch::Tensor> v_zp
+    ) {
+        TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
+        TORCH_CHECK(q.dtype()==torch::kUInt8 && k.dtype()==torch::kUInt8 && v.dtype()==torch::kUInt8,
+                    "q/k/v must be uint8 FP8 / packed UINT4");
+        TORCH_CHECK(q.dim()==4 && k.dim()==4 && v.dim()==4, "q/k/v must be [B,H,S,D]");
+        TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q/k/v must be contiguous");
+        TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q/k/v must share a device");
+        const int B=q.size(0), H=q.size(1), SQ=q.size(2), D=q.size(3);
+        const int HK=k.size(1), SK=k.size(2);
+        TORCH_CHECK(B>0 && H>0 && HK>0 && SQ>0 && SK>0, "q/k/v dimensions must be nonzero");
+        TORCH_CHECK(H % HK == 0, "query heads must be divisible by KV heads");
+        TORCH_CHECK(k.size(0)==B && k.size(3)==D, "K shape must be [B,Hkv,Sk,D]");
+        TORCH_CHECK(D==64 || D==128 || D==256, "GQA kernel supports head dimensions 64, 128, or 256");
+        TORCH_CHECK(v_scales.has_value() == v_zp.has_value(), "packed UINT4 V requires scales and zero points together");
+        const uint16_t* vs_ptr=nullptr;
+        const uint8_t* vz_ptr=nullptr;
+        int groups=4;
+        if (v_scales.has_value()) {
+            auto vs=v_scales.value(); auto vz=v_zp.value();
+            TORCH_CHECK(vs.is_cuda() && vz.is_cuda() && vs.is_contiguous() && vz.is_contiguous(),
+                        "V quantization metadata must be contiguous CUDA tensors");
+            TORCH_CHECK(vs.device()==q.device() && vz.device()==q.device(), "V metadata must share q device");
+            TORCH_CHECK(vs.dtype()==torch::kFloat16 && vz.dtype()==torch::kUInt8, "V scales must be fp16 and zero points uint8");
+            TORCH_CHECK(vs.dim()==4 && vz.dim()==4 && vs.sizes()==vz.sizes(), "V metadata must be matching [B,Hkv,Sk,groups]");
+            TORCH_CHECK(vs.size(0)==B && vs.size(1)==HK && vs.size(2)==SK, "V metadata shape mismatch");
+            groups=vs.size(3);
+            TORCH_CHECK(v.size(0)==B && v.size(1)==HK && v.size(2)==SK && groups>0 && D % groups==0 && v.size(3)*2==D,
+                        "packed V shape/group mismatch");
+            vs_ptr=reinterpret_cast<const uint16_t*>(vs.data_ptr<at::Half>());
+            vz_ptr=vz.data_ptr<uint8_t>();
+        } else {
+            TORCH_CHECK(v.size(0)==B && v.size(1)==HK && v.size(2)==SK && v.size(3)==D,
+                        "FP8 V shape must be [B,Hkv,Sk,D]");
+        }
+        auto out=torch::empty({B,H,SQ,D}, torch::TensorOptions().dtype(torch::kFloat16).device(q.device()));
+        auto lse=torch::empty({B,H,SQ}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+        launch_wave_attn_prefill_gqa(
+            q.data_ptr<uint8_t>(), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(), vs_ptr, vz_ptr, groups,
+            out.data_ptr(), lse.data_ptr<float>(), B,H,HK,SQ,SK,D,
+            (float)softmax_scale,(float)q_scale,(float)k_scale,(float)v_scale,
+            0,is_causal,current_stream());
+        return py::make_tuple(out,lse);
+    }, "FP8 GQA prefill with optional packed UINT4 V; returns (fp16 output, fp32 LSE).",
+       py::arg("q"), py::arg("k"), py::arg("v"), py::arg("softmax_scale"),
+       py::arg("q_scale")=1.0, py::arg("k_scale")=1.0, py::arg("v_scale")=1.0,
+       py::arg("is_causal")=false, py::arg("v_scales")=c10::nullopt, py::arg("v_zp")=c10::nullopt);
 
     m.def("wave_attn_decode_forward", [](
         torch::Tensor q_int4, torch::Tensor k_int4, torch::Tensor v_tensor,

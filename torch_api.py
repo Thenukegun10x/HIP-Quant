@@ -3201,12 +3201,12 @@ class _WaveAttentionFn(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
-def wave_attn_prefill(
+def wave_attn_prefill_with_lse(
     q: "torch.Tensor", k: "torch.Tensor", v: "torch.Tensor", *,
     softmax_scale: Optional[float] = None, is_causal: bool = True,
     v_scales: Optional["torch.Tensor"] = None,
     v_zp: Optional["torch.Tensor"] = None,
-) -> "torch.Tensor":
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
     """Inference FP8 prefill with native GQA and optional packed IU4 V.
 
     Q/K are floating-point [B,H,S,D] and [B,Hkv,Sk,D]. V is either floating
@@ -3237,13 +3237,30 @@ def wave_attn_prefill(
     else:
         v8 = quantize_e4m3(v)
         sv = 1.0
-    out, _ = _load_extension().wave_attn_prefill_gqa_forward(
+    out, lse = _load_extension().wave_attn_prefill_gqa_forward(
         q8, k8, v8, softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
         sq, sk, sv, is_causal,
         v_scales.contiguous() if v_scales is not None else None,
         v_zp.contiguous() if v_zp is not None else None,
     )
-    return out.to(q.dtype)
+    return out.to(q.dtype), lse
+
+
+def wave_attn_prefill(
+    q: "torch.Tensor", k: "torch.Tensor", v: "torch.Tensor", *,
+    softmax_scale: Optional[float] = None, is_causal: bool = True,
+    v_scales: Optional["torch.Tensor"] = None,
+    v_zp: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """FP8 GQA prefill returning normalized output only.
+
+    Use :func:`wave_attn_prefill_with_lse` when independently computed KV
+    pages must be combined with an online-softmax reduction.
+    """
+    return wave_attn_prefill_with_lse(
+        q, k, v, softmax_scale=softmax_scale, is_causal=is_causal,
+        v_scales=v_scales, v_zp=v_zp,
+    )[0]
 
 
 wave_attn_gqa_decode = wave_attn_prefill

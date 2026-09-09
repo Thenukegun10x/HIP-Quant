@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "2.0.0.post215"
+__version__ = "2.1.0"
 
 
 _TORCH_EXPORTS = {

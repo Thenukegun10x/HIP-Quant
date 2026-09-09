@@ -165,6 +165,7 @@ def _torch_extension_config():
             "torch_ext/gemv_q_kernels.hip",
             "torch_ext/ssm_kernels.hip",
             "torch_ext/kv_iu4_kernels.hip",
+            "torch_ext/dequant_q_to_fp16.hip",
         ],
 
 
