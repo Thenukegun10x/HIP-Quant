@@ -16,6 +16,8 @@
 
 ## 🌟 What's New in 2.1.0
 
+> **2.1.0.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). Use it if `2.1.0` reports a torch ABI mismatch on import.
+
 - **🌊 GQA prefill with LSE**: exposed the missing `wave_attn_prefill_gqa_forward` native binding and added `wave_attn_prefill_with_lse`, returning `(output, log-sum-exp)` so independently computed KV pages can be combined with an online-softmax reduction. Plain `wave_attn_prefill` keeps its output-only signature.
 - **⚡ Zero-spill FP16 dequant prefill path**: new native `dequant_q_to_fp16` kernels plus GEMV/SSM/prefill pipeline optimizations.
 - **📦 GGUF loader**: `IQ1_S` (GGML type 19) takes the native quantized path.
