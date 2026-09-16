@@ -322,11 +322,26 @@ the next replay.
 ## 📦 Installation
 
 ```powershell
-# Binary wheel with packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
-pip install dist/hip_quant-1.3.0-cp312-cp312-win_amd64.whl
+# From PyPI: binary wheel with the packaged ROCm 7.2.1 ctypes DLL and PyTorch extension
+pip install hip-quant
 
-# With PyTorch optional dependency declared
+# With the PyTorch optional dependency declared
 pip install "hip-quant[torch]"
+
+# Or a local wheel
+pip install dist/hip_quant-2.2.0-cp312-cp312-win_amd64.whl
+```
+
+Two wheels are published per release, one per PyTorch ABI. Install the one that
+matches your PyTorch, so the extension loads without an ABI mismatch:
+
+| Wheel | PyTorch | ROCm |
+|---|---|---|
+| `hip-quant==2.2.0` | 2.9.x | ROCm 7.2.1 |
+| `hip-quant==2.2.0.post215` | 2.15 / TheRock | ROCm 7.14 |
+
+```powershell
+pip install "hip-quant==2.2.0.post215"   # PyTorch 2.15 / TheRock
 ```
 
 On Windows, DLL resolution order is:
@@ -334,7 +349,7 @@ On Windows, DLL resolution order is:
 - `hip_quantize_rocm721.dll`
 - `hip_quantize.dll`
 
-Runtime DLL directories include `HIP_QUANT_ROCM_BIN`, `HIP_QUANT_ROCM_HOME`, `ROCM_HOME`, `ROCM_PATH`, `HIP_PATH`, the active venv's `_rocm_sdk_core\bin`, `torch\lib`, `Scripts`, then the system ROCm 7.1 path.
+Runtime DLL directories include `HIP_QUANT_ROCM_BIN`, `HIP_QUANT_ROCM_HOME`, `ROCM_HOME`, `ROCM_PATH`, `HIP_PATH`, the active venv's `_rocm_sdk_core\bin`, `torch\lib`, `Scripts`, then the system ROCm 7.2 path.
 
 ---
 
@@ -597,6 +612,20 @@ Block-wise scaling is useful when a tensor has uneven dynamic range across its
 last dimension. It usually reduces FP8 quantization error compared with one
 global scale for the entire tensor. Existing per-tensor FP8 APIs remain unchanged.
 
+#### Dynamic Per-Token FP8 Quantization
+
+`quantize_e4m3_per_token` computes a single FP32 dequant scale for an entire row
+(`amax / 448`). This is the `activation_scheme: "dynamic"` used by
+DeepSeek/vLLM FP8 checkpoints. For an input `[..., K]` the scale tensor has
+shape `[...]` — one value per row:
+
+```python
+from hip_quant.torch_api import quantize_e4m3_per_token
+
+x_fp8, x_scale = quantize_e4m3_per_token(x)   # x_scale: [M],  real ~= fp8 * scale[m]
+```
+
+
 #### Block-scaled Linear and Adafactor Kernel Helpers
 
 Two lower-level training helpers are available for experiments and future fused
@@ -625,12 +654,51 @@ out = fp8_linear_forward_blockwise_quantized(
 )
 ```
 
-The current block-scaled linear kernel is correctness-first and intentionally
-does not use gfx12 WMMA yet. It validates the `FP8 bytes + per-block scales`
-layout and math before replacing the inner loop with a tiled/WMMA or rocBLASLt
-implementation. `Adafactor` is a full Python optimizer step with factored
-second-moment state; GPU-side row/column mean-square helpers exist, while a
-fully fused Adafactor update kernel remains a future optimization.
+#### 2-D Block-Scaled FP8 Linear (vLLM / DeepSeek)
+
+`fp8_linear_forward_blockwise_2d` consumes a safetensors `weight_scale_inv`
+directly: a `[N, K]` E4M3 weight plus one dequant scale per `block x block`
+tile (typically `128 x 128`), i.e. a `[N/block, K/block]` FP32 tensor, paired
+with a single per-token activation scale `[M]`:
+
+```text
+C[m,n] = input_scale[m] * sum_kb  W_scale[n/block, kb] * <A[m,:], B[n,:]>_kb
+```
+
+```python
+from hip_quant import fp8_linear_forward_blockwise_2d, fp8_linear_deepseek
+
+# From raw FP8 + 2-D scale tensors (already on device)
+out = fp8_linear_forward_blockwise_2d(
+    input_fp8, input_scale,        # quantize_e4m3_per_token(x)
+    weight_fp8, weight_scale_inv,  # [N, K] uint8, [N/128, K/128] float32
+    output_dtype_source=x,
+    block_size=128, backend="auto", bias=bias,
+)
+
+# One-shot: dynamically quantizes x per token, then runs the fused GEMM
+out = fp8_linear_deepseek(x, weight_fp8, weight_scale_inv, bias=bias)
+```
+
+`backend` selects the kernel at runtime:
+
+| backend | kernel | notes |
+|---|---|---|
+| `"auto"` (default) | gfx12 WMMA when the shape allows, else portable | recommended |
+| `"wmma"` | gfx12 `v_wmma_f32_16x16x16_fp8_fp8`, one weight-tile scale folded per 128-K stage | gfx12 only |
+| `"portable"` | LDS-tiled `64x64x32` microkernel, exact fp8->fp16 shared-memory decode | any AMD GPU, no matrix intrinsics |
+| `"reference"` | naive per-element kernel | slow; testing only |
+
+The per-token activation scale is constant across K, so it is factored out of
+the accumulation; only the weight tile scale is applied per 128-K block. Scales
+are dequant scales (`real ~= fp8 * scale`), matching `weight_scale_inv`, so a
+checkpoint can be fed verbatim with no re-quantization of the weights.
+
+The 1-D `fp8_linear_forward_blockwise_quantized` kernel above is correctness-first
+and does **not** use gfx12 WMMA; the 2-D path does (see the backend table).
+`Adafactor` is a full Python optimizer step with factored second-moment state;
+GPU-side row/column mean-square helpers exist, while a fully fused Adafactor
+update kernel remains a future optimization.
 
 #### Fake-FP8 Linear (autograd-safe, Phase 3)
 
@@ -741,6 +809,9 @@ from hip_quant import (
     fp8_linear_forward_scaled,
     fp8_linear_forward_fp8_weight,
     fp8_linear_forward_blockwise,
+    fp8_linear_forward_blockwise_quantized,
+    fp8_linear_forward_blockwise_2d,
+    fp8_linear_deepseek,
     fp8_linear_backward_input,
     fp8_linear_backward_input_scaled,
     fp8_linear_backward_weight,
@@ -760,6 +831,9 @@ grad_wt_s  = fp8_linear_backward_weight_scaled(grad_output, input, input_scale)
 
 # Correctness-first block-scaled FP8 path, no WMMA requirement
 out_block = fp8_linear_forward_blockwise(input, weight, bias, block_size=32)
+
+# 2-D (128x128 tile) block-scaled FP8 path from a safetensors weight_scale_inv
+out_2d = fp8_linear_deepseek(input, weight_fp8, weight_scale_inv, bias=bias)
 ```
 
 These functions are also used by `Fp8Linear`, `Fp8ScaledLinear`, and
@@ -838,10 +912,9 @@ All PyTorch extension functions are guarded against:
 
 ## 🧪 Running Tests
 
-#### Math tests (no GPU required)
+#### Extension FP8 tests (GPU required)
 ```powershell
-python tests/torch/test_math_fp8.py
-# 90/90 pass — validated against ml_dtypes reference
+& "C:\venvs\medusa_rocm\Scripts\python.exe" -m pytest tests/torch/test_fp8.py -v
 ```
 
 #### Full pipeline tests (CPU mock, no GPU required)
@@ -905,19 +978,26 @@ $env:HIP_QUANT_BUILD_TORCH_EXT = "1"
 Check the artifacts:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine check `
-  "dist\hip_quant-1.3.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.3.0.tar.gz"
+  "dist\hip_quant-2.2.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-2.2.0.tar.gz"
 ```
 
 Upload to PyPI:
 ```powershell
 & "C:\venvs\medusa_rocm\Scripts\python.exe" -m twine upload `
-  "dist\hip_quant-1.3.0-cp312-cp312-win_amd64.whl" `
-  "dist\hip_quant-1.3.0.tar.gz"
+  "dist\hip_quant-2.2.0-cp312-cp312-win_amd64.whl" `
+  "dist\hip_quant-2.2.0.tar.gz"
 ```
 
-Do not upload stale universal wheels such as `hip_quant-1.3.0-py3-none-any.whl`.
+Do not upload stale universal wheels such as `hip_quant-2.2.0-py3-none-any.whl`.
 The Windows wheel is intentionally platform-tagged because it contains DLLs.
+
+Each release publishes two versions from the same sources — `X.Y.Z` (PyTorch
+2.9.x / ROCm 7.2) and `X.Y.Z.post215` (PyTorch 2.15 / TheRock ROCm 7.14). Build
+each in its own venv: `setup_torch.py` picks the ROCm 7.14/TheRock toolchain for
+a `torch.version.hip` of `7.14.*` and `C:\Program Files\AMD\ROCm\<major.minor>`
+otherwise (see the toolchain matrix in `AGENTS.md`). Never build the 2.9.x
+artifact against TheRock, or vice versa.
 
 Suggested release order:
 - Build and run `twine check`
@@ -931,9 +1011,13 @@ Suggested release order:
 
 ```
 hip_quant/
-├── __init__.py              # NumPy / ctypes offline API
+├── __init__.py              # NumPy / ctypes offline API + lazy export table
 ├── __main__.py              # CLI entry point
-├── torch_api.py             # PyTorch FP8 training API (Phases 1–4)
+├── torch_api.py             # PyTorch FP8 / GEMM / attention API (Phases 1-4)
+├── gguf.py                  # Pure-Python GGUF parser
+├── gguf_loader.py           # Streaming GGUF -> VRAM tensor loader
+├── wave_helpers.py          # Drop-in wave attention helpers
+├── smi.py                   # gpu-smi wrapper
 ├── device_info.py           # GPU/DLL compatibility probe helpers
 ├── cdna_compat.py           # CDNA feature table, build configs, CPU refs
 ├── setup_torch.py           # PyTorch C++ extension build script
@@ -944,17 +1028,23 @@ hip_quant/
 ├── kernels/                 # Per-format offline HIP kernels (.cu)
 ├── torch_ext/               # PyTorch extension source
 │   ├── pytorch_bindings.cpp # C++ bindings (TORCH_CHECK, pybind11)
-│   ├── fp8_quant_kernels.hip# Element-wise quant/dequant kernels
-│   ├── mxfp8_kernels.hip    # MXFP8 UE8M0 quant/dequant (OCP, 32-thread warp)
-│   └── fp8_linear_kernels.hip# Tiled FP8 GEMM kernels
-└── tests/torch/             # GPU test suite (pytest)
+│   ├── fp8_quant_kernels.hip       # Element-wise + per-token + block-wise quant
+│   ├── fp8_linear_kernels.hip      # FP8 GEMM: naive + tiled portable + 2-D block scales
+│   ├── fp8_linear_kernels_v2.hip   # gfx12 LDS-staged FP8 WMMA GEMM (incl. 2-D block scales)
+│   ├── mxfp8_kernels.hip           # MXFP8 UE8M0 quant/dequant (OCP, 32-thread warp)
+│   ├── gemv_q_kernels.hip          # GGUF AOT GEMV (K-/I-quants)
+│   ├── hq2_linear_kernels.hip      # HQ2 learned-codebook formats
+│   ├── hq3_linear_kernels.hip      # HQ3 learned-codebook formats
+│   ├── ssm_kernels.hip             # SSM / DeltaNet / fused norms
+│   └── wave_attn*.hip              # WaveAttention FP8 WMMA prefill/decode/backward
+└── tests/                   # pytest suite (CPU pipeline in tests/test_pipeline.py)
 ```
 
 ---
 
 ## 📋 Architecture Notes
 
-- **RDNA4 PyTorch target** — FP8 WMMA extension kernels are compiled with `--offload-arch=gfx1200` and `--offload-arch=gfx1201`
+- **RDNA4 PyTorch target** — release `_C` builds are a multi-arch fatbin for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201` (`HIP_QUANT_ARCH` overrides this; a `gfx1201`-only build is the fast local-dev option). The gfx12 FP8 WMMA kernels require a `gfx1200`/`gfx1201` device at runtime.
 - **Default offline DLL target** — `build.ps1` compiles the portable DLL quantization kernels for `gfx90a`, `gfx942`, RDNA3 `gfx1100`-`gfx1103`, and RDNA4 `gfx1200`/`gfx1201`
 - **Current validation scope** — runtime-tested locally on `gfx1201` RX 9070 XT; `gfx1200` and CDNA code objects are build-validated and need separate hardware runtime validation
 - **BF16/FP16 PyTorch support** — FP8 quantization and linear kernels accept FP32, FP16, and BF16 tensors, accumulating in FP32 registers and storing results in the input/master dtype
