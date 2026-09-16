@@ -142,6 +142,20 @@ self-consistent snapshot** — a torch 2.15 user checks out the `.post215` tag
 `gfx1201`) for a fast single-arch dev build. Release builds use the default
 (multi-arch fatbin).
 
+**Device enumeration differs between the two runtimes.** The torch 2.9.1 venv
+sees only the RX 9070 XT (device 0). Under the torch 2.15 / TheRock runtime the
+**integrated GPU is device 0 and the 9070 XT is device 1**, so the first kernel
+launch on device 0 fails with `hipErrorInvalidImage` ("device kernel image is
+invalid") — there is no code image for the iGPU. Select the dGPU explicitly:
+```powershell
+$env:HIP_VISIBLE_DEVICES='1'   # TheRock/torch 2.15 runtime
+```
+
+`setup_torch.py` honours `HIP_QUANT_ROCM_HOME`/`ROCM_HOME`/`ROCM_PATH`/`HIP_PATH`
+first, then falls back to the torch-version heuristic. A globally-exported
+`HIP_PATH=C:\Program Files\AMD\ROCm\7.2` therefore wins over TheRock — set
+`HIP_QUANT_ROCM_HOME=C:\TheRock\build` to force the 7.14 toolchain.
+
 ### Release steps
 1. Bump `__version__` (`__init__.py`) and `pyproject.toml` `version`; update the
    `## What's New` README section.
