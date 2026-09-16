@@ -14,6 +14,14 @@
 
 `hip-quant` is a standalone Python library and highly optimized HIP C++ backend for tensor quantization and accelerated LLM inference on AMD GPUs with zero CPU round-trips.
 
+## 🌟 What's New in 2.2.0
+
+> **2.2.0.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). Use it if `2.2.0` reports a torch ABI mismatch on import.
+
+- **🧱 vLLM/DeepSeek 2-D block-scaled FP8 linear**: `fp8_linear_deepseek` / `fp8_linear_forward_blockwise_2d` consume a safetensors `weight_scale_inv` (`weight_block_size [128, 128]`) directly — one dequant scale per 128×128 weight tile — with dynamic per-token activation quantization (`quantize_e4m3_per_token`, `amax/448`). Backends are chosen at runtime: gfx12 FP8 WMMA, a tiled portable kernel, or a naive reference.
+- **⚡ Tiled portable FP8 GEMM**: an LDS-tiled `64×64×32` microkernel with exact fp8→fp16 shared-memory decode. No matrix intrinsics, so it runs on any AMD GPU, and it is ~100× faster than the naive reference.
+- **🎯 IQ2_S dot2 decode GEMV**: M=1 decode now uses a half-wave-per-row f16 dot2 kernel, plus a benchmark-only variant hook (`gemv_q_forward_variant`, `tests/bench_iq2s_variants.py`).
+
 ## 🌟 What's New in 2.1.0
 
 > **2.1.0.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). Use it if `2.1.0` reports a torch ABI mismatch on import.

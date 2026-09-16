@@ -222,6 +222,172 @@ void fp8_gemm_v2_input_weight_fp8_kernel(
 
 
 // ---------------------------------------------------------------------------
+// gfx12 FP8 WMMA variant of the DeepSeek/vLLM-style 2-D block-scaled GEMM.
+//
+//   C[m,n] = A_scale[m] * sum_kb W_scale[n/block_n, kb] * <A[m,:], B[n,:]>_kb
+//
+// A K-stage here is exactly K_STAGE_ELEMS = 128 K-elements, i.e. one weight
+// scale tile in K, so a stage's WMMA accumulator is flushed (scaled by
+// W_scale[n/block_n, k_stage]) into a running total.  The per-token A scale
+// is constant across K, so it is applied once at store time.  Requires
+// block_k == K_STAGE_ELEMS and block_n a multiple of TILE_N (caller-checked).
+// ---------------------------------------------------------------------------
+template<int M_TILES, int N_WAVES>
+__global__
+__launch_bounds__(N_WAVES * 32, 1)
+void fp8_gemm_v2_blockwise_2d_kernel(
+    const uint8_t * __restrict__ A_fp8,
+    const float   * __restrict__ A_scales,   // [M]                 per-token
+    const uint8_t * __restrict__ B_fp8,
+    const float   * __restrict__ B_scales,   // [N/block_n, K/128]
+    void          * __restrict__ C,
+    const void    * __restrict__ bias,
+    int M, int N, int K,
+    int k_blocks, int block_n,
+    int c_dtype, int bias_dtype, bool has_bias
+) {
+    const cg::thread_block cta = cg::this_thread_block();
+    const cg::thread_group wmma_wave = cg::tiled_partition(cta, 32);
+    const int wave = cta.thread_rank() >> 5;
+    const int tid = wmma_wave.thread_rank();
+
+    int m = blockIdx.y * (M_TILES * TILE_M);
+    int n_tile = blockIdx.x * N_WAVES + wave;
+    int n = n_tile * TILE_N;
+    bool valid_wave = (m < M && n < N);
+
+    int lane_wrapped = tid & 15;
+    int lane_group   = tid >> 4;
+
+    v8f total[M_TILES];
+    #pragma unroll
+    for (int mt = 0; mt < M_TILES; ++mt) total[mt] = (v8f){};
+
+    __shared__ uint32_t A_lds[M_TILES * TILE_M][LDS_ROW_WORDS];
+    __shared__ uint32_t B_lds[N_WAVES * TILE_N][LDS_ROW_WORDS];
+
+    int linear_tid = threadIdx.x;
+    constexpr int block_threads = N_WAVES * 32;
+    constexpr int a_stage_words = M_TILES * TILE_M * (K_STAGE_ELEMS / 4);
+
+    const int n_block = (n_tile * TILE_N) / block_n;
+
+    int k_stage = 0;
+    for (int k_start = 0; k_start < K; k_start += K_STAGE_ELEMS, ++k_stage) {
+
+        // ---------- cooperative load  A  ----------
+        for (int a_idx = linear_tid; a_idx < a_stage_words; a_idx += block_threads) {
+            int a_row = a_idx / (K_STAGE_ELEMS / 4);
+            int a_word = a_idx % (K_STAGE_ELEMS / 4);
+            int a_col = a_word * 4;
+            int global_row = m + a_row;
+            uint32_t a_val = 0;
+            if (global_row < M) {
+                int64_t global_off = (int64_t)global_row * K + k_start + a_col;
+                a_val = load_fp8_word(A_fp8, global_off, K - k_start - a_col);
+            }
+            A_lds[a_row][a_word] = a_val;
+        }
+
+        // ---------- cooperative load  B  ----------
+        for (int pass = 0; pass < 16; pass++) {
+            int b_idx = pass * block_threads + linear_tid;
+            int b_row = b_idx / (K_STAGE_ELEMS / 4);
+            int b_word = b_idx % (K_STAGE_ELEMS / 4);
+            int b_col = b_word * 4;
+
+            int wave_idx = b_row >> 4;
+            int n_off    = b_row & 15;
+            int global_n = (blockIdx.x * N_WAVES + wave_idx) * TILE_N + n_off;
+            uint32_t b_val = 0;
+            if (global_n < N) {
+                int64_t global_off = (int64_t)global_n * K + k_start + b_col;
+                b_val = load_fp8_word(B_fp8, global_off, K - k_start - b_col);
+            }
+            B_lds[b_row][b_word] = b_val;
+        }
+
+        cta.sync();
+
+        // ---------- compute one stage into a fresh accumulator ----------
+        if (valid_wave) {
+            wmma_wave.sync();
+            v8f stage[M_TILES];
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) stage[mt] = (v8f){};
+
+            for (int kt = 0; kt < K_TILES_PER_STAGE; kt++) {
+                int word = kt * (TILE_K / 4) + lane_group * 2;
+                v2i b_vec = (v2i){
+                    (int)B_lds[wave * TILE_N + lane_wrapped][word],
+                    (int)B_lds[wave * TILE_N + lane_wrapped][word + 1]
+                };
+                #pragma unroll
+                for (int mt = 0; mt < M_TILES; ++mt) {
+                    if (m + mt * TILE_M < M) {
+                        v2i a_vec = (v2i){
+                            (int)A_lds[mt * TILE_M + lane_wrapped][word],
+                            (int)A_lds[mt * TILE_M + lane_wrapped][word + 1]
+                        };
+                        #if defined(__gfx1200__) || defined(__gfx1201__)
+                        stage[mt] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            a_vec, b_vec, stage[mt]);
+                        #endif
+                    }
+                }
+            }
+
+            const float w_scale = B_scales[(int64_t)n_block * k_blocks + k_stage];
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) total[mt][i] += stage[mt][i] * w_scale;
+            }
+            wmma_wave.sync();
+        }
+
+        cta.sync();
+    }
+
+    // ---------- store  C  ----------
+    if (valid_wave) {
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int row = m + mt * TILE_M + lane_group * 8 + i;
+                int col = n + lane_wrapped;
+                if (row < M && col < N) {
+                    float value = total[mt][i] * A_scales[row];
+                    if (has_bias) value += load_float_input(bias, bias_dtype, col);
+                    store_float_output(C, c_dtype, (int64_t)row * N + col, value);
+                }
+            }
+        }
+    }
+    __threadfence_block();
+}
+
+template<int M_TILES>
+static void launch_fp8_gemm_v2_blockwise_2d_configured(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n,
+    int c_dtype, int bias_dtype, bool has_bias, hipStream_t stream
+) {
+    constexpr int n_waves = MAX_WAVES_PER_BLOCK;
+    constexpr int n_per_block = TILE_N * n_waves;
+    dim3 block(n_waves * 32);
+    dim3 grid((N + n_per_block - 1) / n_per_block,
+              (M + M_TILES * TILE_M - 1) / (M_TILES * TILE_M));
+    hipLaunchKernelGGL((fp8_gemm_v2_blockwise_2d_kernel<M_TILES, n_waves>),
+                       grid, block, 0, stream, A_fp8, A_scales, B_fp8, B_scales,
+                       C, bias, M, N, K, k_blocks, block_n, c_dtype, bias_dtype, has_bias);
+}
+
+
+// ---------------------------------------------------------------------------
 // C-linkage launch helpers (called from pytorch_bindings_hip.cpp)
 // ---------------------------------------------------------------------------
 static int current_device_cu_count() {
@@ -469,6 +635,26 @@ void launch_fp8_linear_forward_v2_input_weight(
     } else {
         launch_fp8_gemm_v2_configured<1, MAX_WAVES_PER_BLOCK>(
             A_fp8, B_fp8, C, bias, M, N, K, out_scale,
+            c_dtype, bias_dtype, has_bias, stream);
+    }
+}
+
+void launch_fp8_linear_forward_blockwise_2d_wmma(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream
+) {
+    (void)block_k;  // callers guarantee block_k == K_STAGE_ELEMS
+    if (M > TILE_M) {
+        launch_fp8_gemm_v2_blockwise_2d_configured<M_TILES_PER_BLOCK>(
+            A_fp8, A_scales, B_fp8, B_scales, C, bias, M, N, K, k_blocks, block_n,
+            c_dtype, bias_dtype, has_bias, stream);
+    } else {
+        launch_fp8_gemm_v2_blockwise_2d_configured<1>(
+            A_fp8, A_scales, B_fp8, B_scales, C, bias, M, N, K, k_blocks, block_n,
             c_dtype, bias_dtype, has_bias, stream);
     }
 }

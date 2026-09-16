@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "2.1.0.post215"
+__version__ = "2.2.0"
 
 
 _TORCH_EXPORTS = {
@@ -38,6 +38,7 @@ _TORCH_EXPORTS = {
     "quantize_e5m2_transpose",
     "quantize_e5m2_stochastic",
     "quantize_e4m3_blockwise",
+    "quantize_e4m3_per_token",
     "quantize_e5m2_blockwise",
     "quantize_e5m2_blockwise_stochastic",
     "refresh_fp8_blockwise_shadow",
@@ -57,6 +58,8 @@ _TORCH_EXPORTS = {
     "fp8_linear_forward_fp8_input_weight_packed",
     "fp8_linear_forward_blockwise",
     "fp8_linear_forward_blockwise_quantized",
+    "fp8_linear_forward_blockwise_2d",
+    "fp8_linear_deepseek",
     "fp8_linear_backward_input",
     "fp8_linear_backward_input_scaled",
     "fp8_linear_backward_weight",

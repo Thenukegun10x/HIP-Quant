@@ -16,6 +16,7 @@
 // and BF8/BF8 WMMA variants, not a mixed BF8/FP8 WMMA variant.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include "../hip_quant_util.h"
 
 #define HIP_QUANT_DTYPE_F32  0
@@ -284,6 +285,191 @@ void fp8_gemm_e4m3_blockwise_naive_kernel(
 
     if (has_bias) acc += load_float_input(bias, bias_dtype, n);
     store_float_output(C, c_dtype, idx, acc);
+}
+
+// Portable (no matrix-intrinsic) GEMM for DeepSeek/vLLM-style 2-D block
+// scales: activations carry one dynamic dequant scale per row, weights one
+// dequant scale per (block_n x block_k) tile.
+//
+//   C[m,n] = A_scale[m] * sum_kb  W_scale[n/block_n, kb] * <A[m,:], B[n,:]>_kb
+//
+// The per-token A scale is constant across kb, so it is factored out of the
+// accumulation.  This kernel is the correctness reference for the gfx12 WMMA
+// path and the fallback on architectures without an FP8 matrix instruction.
+__global__
+__launch_bounds__(256, 4)
+void fp8_gemm_e4m3_blockwise_2d_naive_kernel(
+    const uint8_t * __restrict__ A_fp8,
+    const float   * __restrict__ A_scales,   // [M]         per-token
+    const uint8_t * __restrict__ B_fp8,
+    const float   * __restrict__ B_scales,   // [N/block_n, K/block_k]
+    void          * __restrict__ C,
+    const void    * __restrict__ bias,
+    int M, int N, int K,
+    int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)M * N;
+    if (idx >= total) return;
+
+    int m = (int)(idx / N);
+    int n = (int)(idx - (int64_t)m * N);
+
+    const float a_scale = A_scales[m];
+    const float * w_scales = B_scales + (int64_t)(n / block_n) * k_blocks;
+    const uint8_t * a_row = A_fp8 + (int64_t)m * K;
+    const uint8_t * b_row = B_fp8 + (int64_t)n * K;
+
+    float acc = 0.0f;
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        int k_start = kb * block_k;
+        int k_end = k_start + block_k;
+        if (k_end > K) k_end = K;
+        float partial = 0.0f;
+        for (int k = k_start; k < k_end; ++k) {
+            partial += fp8_e4m3_to_fp32(a_row[k]) * fp8_e4m3_to_fp32(b_row[k]);
+        }
+        acc += partial * w_scales[kb];
+    }
+    acc *= a_scale;
+
+    if (has_bias) acc += load_float_input(bias, bias_dtype, n);
+    store_float_output(C, c_dtype, idx, acc);
+}
+
+// ---------------------------------------------------------------------------
+// Tiled portable GEMM for the same 2-D block-scaled layout.  Same math as the
+// naive kernel above, but output-tiled and staged in shared memory so global
+// traffic drops ~32x and the inner loop reads decoded fp16 from LDS instead of
+// running a branchy per-byte E4M3 decode.
+//
+//   block tile BM x BN, K chunk BK; each thread owns a TM x TN micro-tile.
+//   fp8 -> fp16 is exact (E4M3 has 3 mantissa bits; max 448 << 65504), so the
+//   shared-memory decode loses nothing.  No matrix intrinsics: any AMD GPU.
+//
+// Requires block_k % BK == 0 and block_n % BN == 0 (true for the [128,128]
+// DeepSeek/vLLM layout); the launcher only selects this when that holds.
+// M, N, K may be non-multiples of the tile.
+// ---------------------------------------------------------------------------
+#define BLK_BM 64
+#define BLK_BN 64
+#define BLK_BK 32
+// Row stride BK + 2 halves = 17 words: consecutive rows advance by an odd
+// number of LDS words, so operand reads sweep all 32 banks instead of
+// aliasing onto a few.
+#define BLK_LDS_STRIDE (BLK_BK + 2)
+
+__global__
+__launch_bounds__(256, 2)
+void fp8_gemm_e4m3_blockwise_2d_tiled_kernel(
+    const uint8_t * __restrict__ A_fp8,
+    const float   * __restrict__ A_scales,   // [M]         per-token
+    const uint8_t * __restrict__ B_fp8,
+    const float   * __restrict__ B_scales,   // [N/block_n, K/block_k]
+    void          * __restrict__ C,
+    const void    * __restrict__ bias,
+    int M, int N, int K,
+    int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias
+) {
+    constexpr int TM = BLK_BM / 16;
+    constexpr int TN = BLK_BN / 16;
+    const int tx = threadIdx.x & 15;   // n direction
+    const int ty = threadIdx.x >> 4;   // m direction
+
+    const int m_block = blockIdx.y * BLK_BM;
+    const int n_block = blockIdx.x * BLK_BN;
+    // A BN-wide slab of columns lies inside a single block_n column tile.
+    const int w_row = n_block / block_n;
+
+    __shared__ half lut[256];
+    __shared__ half A_s[BLK_BM][BLK_LDS_STRIDE];
+    __shared__ half B_s[BLK_BN][BLK_LDS_STRIDE];
+
+    // fp8 -> fp16 is exact, so the decoded operand keeps full E4M3 precision.
+    lut[threadIdx.x] = __float2half(fp8_e4m3_to_fp32((uint8_t)threadIdx.x));
+    __syncthreads();
+
+    float total[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) total[i][j] = 0.0f;
+
+    const int m0 = m_block + ty * TM;
+    const int n0 = n_block + tx * TN;
+
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        const int k_base = kb * block_k;
+        float acc[TM][TN];
+        #pragma unroll
+        for (int i = 0; i < TM; ++i)
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+        for (int kc = 0; kc < block_k; kc += BLK_BK) {
+            for (int i = threadIdx.x; i < BLK_BM * BLK_BK; i += 256) {
+                int r = i / BLK_BK;
+                int c = i - r * BLK_BK;
+                int gm = m_block + r;
+                int gk = k_base + kc + c;
+                half v = __float2half(0.0f);
+                if (gm < M && gk < K) v = lut[A_fp8[(int64_t)gm * K + gk]];
+                A_s[r][c] = v;
+            }
+            for (int i = threadIdx.x; i < BLK_BN * BLK_BK; i += 256) {
+                int r = i / BLK_BK;
+                int c = i - r * BLK_BK;
+                int gn = n_block + r;
+                int gk = k_base + kc + c;
+                half v = __float2half(0.0f);
+                if (gn < N && gk < K) v = lut[B_fp8[(int64_t)gn * K + gk]];
+                B_s[r][c] = v;
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int k = 0; k < BLK_BK; ++k) {
+                half a_reg[TM];
+                half b_reg[TN];
+                #pragma unroll
+                for (int i = 0; i < TM; ++i) a_reg[i] = A_s[ty * TM + i][k];
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) b_reg[j] = B_s[tx * TN + j][k];
+                #pragma unroll
+                for (int i = 0; i < TM; ++i) {
+                    float av = __half2float(a_reg[i]);
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j)
+                        acc[i][j] = fmaf(av, __half2float(b_reg[j]), acc[i][j]);
+                }
+            }
+            __syncthreads();
+        }
+
+        const float w_scale = B_scales[(int64_t)w_row * k_blocks + kb];
+        #pragma unroll
+        for (int i = 0; i < TM; ++i)
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                total[i][j] += acc[i][j] * w_scale;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int gm = m0 + i;
+        if (gm >= M) continue;
+        const float a_scale = A_scales[gm];
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int gn = n0 + j;
+            if (gn >= N) continue;
+            float value = total[i][j] * a_scale;
+            if (has_bias) value += load_float_input(bias, bias_dtype, gn);
+            store_float_output(C, c_dtype, (int64_t)gm * N + gn, value);
+        }
+    }
 }
 
 // Same forward GEMM, but both A and B are already scaled E4M3 bytes.
@@ -838,6 +1024,43 @@ void launch_fp8_linear_forward_blockwise(
                        dim3((uint32_t)blocks64), dim3(threads), 0, stream,
                        A_fp8, A_scales, B_fp8, B_scales, C, bias,
                        M, N, K, blocks_per_row, block_size,
+                       c_dtype, bias_dtype, has_bias);
+}
+
+void launch_fp8_linear_forward_blockwise_2d(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream
+) {
+    int64_t total = (int64_t)M * N;
+    if (total == 0) return;
+    int threads = 256;
+    int64_t blocks64 = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(fp8_gemm_e4m3_blockwise_2d_naive_kernel,
+                       dim3((uint32_t)blocks64), dim3(threads), 0, stream,
+                       A_fp8, A_scales, B_fp8, B_scales, C, bias,
+                       M, N, K, k_blocks, block_n, block_k,
+                       c_dtype, bias_dtype, has_bias);
+}
+
+void launch_fp8_linear_forward_blockwise_2d_tiled(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream
+) {
+    if (M == 0 || N == 0) return;
+    dim3 block(256);
+    dim3 grid((N + BLK_BN - 1) / BLK_BN, (M + BLK_BM - 1) / BLK_BM);
+    hipLaunchKernelGGL(fp8_gemm_e4m3_blockwise_2d_tiled_kernel,
+                       grid, block, 0, stream,
+                       A_fp8, A_scales, B_fp8, B_scales, C, bias,
+                       M, N, K, k_blocks, block_n, block_k,
                        c_dtype, bias_dtype, has_bias);
 }
 

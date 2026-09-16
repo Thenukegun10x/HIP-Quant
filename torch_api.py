@@ -641,6 +641,18 @@ def quantize_e4m3_blockwise(
     return _load_extension().quantize_e4m3_blockwise(x.contiguous(), int(block_size))
 
 
+def quantize_e4m3_per_token(
+    x: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Dynamic per-token FP8 E4M3 quantization (the vLLM/DeepSeek activation scheme).
+
+    Returns ``(fp8_bytes, scales)``. For an input shape ``[..., K]``, ``scales``
+    has shape ``[...]`` — one FP32 dequant scale per row — and ``real ~= fp8 * scale``.
+    Unlike :func:`quantize_e4m3_blockwise` the scale is shared across the whole row.
+    """
+    return _load_extension().quantize_e4m3_per_token(x.contiguous())
+
+
 def quantize_e5m2_blockwise(
     x: "torch.Tensor",
     block_size: int = 32,
@@ -2687,6 +2699,70 @@ def fp8_linear_forward_blockwise(
         input_fp8, input_scales, weight_fp8, weight_scales,
         input_2d, block_size, bias
     )
+
+
+_FP8_BLOCKWISE_2D_BACKENDS = {"auto": 0, "portable": 1, "wmma": 2, "reference": 3}
+
+
+def fp8_linear_forward_blockwise_2d(
+    input_fp8:           "torch.Tensor",
+    input_scale:         "torch.Tensor",
+    weight_fp8:          "torch.Tensor",
+    weight_scale_inv:    "torch.Tensor",
+    output_dtype_source: "torch.Tensor",
+    block_size:          int = 128,
+    backend:             str = "auto",
+    bias:                Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Fused FP8 linear with a per-token activation scale and 2-D weight scale tiles.
+
+    ``weight_scale_inv`` is ``[N/block_size, K/block_size]`` (e.g. the
+    safetensors ``weight_scale_inv`` of a DeepSeek/vLLM ``weight_block_size``
+    ``[128, 128]`` checkpoint) and ``input_scale`` is ``[M]``. Computes
+    ``C[m,n] = input_scale[m] * sum_kb W_scale[n/b, kb] * <A[m,:], B[n,:]>_kb``.
+
+    ``backend`` selects the implementation: ``"auto"`` uses the gfx12 WMMA
+    kernel when the shape allows and falls back to the tiled portable kernel
+    otherwise; ``"portable"`` forces the tiled portable kernel, ``"wmma"``
+    forces gfx12 WMMA, and ``"reference"`` forces the slow always-correct
+    naive kernel (testing only).
+    """
+    try:
+        backend_code = _FP8_BLOCKWISE_2D_BACKENDS[backend]
+    except KeyError:
+        raise ValueError(
+            f"backend must be one of {sorted(_FP8_BLOCKWISE_2D_BACKENDS)}, got {backend!r}"
+        ) from None
+    return _load_extension().fp8_linear_forward_blockwise_2d(
+        input_fp8.contiguous(), input_scale.contiguous(),
+        weight_fp8.contiguous(), weight_scale_inv.contiguous(),
+        output_dtype_source, int(block_size), backend_code, bias
+    )
+
+
+def fp8_linear_deepseek(
+    input:            "torch.Tensor",
+    weight_fp8:       "torch.Tensor",
+    weight_scale_inv: "torch.Tensor",
+    bias:             Optional["torch.Tensor"] = None,
+    block_size:       int = 128,
+    backend:          str = "auto",
+) -> "torch.Tensor":
+    """DeepSeek/vLLM FP8 blockwise linear from a safetensors checkpoint.
+
+    ``weight_fp8`` is ``[N, K]`` E4M3 and ``weight_scale_inv`` is
+    ``[N/block_size, K/block_size]`` F32 with ``real = fp8 * weight_scale_inv``
+    (the ``_inv`` suffix means it is already a dequant scale). ``input`` is
+    quantized dynamically per token, matching ``activation_scheme: "dynamic"``.
+    """
+    orig_shape = input.shape
+    input_2d = input.reshape(-1, orig_shape[-1]).contiguous()
+    input_fp8, input_scale = quantize_e4m3_per_token(input_2d)
+    out = fp8_linear_forward_blockwise_2d(
+        input_fp8, input_scale, weight_fp8, weight_scale_inv,
+        input_2d, block_size, backend, bias,
+    )
+    return out.reshape(*orig_shape[:-1], out.size(-1))
 
 
 def fp8_linear_backward_input(

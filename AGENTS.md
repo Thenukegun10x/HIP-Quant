@@ -112,3 +112,40 @@ health profiler — use it before theorizing about tok/s.
   "C:\venvs\medusa_rocm\Scripts\python.exe" setup_torch.py build_ext --inplace
   ```
   Expect `temp.win-amd64-cpython-312` and `Hostx64\x64\link.exe`.
+
+## Release & toolchain matrix
+Two PyTorch ABIs ship from one source tree. `setup_torch.py:58` auto-selects the
+ROCm toolchain from `torch.version.hip`: `7.14.*` (TheRock) → `C:/TheRock/build`,
+otherwise `C:/Program Files/AMD/ROCm/<major.minor>`. **Never build the 2.9.x
+artifact against TheRock (or vice versa)** — the extension links the HIP ABI and
+will fail to load with an ABI mismatch. The two venvs are independent; the build
+only mutates `PATH`/env for its own process, so neither breaks the other.
+
+| | torch 2.9.1 build (main) | torch 2.15 build (post215) |
+|---|---|---|
+| Venv | `C:\venvs\medusa_rocm\Scripts\python.exe` | `C:\Users\armor\Desktop\AI pipeline\.venv\Scripts\python.exe` |
+| torch | `2.9.1+rocm7.2.1` | `2.15.0a0+gitf07882e` |
+| HIP | `7.2.53211-158bd99533` | `7.14.60850` |
+| ROCm toolchain | `C:\Program Files\AMD\ROCm\7.2` (venv also has pip `rocm-sdk 7.2.1`) | `C:\TheRock\build` (TheRock 7.14.0; tarball `C:\TheRock\therock-dist-windows-gfx120X-all-7.14.0.tar.gz`) |
+| Version | `X.Y.Z` | `X.Y.Z.post215` |
+| Git tag | `vX.Y.Z` | `vX.Y.Z.post215` |
+| Local backup | `_C.cp312-win_amd64.torch29.pyd` | `_C.cp312-win_amd64.torch215.pyd` |
+
+Only `_C.cp312-win_amd64.pyd` is tracked, and it is what `_load_extension()` imports
+(`torch_api.py:431`). The `.torch29.pyd` / `.torch215.pyd` files are gitignored
+local backups swapped in/out by hand. **Each release tag is a complete,
+self-consistent snapshot** — a torch 2.15 user checks out the `.post215` tag
+(e.g. `v2.1.0` = 2.9.1, `v2.1.0.post215` = 2.15).
+
+`HIP_QUANT_ARCH` overrides the default 8-arch list
+(`gfx90a,gfx942,gfx1100,gfx1101,gfx1102,gfx1103,gfx1200,gfx1201`); set it (e.g.
+`gfx1201`) for a fast single-arch dev build. Release builds use the default
+(multi-arch fatbin).
+
+### Release steps
+1. Bump `__version__` (`__init__.py`) and `pyproject.toml` `version`; update the
+   `## What's New` README section.
+2. In the 2.9.1 venv (default multi-arch), build, copy the result over
+   `_C.cp312-win_amd64.pyd`, commit, tag `vX.Y.Z`, push.
+3. Bump to `X.Y.Z.post215`, build in the 2.15 venv (auto-uses TheRock), copy over
+   the tracked `_C`, commit, tag `vX.Y.Z.post215`, push.

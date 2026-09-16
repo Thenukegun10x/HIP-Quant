@@ -411,6 +411,56 @@ void quant_blockwise_kernel_t(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic per-token E4M3 quantize: one dequant scale for the whole row
+// (real ~= fp8_value * scale).  This is the activation scheme used by
+// DeepSeek/vLLM FP8 checkpoints; it is the 1xK degenerate case of the
+// block-wise kernel above, but block_size is unconstrained here.
+// ---------------------------------------------------------------------------
+template <int DTYPE>
+__global__
+__launch_bounds__(256, 4)
+void quant_e4m3_per_token_kernel_t(
+    const void  * __restrict__ src,
+    uint8_t     * __restrict__ dst,
+    float       * __restrict__ scales,
+    int64_t       rows,
+    int64_t       cols
+) {
+    int64_t row = (int64_t)blockIdx.x;
+    if (row >= rows) return;
+
+    __shared__ float shared_max[256];
+    float local_max = 0.0f;
+    int64_t base = row * cols;
+    for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        float v = load_float_input_t<DTYPE>(src, base + col);
+        float av = fabsf(v);
+        if (isfinite(av) && av > local_max) local_max = av;
+    }
+
+    shared_max[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float other = shared_max[threadIdx.x + stride];
+            if (other > shared_max[threadIdx.x]) shared_max[threadIdx.x] = other;
+        }
+        __syncthreads();
+    }
+
+    float amax = shared_max[0];
+    float scale = amax > 0.0f ? (amax / 448.0f) : 1.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+    __syncthreads();
+
+    float inv_scale = 1.0f / scale;
+    for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        dst[base + col] = fp32_to_fp8_e4m3(load_float_input_t<DTYPE>(src, base + col) * inv_scale);
+    }
+}
+
 template <int DTYPE>
 __global__
 __launch_bounds__(256, 4)
@@ -765,6 +815,24 @@ void launch_quant_e4m3_blockwise(const void* src, uint8_t* dst, float* scales,
         hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_blockwise_kernel_t<HIP_QUANT_DTYPE_F32, false>),
                            dim3(grid), dim3(256), 0, stream,
                            src, dst, scales, rows, cols, blocks_per_row, block_size);
+    }
+}
+
+void launch_quant_e4m3_per_token(const void* src, uint8_t* dst, float* scales,
+                                 int64_t rows, int64_t cols, int dtype,
+                                 hipStream_t stream) {
+    if (rows == 0 || cols == 0) return;
+    assert(rows <= (int64_t)0xFFFFFFFFu);
+    dim3 grid((uint32_t)rows);
+    if (dtype == HIP_QUANT_DTYPE_F16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_per_token_kernel_t<HIP_QUANT_DTYPE_F16>),
+                           grid, dim3(256), 0, stream, src, dst, scales, rows, cols);
+    } else if (dtype == HIP_QUANT_DTYPE_BF16) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_per_token_kernel_t<HIP_QUANT_DTYPE_BF16>),
+                           grid, dim3(256), 0, stream, src, dst, scales, rows, cols);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_e4m3_per_token_kernel_t<HIP_QUANT_DTYPE_F32>),
+                           grid, dim3(256), 0, stream, src, dst, scales, rows, cols);
     }
 }
 

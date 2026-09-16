@@ -94,6 +94,8 @@ void launch_dequant_e5m2(const uint8_t* src, float* dst, int64_t numel,
 void launch_quant_e4m3_blockwise(const void* src, uint8_t* dst, float* scales,
                                  int64_t rows, int64_t cols, int64_t blocks_per_row,
                                  int block_size, int dtype, hipStream_t stream);
+void launch_quant_e4m3_per_token(const void* src, uint8_t* dst, float* scales,
+                                 int64_t rows, int64_t cols, int dtype, hipStream_t stream);
 void launch_quant_e5m2_blockwise(const void* src, uint8_t* dst, float* scales,
                                  int64_t rows, int64_t cols, int64_t blocks_per_row,
                                  int block_size, int dtype, hipStream_t stream);
@@ -158,6 +160,27 @@ void launch_fp8_linear_forward_blockwise(
     const uint8_t* B_fp8, const float* B_scales,
     void* C, const void* bias,
     int M, int N, int K, int blocks_per_row, int block_size,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream);
+void launch_fp8_linear_forward_blockwise_2d(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream);
+void launch_fp8_linear_forward_blockwise_2d_wmma(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
+    int c_dtype, int bias_dtype, bool has_bias,
+    hipStream_t stream);
+void launch_fp8_linear_forward_blockwise_2d_tiled(
+    const uint8_t* A_fp8, const float* A_scales,
+    const uint8_t* B_fp8, const float* B_scales,
+    void* C, const void* bias,
+    int M, int N, int K, int k_blocks, int block_n, int block_k,
     int c_dtype, int bias_dtype, bool has_bias,
     hipStream_t stream);
 
@@ -852,6 +875,15 @@ static inline void check_gfx12_fp8_wmma_runtime(const char* op_name) {
                 ".");
 }
 
+// Pure capability probe (no throwing): used to pick a GEMM backend.
+static inline bool device_is_gfx12() {
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device) != hipSuccess) return false;
+    return strstr(props.gcnArchName, "gfx12") != nullptr;
+}
+
 struct BiasLaunch {
     const void* ptr;
     int dtype;
@@ -1124,6 +1156,30 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_e4m3_blockwise(
     launch_quant_e4m3_blockwise(
         input.data_ptr(), output.data_ptr<uint8_t>(), scales.data_ptr<float>(),
         rows, cols, blocks_per_row, iBlock, input_dtype, current_stream());
+    return std::make_tuple(output, scales);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_e4m3_per_token(
+    torch::Tensor input
+) {
+    TORCH_CHECK(input.is_cuda(),       "quantize_e4m3_per_token: input must be a HIP/CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "quantize_e4m3_per_token: input must be contiguous");
+    TORCH_CHECK(input.dim() >= 1,      "quantize_e4m3_per_token: input must have at least one dimension");
+    int input_dtype = float_dtype_code(input, "quantize_e4m3_per_token: input");
+
+    int64_t cols = input.size(input.dim() - 1);
+    TORCH_CHECK(cols > 0, "quantize_e4m3_per_token: last dimension must be non-empty");
+    int64_t rows = input.numel() / cols;
+    TORCH_CHECK(rows <= (int64_t)0xFFFFFFFFu,
+                "quantize_e4m3_per_token: row grid exceeds HIP dim3 limit");
+
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kUInt8));
+    std::vector<int64_t> scale_sizes(input.sizes().begin(), input.sizes().end() - 1);
+    auto scales = torch::empty(scale_sizes, input.options().dtype(torch::kFloat32));
+
+    launch_quant_e4m3_per_token(
+        input.data_ptr(), output.data_ptr<uint8_t>(), scales.data_ptr<float>(),
+        rows, cols, input_dtype, current_stream());
     return std::make_tuple(output, scales);
 }
 
@@ -2349,6 +2405,114 @@ torch::Tensor fp8_linear_forward_blockwise(
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeek/vLLM-style FP8 linear: a dynamic per-token activation scale times
+// 2-D (block_n x block_k) weight dequant-scale tiles, i.e. directly consuming
+// a safetensors `weight_scale_inv` of shape [N/block, K/block].
+//
+//   C[m,n] = input_scale[m] * sum_kb W_scale[n/block_n, kb] * <A[m,:], B[n,:]>_kb
+//
+// backend: 0 = auto (gfx12 WMMA when the shape allows, else tiled portable),
+//          1 = force the tiled portable kernel,
+//          2 = force gfx12 WMMA (errors if the shape/arch cannot support it),
+//          3 = force the naive reference kernel (slow, testing only).
+// ---------------------------------------------------------------------------
+torch::Tensor fp8_linear_forward_blockwise_2d(
+    torch::Tensor input_fp8,
+    torch::Tensor input_scale,
+    torch::Tensor weight_fp8,
+    torch::Tensor weight_scale_inv,
+    torch::Tensor output_dtype_source,
+    int64_t block_size,
+    int64_t backend,
+    c10::optional<torch::Tensor> bias
+) {
+    TORCH_CHECK(input_fp8.is_cuda() && input_fp8.is_contiguous(),
+                "fp8_linear_forward_blockwise_2d: input_fp8 must be a contiguous CUDA tensor");
+    TORCH_CHECK(input_scale.is_cuda() && input_scale.is_contiguous(),
+                "fp8_linear_forward_blockwise_2d: input_scale must be a contiguous CUDA tensor");
+    TORCH_CHECK(weight_fp8.is_cuda() && weight_fp8.is_contiguous(),
+                "fp8_linear_forward_blockwise_2d: weight_fp8 must be a contiguous CUDA tensor");
+    TORCH_CHECK(weight_scale_inv.is_cuda() && weight_scale_inv.is_contiguous(),
+                "fp8_linear_forward_blockwise_2d: weight_scale_inv must be a contiguous CUDA tensor");
+    TORCH_CHECK(output_dtype_source.is_cuda(),
+                "fp8_linear_forward_blockwise_2d: output_dtype_source must be a CUDA tensor");
+    TORCH_CHECK(input_fp8.scalar_type() == torch::kUInt8 && weight_fp8.scalar_type() == torch::kUInt8,
+                "fp8_linear_forward_blockwise_2d: FP8 inputs must be uint8");
+    TORCH_CHECK(input_scale.scalar_type() == torch::kFloat32 &&
+                weight_scale_inv.scalar_type() == torch::kFloat32,
+                "fp8_linear_forward_blockwise_2d: scales must be float32");
+    TORCH_CHECK(input_fp8.dim() == 2 && weight_fp8.dim() == 2,
+                "fp8_linear_forward_blockwise_2d: input_fp8 and weight_fp8 must be 2-D");
+    TORCH_CHECK(weight_scale_inv.dim() == 2,
+                "fp8_linear_forward_blockwise_2d: weight_scale_inv must be 2-D [N/block, K/block]");
+    TORCH_CHECK(block_size > 0, "fp8_linear_forward_blockwise_2d: block_size must be positive");
+
+    int64_t M = input_fp8.size(0);
+    int64_t K = input_fp8.size(1);
+    int64_t N = weight_fp8.size(0);
+    TORCH_CHECK(weight_fp8.size(1) == K, "fp8_linear_forward_blockwise_2d: weight K-dim mismatch");
+    TORCH_CHECK(input_scale.numel() == M,
+                "fp8_linear_forward_blockwise_2d: input_scale must hold one value per token (M)");
+
+    int64_t n_blocks = (N + block_size - 1) / block_size;
+    int64_t k_blocks = (K + block_size - 1) / block_size;
+    TORCH_CHECK(weight_scale_inv.size(0) == n_blocks && weight_scale_inv.size(1) == k_blocks,
+                "fp8_linear_forward_blockwise_2d: weight_scale_inv shape mismatch "
+                "(expected [", n_blocks, ", ", k_blocks, "])");
+    TORCH_CHECK(input_fp8.device() == input_scale.device() &&
+                input_fp8.device() == weight_fp8.device() &&
+                input_fp8.device() == weight_scale_inv.device() &&
+                input_fp8.device() == output_dtype_source.device(),
+                "fp8_linear_forward_blockwise_2d: all tensors must be on the same device");
+    TORCH_CHECK(M == 0 || M <= (int64_t)INT_MAX, "fp8_linear_forward_blockwise_2d: M exceeds INT_MAX");
+    int iM = checked_int(M, "M");
+    int iN = checked_int(N, "N");
+    int iK = checked_int(K, "K");
+    int iKBlocks = checked_int(k_blocks, "k_blocks");
+    TORCH_CHECK(M == 0 || N <= ((int64_t)0xFFFFFFFFu * 256 / M),
+                "fp8_linear_forward_blockwise_2d: output grid exceeds HIP dim3 limit");
+
+    int output_dtype = float_dtype_code(output_dtype_source, "fp8_linear_forward_blockwise_2d: output_dtype_source");
+    BiasLaunch bias_launch = validate_bias_for_forward(bias, N, input_fp8.device(), "fp8_linear_forward_blockwise_2d");
+    auto output = torch::empty({M, N}, output_dtype_source.options());
+
+    // backend 3 forces the always-correct naive reference.
+    const bool force_reference = backend == 3;
+    const bool wmma_capable = backend != 1 && !force_reference && device_is_gfx12() &&
+        block_size == 128 && K % 128 == 0 && N % block_size == 0;
+    // The tiled portable kernel needs block_k % 32 == 0 and block_n % 64 == 0
+    // (satisfied by block_size == 128) and a grid within the HIP dim3 limits.
+    const bool tiled_capable = backend != 2 && !force_reference && !wmma_capable &&
+        block_size == 128 && ((N + 63) / 64) <= 65535 && ((M + 63) / 64) <= 65535;
+    TORCH_CHECK(backend != 2 || wmma_capable,
+                "fp8_linear_forward_blockwise_2d: gfx12 WMMA backend requires block_size == 128, "
+                "K % 128 == 0, N % 128 == 0 and a gfx12 GPU");
+
+    const uint8_t* a  = input_fp8.data_ptr<uint8_t>();
+    const float*   as_ = input_scale.data_ptr<float>();
+    const uint8_t* b  = weight_fp8.data_ptr<uint8_t>();
+    const float*   bs = weight_scale_inv.data_ptr<float>();
+
+    if (wmma_capable) {
+        launch_fp8_linear_forward_blockwise_2d_wmma(
+            a, as_, b, bs, output.data_ptr(), bias_launch.ptr,
+            iM, iN, iK, iKBlocks, (int)block_size, (int)block_size,
+            output_dtype, bias_launch.dtype, bias_launch.has_bias, current_stream());
+    } else if (tiled_capable) {
+        launch_fp8_linear_forward_blockwise_2d_tiled(
+            a, as_, b, bs, output.data_ptr(), bias_launch.ptr,
+            iM, iN, iK, iKBlocks, (int)block_size, (int)block_size,
+            output_dtype, bias_launch.dtype, bias_launch.has_bias, current_stream());
+    } else {
+        launch_fp8_linear_forward_blockwise_2d(
+            a, as_, b, bs, output.data_ptr(), bias_launch.ptr,
+            iM, iN, iK, iKBlocks, (int)block_size, (int)block_size,
+            output_dtype, bias_launch.dtype, bias_launch.has_bias, current_stream());
+    }
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4 — fp8_linear_backward_input
 // grad_output: [M, N] float32
 // weight      : [N, K] float32
@@ -2920,6 +3084,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_e4m3_blockwise", &quantize_e4m3_blockwise,
           "Block-wise quantize tensor to FP8 E4M3 over the last dimension",
           py::arg("input"), py::arg("block_size") = 32);
+    m.def("quantize_e4m3_per_token", &quantize_e4m3_per_token,
+          "Dynamic per-token quantize to FP8 E4M3 (one dequant scale per row)",
+          py::arg("input"));
     m.def("quantize_e5m2_blockwise", &quantize_e5m2_blockwise,
           "Block-wise quantize tensor to FP8 E5M2 over the last dimension",
           py::arg("input"), py::arg("block_size") = 32);
@@ -3052,6 +3219,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input_fp8"), py::arg("input_scales"),
           py::arg("weight_fp8"), py::arg("weight_scales"),
           py::arg("output_dtype_source"), py::arg("block_size") = 32,
+          py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("fp8_linear_forward_blockwise_2d", &fp8_linear_forward_blockwise_2d,
+          "FP8 linear forward with per-token activation scale and 2-D (block x block) weight scale tiles",
+          py::arg("input_fp8"), py::arg("input_scale"),
+          py::arg("weight_fp8"), py::arg("weight_scale_inv"),
+          py::arg("output_dtype_source"), py::arg("block_size") = 128,
+          py::arg("backend") = 0,
           py::arg("bias") = c10::optional<torch::Tensor>());
     m.def("fp8_linear_backward_input",  &fp8_linear_backward_input,
           "FP8 linear backward — grad w.r.t. input",
