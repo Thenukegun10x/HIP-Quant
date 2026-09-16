@@ -179,6 +179,7 @@ void launch_gemv_q_forward(
     const void* bias, int ggml_type, int M, int N, int K,
     bool has_bias, hipStream_t stream);
 int gemv_q_split_chunks(int M, int K);
+extern "C" void gemv_tune_set_variant(int variant);
 void launch_gemm_q_forward(
     const void* input, const void* packed_weight, void* output,
     const void* bias, int ggml_type, int Mrows, int N, int K,
@@ -1813,6 +1814,22 @@ torch::Tensor gemv_q_forward(
     return output;
 }
 
+// Tuning-only entry point.  Variant selection happens synchronously on the
+// host before the kernel launch; regular inference always keeps variant 0.
+torch::Tensor gemv_q_forward_variant(
+    torch::Tensor input,
+    torch::Tensor weight_packed,
+    int64_t ggml_type,
+    int64_t output_features,
+    int64_t variant,
+    c10::optional<torch::Tensor> bias
+) {
+    gemv_tune_set_variant((int)variant);
+    auto output = gemv_q_forward(input, weight_packed, ggml_type, output_features, bias);
+    gemv_tune_set_variant(0);
+    return output;
+}
+
 // ---------------------------------------------------------------------------
 // P-prefill-1: batched GEMM over K-quant weights (S>1 prefill). v1 covers
 // the qk flavor (Q2/Q4/Q5/Q6_K, IQ2_XXS/XS/S, IQ4_XS, IQ1_M); other flavors
@@ -2974,6 +2991,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Dedicated AOT GEMV for single-token decode (M=1) on native Q8_0 and Q4_0 weights",
           py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
           py::arg("output_features"), py::arg("bias") = c10::optional<torch::Tensor>());
+    m.def("gemv_q_forward_variant", &gemv_q_forward_variant,
+          "Tuning-only GEMV variant selector (variant 0 is production baseline)",
+          py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),
+          py::arg("output_features"), py::arg("variant"),
+          py::arg("bias") = c10::optional<torch::Tensor>());
     m.def("gemm_q_forward", &gemm_q_forward,
           "Batched GEMM over K-quant weights for S>1 prefill (LDS-staged weights, M-tiled)",
           py::arg("input"), py::arg("weight_packed"), py::arg("ggml_type"),

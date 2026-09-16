@@ -2612,6 +2612,21 @@ def gemv_q_forward(
     return _load_extension().gemv_q_forward(
         input.contiguous(), weight_packed.contiguous(), int(ggml_type), int(output_features), bias
     )
+
+
+def gemv_q_forward_variant(
+    input: "torch.Tensor",
+    weight_packed: "torch.Tensor",
+    ggml_type: int,
+    output_features: int,
+    variant: int,
+    bias: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    """Run a benchmark-only GEMV variant; normal inference always uses variant 0."""
+    return _load_extension().gemv_q_forward_variant(
+        input.contiguous(), weight_packed.contiguous(), int(ggml_type),
+        int(output_features), int(variant), bias,
+    )
 def dequant_embedding_forward(
     weight_packed: "torch.Tensor",
     token_ids: "torch.Tensor",

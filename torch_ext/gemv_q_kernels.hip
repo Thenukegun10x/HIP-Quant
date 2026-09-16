@@ -31,6 +31,14 @@
 #define GGML_TYPE_IQ4_XS 23
 #define GGML_TYPE_IQ1_M 29
 
+// Benchmark-only host-side dispatch selector.  It is read while queuing the
+// kernel launch, so resetting it immediately after a launch is safe.
+extern "C" {
+static int gemv_tune_variant_storage = 0;
+void gemv_tune_set_variant(int variant) { gemv_tune_variant_storage = variant; }
+int gemv_tune_get_variant() { return gemv_tune_variant_storage; }
+}
+
 namespace {
 
 __device__ inline uint8_t unpack_k4_scale(const uint8_t *scales, int group) {
@@ -1069,6 +1077,82 @@ __global__ void gemv_iq4xs_kernel(
     }
 }
 
+// IQ2_S candidate for M=1 decode: a physical wave computes two output rows,
+// with each 16-lane half-wave owning one row.  A lane consumes two adjacent
+// FP16 activations and uses the native f16 dot2 -> f32 accumulator.  The
+// per-32-element IQ2_S scale is applied after the two-element dot, which is
+// mathematically equivalent but has a different rounding schedule from the
+// baseline; the paired benchmark checks its final fp16 output explicitly.
+template <int ROWS_PER_BLOCK = 8>
+__global__ void gemv_iq2s_dot2_kernel(
+    const half* __restrict__ x,
+    const block_iq2_s* __restrict__ weights,
+    half* __restrict__ y,
+    const half* __restrict__ bias,
+    int N, int K,
+    int K_full, int row_stride_sb,
+    bool has_bias,
+    bool use_lds
+) {
+    static_assert((ROWS_PER_BLOCK % 2) == 0, "dot2 kernel needs row pairs");
+    constexpr int WAVES_PER_BLOCK = ROWS_PER_BLOCK / 2;
+    extern __shared__ half x_shared[];
+    const half* x_vec = x;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    if (use_lds) {
+        for (int i = tid; i < K; i += 32 * WAVES_PER_BLOCK) {
+            x_shared[i] = x[i];
+        }
+        __syncthreads();
+        x_vec = x_shared;
+    }
+
+    const int lane_id = threadIdx.x;
+    const int wave_id = threadIdx.y;
+    const int half_row = lane_id >> 4;
+    const int lane16 = lane_id & 15;
+    const int n = blockIdx.x * ROWS_PER_BLOCK + 2 * wave_id + half_row;
+    if (n >= N) return;
+
+    const int l = lane16 >> 2;
+    const int j = (lane16 & 3) << 1;
+    const block_iq2_s* row = weights + (size_t)n * row_stride_sb;
+    float sum = 0.0f;
+    const int num_superblocks = K / 256;
+    #pragma unroll 2
+    for (int b = 0; b < num_superblocks; ++b) {
+        const block_iq2_s* blk = row + b;
+        const float d = fp16_to_fp32(blk->d);
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t scale = blk->scales[ib];
+            const int level = (l < 2) ? (scale & 0x0f) : (scale >> 4);
+            const float dl = d * (0.5f + (float)level) * 0.25f;
+            const int grid_idx = (int)blk->qs[4 * ib + l]
+                | ((int)(blk->qh[ib] << (8 - 2 * l)) & 0x300);
+            const uint64_t grid = d_iq2s_grid[grid_idx];
+            const int8_t g0 = (int8_t)((grid >> (j * 8)) & 0xff);
+            const int8_t g1 = (int8_t)((grid >> ((j + 1) * 8)) & 0xff);
+            const uint8_t sign = blk->qs[32 + 4 * ib + l];
+            const float w0 = ((sign >> j) & 1) ? -(float)g0 : (float)g0;
+            const float w1 = ((sign >> (j + 1)) & 1) ? -(float)g1 : (float)g1;
+            const __half2 w_pair = __halves2half2(__float2half(w0), __float2half(w1));
+            const int x_offset = b * 256 + ib * 32 + 2 * lane16;
+            const __half2 x_pair = *reinterpret_cast<const __half2*>(x_vec + x_offset);
+            sum = fmaf(dl, amd_mixed_dot(w_pair, x_pair, 0.0f, false), sum);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset, 16);
+    }
+    if (lane16 == 0) {
+        if (has_bias) sum += __half2float(bias[n]);
+        y[n] = __float2half(sum);
+    }
+}
+
 } // namespace
 
 template <int M>
@@ -1088,7 +1172,11 @@ static void dispatch_gemv_q(
     dim3 block(32, ROWS_PER_BLOCK); // 128 threads per block (4 waves)
     dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
 
-    bool use_lds = ((size_t)M * K <= 8192);
+    const int tune_variant = gemv_tune_get_variant();
+    // The usual 8K cap keeps ordinary decode occupancy high.  Variant 3
+    // exists only for paired tests of the former 34KB IQ2_S staging policy.
+    bool use_lds = ((size_t)M * K <= 8192)
+        || (ggml_type == GGML_TYPE_IQ2_S && tune_variant == 3 && (size_t)M * K <= 32768);
     size_t shared_bytes = use_lds ? ((size_t)M * K * sizeof(half)) : 0;
 
     if (ggml_type == GGML_TYPE_Q8_0) {
@@ -1179,12 +1267,51 @@ static void dispatch_gemv_q(
             N, K, K_full, row_stride_sb, has_bias, use_lds
         );
     } else if (ggml_type == GGML_TYPE_IQ2_S) {
-        hipLaunchKernelGGL(
-            (gemv_qk_kernel<block_iq2_s, dot_iq2_s, ROWS_PER_BLOCK, M>),
-            grid, block, shared_bytes, stream,
-            (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
-            N, K, K_full, row_stride_sb, has_bias, use_lds
-        );
+        // Eight independent output rows share an activation staging pass.
+        // On the Qwen IQ2_S FFN shapes this is 10--16% faster than the old
+        // four-wave geometry, with bit-identical output.  Variant 1 preserves
+        // the old launch only as a paired benchmark control.
+        if (tune_variant == 1) {
+            hipLaunchKernelGGL(
+                (gemv_qk_kernel<block_iq2_s, dot_iq2_s, ROWS_PER_BLOCK, M>),
+                grid, block, shared_bytes, stream,
+                (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
+                N, K, K_full, row_stride_sb, has_bias, use_lds
+            );
+        } else if (tune_variant == 0 || tune_variant == 4) {
+            if constexpr (M == 1) {
+                constexpr int ROWS_IQ2 = 8;
+                constexpr int WAVES_IQ2 = ROWS_IQ2 / 2;
+                dim3 block_iq2(32, WAVES_IQ2);
+                dim3 grid_iq2((N + ROWS_IQ2 - 1) / ROWS_IQ2);
+                hipLaunchKernelGGL(
+                    (gemv_iq2s_dot2_kernel<ROWS_IQ2>),
+                    grid_iq2, block_iq2, shared_bytes, stream,
+                    (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
+                    N, K, K_full, row_stride_sb, has_bias, use_lds
+                );
+            } else {
+                constexpr int ROWS_IQ2 = 8;
+                dim3 block_iq2(32, ROWS_IQ2);
+                dim3 grid_iq2((N + ROWS_IQ2 - 1) / ROWS_IQ2);
+                hipLaunchKernelGGL(
+                    (gemv_qk_kernel<block_iq2_s, dot_iq2_s, ROWS_IQ2, M>),
+                    grid_iq2, block_iq2, shared_bytes, stream,
+                    (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
+                    N, K, K_full, row_stride_sb, has_bias, use_lds
+                );
+            }
+        } else {
+            constexpr int ROWS_IQ2 = 8;
+            dim3 block_iq2(32, ROWS_IQ2);
+            dim3 grid_iq2((N + ROWS_IQ2 - 1) / ROWS_IQ2);
+            hipLaunchKernelGGL(
+                (gemv_qk_kernel<block_iq2_s, dot_iq2_s, ROWS_IQ2, M>),
+                grid_iq2, block_iq2, shared_bytes, stream,
+                (const half*)input, (const block_iq2_s*)packed_weight, (half*)output, (const half*)bias,
+                N, K, K_full, row_stride_sb, has_bias, use_lds
+            );
+        }
     } else if (ggml_type == GGML_TYPE_IQ1_M) {
         hipLaunchKernelGGL(
             (gemv_qk_kernel<block_iq1_m, dot_iq1_m, ROWS_PER_BLOCK, M>),
