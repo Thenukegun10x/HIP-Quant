@@ -430,13 +430,31 @@ def _load_extension() -> object:
     try:
         from hip_quant import _C as _ext  # type: ignore[attr-defined]
         _C = _ext
-    except ImportError:
+    except ImportError as first_exc:
         try:
-            import sys, os
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            import _C as _ext
+            # Load the ABI-tagged extension by absolute path. Do NOT prepend the
+            # package dir to sys.path: that would let any `_C*` file dropped in
+            # the package directory shadow unrelated modules process-wide.
+            import importlib.machinery
+            import importlib.util
+            import os
+            pkg_dir = os.path.dirname(os.path.abspath(__file__))
+            _ext = None
+            for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+                candidate = os.path.join(pkg_dir, "_C" + suffix)
+                if not os.path.isfile(candidate):
+                    continue
+                spec = importlib.util.spec_from_file_location("hip_quant._C", candidate)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _ext = module
+                break
+            if _ext is None:
+                raise first_exc
             _C = _ext
-        except ImportError as exc:
+        except Exception as exc:
             raise ImportError(
                 f"hip_quant._C extension failed to load ({exc}). "
                 "Ensure PyTorch with ROCm is installed and matches the extension ABI, "
@@ -3379,9 +3397,11 @@ def wave_attn_int4(
         q_int4 = q.contiguous(); k_int4 = k.contiguous()
     else:
         if q_scale is None:
-            q_scale = q.abs().max().item() / 7.0 if q.abs().max().item() > 0 else 1.0
+            q_amax = q.abs().max().item()   # single reduction + host sync
+            q_scale = q_amax / 7.0 if q_amax > 0 else 1.0
         if k_scale is None:
-            k_scale = k.abs().max().item() / 7.0 if k.abs().max().item() > 0 else 1.0
+            k_amax = k.abs().max().item()
+            k_scale = k_amax / 7.0 if k_amax > 0 else 1.0
         q_int4 = quantize_int4_packed(q, q_scale)
         k_int4 = quantize_int4_packed(k, k_scale)
     v_fp8 = v if v.dtype == torch.uint8 else quantize_e4m3(v)

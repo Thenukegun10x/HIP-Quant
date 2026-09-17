@@ -89,12 +89,12 @@ void fp8_gemm_e4m3_kernel(
             int a_row = m + lane_wrapped;
             int a_col = k + k_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < K) ? fp32_to_fp8_e4m3(load_float_input(A, a_dtype, a_row * K + a_col) * a_scale) : 0;
+                (a_row < M && a_col < K) ? fp32_to_fp8_e4m3(load_float_input(A, a_dtype, (int64_t)a_row * K + a_col) * a_scale) : 0;
 
             int b_row = k + k_offset;
             int b_col = n + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < K && b_col < N) ? fp32_to_fp8_e4m3(load_float_input(B, b_dtype, b_col * K + b_row) * b_scale) : 0;
+                (b_row < K && b_col < N) ? fp32_to_fp8_e4m3(load_float_input(B, b_dtype, (int64_t)b_col * K + b_row) * b_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -111,7 +111,7 @@ void fp8_gemm_e4m3_kernel(
         if (row < M && col < N) {
             float value = acc[i] * out_scale;
             if (has_bias) value += load_float_input(bias, bias_dtype, col);
-            store_float_output(C, c_dtype, row * N + col, value);
+            store_float_output(C, c_dtype, (int64_t)row * N + col, value);
         }
     }
     __threadfence_block();
@@ -152,12 +152,12 @@ void fp8_gemm_e4m3_weight_fp8_kernel(
             int a_row = m + lane_wrapped;
             int a_col = k + k_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < K) ? fp32_to_fp8_e4m3(load_float_input(A, a_dtype, a_row * K + a_col) * a_scale) : 0;
+                (a_row < M && a_col < K) ? fp32_to_fp8_e4m3(load_float_input(A, a_dtype, (int64_t)a_row * K + a_col) * a_scale) : 0;
 
             int b_row = k + k_offset;
             int b_col = n + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < K && b_col < N) ? B_fp8[b_col * K + b_row] : 0;
+                (b_row < K && b_col < N) ? B_fp8[(int64_t)b_col * K + b_row] : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -174,7 +174,7 @@ void fp8_gemm_e4m3_weight_fp8_kernel(
         if (row < M && col < N) {
             float value = acc[i] * out_scale;
             if (has_bias) value += load_float_input(bias, bias_dtype, col);
-            store_float_output(C, c_dtype, row * N + col, value);
+            store_float_output(C, c_dtype, (int64_t)row * N + col, value);
         }
     }
     __threadfence_block();
@@ -215,12 +215,12 @@ void fp8_gemm_e4m3_input_fp8_kernel(
             int a_row = m + lane_wrapped;
             int a_col = k + k_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < K) ? A_fp8[a_row * K + a_col] : 0;
+                (a_row < M && a_col < K) ? A_fp8[(int64_t)a_row * K + a_col] : 0;
 
             int b_row = k + k_offset;
             int b_col = n + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < K && b_col < N) ? fp32_to_fp8_e4m3(load_float_input(B, b_dtype, b_col * K + b_row) * b_scale) : 0;
+                (b_row < K && b_col < N) ? fp32_to_fp8_e4m3(load_float_input(B, b_dtype, (int64_t)b_col * K + b_row) * b_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -237,7 +237,7 @@ void fp8_gemm_e4m3_input_fp8_kernel(
         if (row < M && col < N) {
             float value = acc[i] * out_scale;
             if (has_bias) value += load_float_input(bias, bias_dtype, col);
-            store_float_output(C, c_dtype, row * N + col, value);
+            store_float_output(C, c_dtype, (int64_t)row * N + col, value);
         }
     }
     __threadfence_block();
@@ -276,8 +276,8 @@ void fp8_gemm_e4m3_blockwise_naive_kernel(
         float scale = A_scales[m * blocks_per_row + kb] * B_scales[n * blocks_per_row + kb];
         float partial = 0.0f;
         for (int k = k_start; k < k_end; ++k) {
-            float av = fp8_e4m3_to_fp32(A_fp8[m * K + k]);
-            float bv = fp8_e4m3_to_fp32(B_fp8[n * K + k]);
+            float av = fp8_e4m3_to_fp32(A_fp8[(int64_t)m * K + k]);
+            float bv = fp8_e4m3_to_fp32(B_fp8[(int64_t)n * K + k]);
             partial += av * bv;
         }
         acc += partial * scale;
@@ -508,12 +508,12 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
             int a_row = m + lane_wrapped;
             int a_col = k + k_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < K) ? A_fp8[a_row * K + a_col] : 0;
+                (a_row < M && a_col < K) ? A_fp8[(int64_t)a_row * K + a_col] : 0;
 
             int b_row = k + k_offset;
             int b_col = n + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < K && b_col < N) ? B_fp8[b_col * K + b_row] : 0;
+                (b_row < K && b_col < N) ? B_fp8[(int64_t)b_col * K + b_row] : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -530,7 +530,7 @@ void fp8_gemm_e4m3_input_weight_fp8_kernel(
         if (row < M && col < N) {
             float value = acc[i] * out_scale;
             if (has_bias) value += load_float_input(bias, bias_dtype, col);
-            store_float_output(C, c_dtype, row * N + col, value);
+            store_float_output(C, c_dtype, (int64_t)row * N + col, value);
         }
     }
     __threadfence_block();
@@ -556,7 +556,7 @@ void pack_fp8_weight_wmma_kernel(
 
     int n = n_tile * TILE_N + lane;
     int k = k_tile * TILE_K + lane_group * 8 + byte;
-    B_packed[idx] = (n < N && k < K) ? B_fp8[n * K + k] : 0;
+    B_packed[idx] = (n < N && k < K) ? B_fp8[(int64_t)n * K + k] : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -597,12 +597,12 @@ void fp8_gemm_backward_input_kernel(
             int a_row = m + lane_wrapped;
             int a_col = n_tile + n_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < N) ? fp32_to_fp8_e5m2(load_float_input(grad_output, grad_output_dtype, a_row * N + a_col)) : 0;
+                (a_row < M && a_col < N) ? fp32_to_fp8_e5m2(load_float_input(grad_output, grad_output_dtype, (int64_t)a_row * N + a_col)) : 0;
 
             int b_row = n_tile + n_offset;
             int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < N && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(weight, weight_dtype, b_row * K + b_col) * weight_scale) : 0;
+                (b_row < N && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(weight, weight_dtype, (int64_t)b_row * K + b_col) * weight_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -617,7 +617,7 @@ void fp8_gemm_backward_input_kernel(
         int row = m + lane_group * 8 + i;
         int col = k_tile + lane_wrapped;
         if (row < M && col < K) {
-            store_float_output(grad_input, grad_input_dtype, row * K + col, acc[i] * out_scale);
+            store_float_output(grad_input, grad_input_dtype, (int64_t)row * K + col, acc[i] * out_scale);
         }
     }
     __threadfence_block();
@@ -657,12 +657,12 @@ void fp8_gemm_backward_input_fp8_grad_kernel(
             int a_row = m + lane_wrapped;
             int a_col = n_tile + n_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < N) ? grad_output_fp8[a_row * N + a_col] : 0;
+                (a_row < M && a_col < N) ? grad_output_fp8[(int64_t)a_row * N + a_col] : 0;
 
             int b_row = n_tile + n_offset;
             int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < N && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(weight, weight_dtype, b_row * K + b_col) * weight_scale) : 0;
+                (b_row < N && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(weight, weight_dtype, (int64_t)b_row * K + b_col) * weight_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -677,7 +677,7 @@ void fp8_gemm_backward_input_fp8_grad_kernel(
         int row = m + lane_group * 8 + i;
         int col = k_tile + lane_wrapped;
         if (row < M && col < K) {
-            store_float_output(grad_input, grad_input_dtype, row * K + col, acc[i] * out_scale);
+            store_float_output(grad_input, grad_input_dtype, (int64_t)row * K + col, acc[i] * out_scale);
         }
     }
     __threadfence_block();
@@ -721,12 +721,12 @@ void fp8_gemm_backward_weight_kernel(
             int a_row = n + lane_wrapped;
             int a_col = m_tile + m_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < N && a_col < M) ? fp32_to_fp8_e5m2(load_float_input(grad_output, grad_output_dtype, a_col * N + a_row)) : 0;
+                (a_row < N && a_col < M) ? fp32_to_fp8_e5m2(load_float_input(grad_output, grad_output_dtype, (int64_t)a_col * N + a_row)) : 0;
 
             int b_row = m_tile + m_offset;
             int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < M && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(input, input_dtype, b_row * K + b_col) * input_scale) : 0;
+                (b_row < M && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(input, input_dtype, (int64_t)b_row * K + b_col) * input_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -741,7 +741,7 @@ void fp8_gemm_backward_weight_kernel(
         int row = n + lane_group * 8 + i;
         int col = k_tile + lane_wrapped;
         if (row < N && col < K) {
-            store_float_output(grad_weight, grad_weight_dtype, row * K + col, acc[i] * out_scale);
+            store_float_output(grad_weight, grad_weight_dtype, (int64_t)row * K + col, acc[i] * out_scale);
         }
     }
     __threadfence_block();
@@ -781,12 +781,12 @@ void fp8_gemm_backward_weight_fp8_grad_kernel(
             int a_row = n + lane_wrapped;
             int a_col = m_tile + m_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < N && a_col < M) ? grad_output_fp8[a_col * N + a_row] : 0;
+                (a_row < N && a_col < M) ? grad_output_fp8[(int64_t)a_col * N + a_row] : 0;
 
             int b_row = m_tile + m_offset;
             int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < M && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(input, input_dtype, b_row * K + b_col) * input_scale) : 0;
+                (b_row < M && b_col < K) ? fp32_to_fp8_e5m2(load_float_input(input, input_dtype, (int64_t)b_row * K + b_col) * input_scale) : 0;
         }
 
         v2i a_vec = (v2i){ a_packed[0], a_packed[1] };
@@ -801,7 +801,7 @@ void fp8_gemm_backward_weight_fp8_grad_kernel(
         int row = n + lane_group * 8 + i;
         int col = k_tile + lane_wrapped;
         if (row < N && col < K) {
-            store_float_output(grad_weight, grad_weight_dtype, row * K + col, acc[i] * out_scale);
+            store_float_output(grad_weight, grad_weight_dtype, (int64_t)row * K + col, acc[i] * out_scale);
         }
     }
     __threadfence_block();
@@ -838,11 +838,11 @@ void fp8_gemm_backward_input_raw_fp8_kernel(
             const int a_row = m + lane_wrapped;
             const int a_col = n_tile + n_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < M && a_col < N) ? grad_output_fp8[a_row * N + a_col] : 0;
+                (a_row < M && a_col < N) ? grad_output_fp8[(int64_t)a_row * N + a_col] : 0;
             const int b_row = n_tile + n_offset;
             const int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < N && b_col < K) ? weight_fp8[b_row * K + b_col] : 0;
+                (b_row < N && b_col < K) ? weight_fp8[(int64_t)b_row * K + b_col] : 0;
         }
         const v2i a_vec = (v2i){a_packed[0], a_packed[1]};
         const v2i b_vec = (v2i){b_packed[0], b_packed[1]};
@@ -856,7 +856,7 @@ void fp8_gemm_backward_input_raw_fp8_kernel(
         const int row = m + lane_group * 8 + i;
         const int col = k_tile + lane_wrapped;
         if (row < M && col < K) {
-            store_float_output(grad_input, grad_input_dtype, row * K + col,
+            store_float_output(grad_input, grad_input_dtype, (int64_t)row * K + col,
                                acc[i] * weight_inv_scale);
         }
     }
@@ -890,11 +890,11 @@ void fp8_gemm_backward_weight_raw_fp8_kernel(
             const int a_row = n + lane_wrapped;
             const int a_col = m_tile + m_offset;
             ((uint8_t*)a_packed)[i] =
-                (a_row < N && a_col < M) ? grad_output_fp8[a_col * N + a_row] : 0;
+                (a_row < N && a_col < M) ? grad_output_fp8[(int64_t)a_col * N + a_row] : 0;
             const int b_row = m_tile + m_offset;
             const int b_col = k_tile + lane_wrapped;
             ((uint8_t*)b_packed)[i] =
-                (b_row < M && b_col < K) ? input_fp8[b_row * K + b_col] : 0;
+                (b_row < M && b_col < K) ? input_fp8[(int64_t)b_row * K + b_col] : 0;
         }
         const v2i a_vec = (v2i){a_packed[0], a_packed[1]};
         const v2i b_vec = (v2i){b_packed[0], b_packed[1]};
@@ -908,7 +908,7 @@ void fp8_gemm_backward_weight_raw_fp8_kernel(
         const int row = n + lane_group * 8 + i;
         const int col = k_tile + lane_wrapped;
         if (row < N && col < K) {
-            store_float_output(grad_weight, grad_weight_dtype, row * K + col,
+            store_float_output(grad_weight, grad_weight_dtype, (int64_t)row * K + col,
                                acc[i] * input_inv_scale);
         }
     }

@@ -166,11 +166,12 @@ class _Reader:
 
     _BLOCK = 1 << 20
 
-    def __init__(self, f: BinaryIO) -> None:
+    def __init__(self, f: BinaryIO, limit: int) -> None:
         self._f = f
         self._buf = bytearray()
         self._pos = 0
         self.offset = 0  # absolute file offset of _buf[0]
+        self._limit = limit  # total file size: no field may exceed it
 
     def _fill(self, n: int) -> None:
         while len(self._buf) - self._pos < n:
@@ -185,6 +186,15 @@ class _Reader:
             self._buf += chunk
 
     def read(self, n: int) -> bytes:
+        # A length field read straight from the file is untrusted. Reading n
+        # bytes past EOF is impossible, so reject it up front: otherwise a tiny
+        # crafted file can make CPython attempt a multi-GiB allocation
+        # (MemoryError / DoS).
+        if n < 0 or self.tell() + n > self._limit:
+            raise GGUFError(
+                f"field length {n} exceeds remaining file bytes "
+                f"({self._limit - self.tell()} left)"
+            )
         self._fill(n)
         out = bytes(self._buf[self._pos:self._pos + n])
         self._pos += n
@@ -227,7 +237,7 @@ def load(path: str, parse_data: bool = False) -> GGUFFile:
     """
     file_size = os.path.getsize(path)
     with open(path, "rb") as f:
-        r = _Reader(f)
+        r = _Reader(f, file_size)
         if r.u32() != GGUF_MAGIC:
             raise GGUFError(f"{path}: bad magic (not a GGUF file)")
         version = r.u32()
@@ -267,6 +277,8 @@ def load(path: str, parse_data: bool = False) -> GGUFFile:
                 n_bytes=n_bytes, offset=offset, index=i))
 
         alignment = int(metadata.get("general.alignment", 32))
+        if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+            raise GGUFError(f"{path}: invalid general.alignment {alignment}")
         data_offset = _align(r.tell(), alignment)
 
     # bounds check: every tensor must lie inside the file, and tensor

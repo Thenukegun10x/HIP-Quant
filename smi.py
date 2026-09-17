@@ -41,39 +41,47 @@ import warnings
 from typing import Any, Dict, List, Optional
 
 _PKG_DIR = pathlib.Path(__file__).parent if pathlib.Path(__file__).parent.name != "hip_quant" else pathlib.Path(__file__).parent
-# package root is repo root (pyproject packages hip_quant=".")
-# binary locations: tools/gpu-smi.exe (vendored), or system PATH, or cargo build output
+# gpu-smi is a SEPARATE project (github.com/Thenukegun10x/GPU-SMI). It is
+# fetched into tools/ at build time (tools/fetch_gpu_smi.py) and bundled in the
+# wheel, so there is no hardcoded external install path: discovery order is an
+# explicit override, the bundled asset, a console script beside the
+# interpreter, then PATH.
 _BIN_LOCK = threading.Lock()
 
-_CANDIDATES = [
-    pathlib.Path(__file__).resolve().parent / "tools" / "gpu-smi.exe",
-    pathlib.Path(__file__).resolve().parent / "tools" / "gpu-smi",
-    pathlib.Path(__file__).resolve().parent / "gpu-smi.exe",
-    pathlib.Path(__file__).resolve().parent / "gpu-smi",
-    pathlib.Path(__file__).resolve().parent / "gpu-smi-src" / "target" / "release" / "gpu-smi.exe",
-    pathlib.Path(__file__).resolve().parent / "gpu-smi-src" / "target" / "release" / "gpu-smi",
-]
+_BUNDLED_DIR = pathlib.Path(__file__).resolve().parent / "tools"
 
 
-
-def _find_bin() -> Optional[pathlib.Path]:
-    # explicit env override
+def _candidate_bins():
+    """Yield plausible gpu-smi locations, most explicit first."""
+    names = (("gpu-smi.exe", "gpu-smi", "gpu_smi.exe") if os.name == "nt"
+             else ("gpu-smi", "gpu_smi"))
     env = os.environ.get("HIP_QUANT_GPU_SMI_BIN") or os.environ.get("GPU_SMI_BIN")
     if env:
         p = pathlib.Path(env)
-        if p.exists():
-            return p
-    for p in _CANDIDATES:
-        if p.exists():
-            return p
-    # PATH fallback
-    for name in ("gpu-smi.exe", "gpu-smi", "gpu_smi.exe"):
-        import shutil
+        if p.is_file():
+            yield p
+    # build-time bundled asset
+    for name in names:
+        p = _BUNDLED_DIR / name
+        if p.is_file():
+            yield p
+    # console script installed beside the running interpreter (pip/pipx)
+    scripts_dir = pathlib.Path(sys.executable).parent
+    for name in names:
+        p = scripts_dir / name
+        if p.is_file():
+            yield p
+    import shutil
 
+    for name in names:
         found = shutil.which(name)
         if found:
-            return pathlib.Path(found)
-    return None
+            yield pathlib.Path(found)
+
+
+def _find_bin() -> Optional[pathlib.Path]:
+    return next(iter(_candidate_bins()), None)
+
 
 
 def _fallback_query() -> List[Dict[str, Any]]:

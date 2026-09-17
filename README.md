@@ -14,6 +14,18 @@
 
 `hip-quant` is a standalone Python library and highly optimized HIP C++ backend for tensor quantization and accelerated LLM inference on AMD GPUs with zero CPU round-trips.
 
+## 🌟 What's New in 2.2.1
+
+> **2.2.1.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). See *Custom PyTorch 2.15* below for a self-hosted install index.
+
+Security, correctness and robustness fixes from an internal audit:
+
+- **Kernels**: fixed a missing CTA barrier in `wave_attn`/`wave_attn_long` (V overwrote the K tile while waves were still reading it), corrected the causal K-tile clamp (dropped the diagonal tile at exact boundaries), added `Dim <= 128` guards to the wave forward entry points, made the `gemv_tune` dispatch selector thread-local and exception-safe, and 64-bit-corrected FP8 GEMM index arithmetic.
+- **Parsers (untrusted input)**: bounded GGUF string/array reads and the legacy HQ2 manifest (small crafted files could force multi-GiB allocations), rejected `general.alignment <= 0`, and replaced `assert`-based shape validation with explicit raises.
+- **Offline API**: `quantize_from_fp8` now validates the `imatrix` element count (was a host + device out-of-bounds read), `ggml_blck_size_for` restype corrected, `math.prod` for element counts.
+- **Hardening**: `_C` is loaded by absolute path (no `sys.path` mutation), `HIP_QUANT_DLL`/`_PATH` must be absolute, and the mxfp4 LUT init is `std::call_once`.
+- **gpu-smi** is now fetched from its GitHub Releases at build time (checksum-verified) and bundled in the wheel; `smi.py` discovers it dynamically (env → bundled → console script → PATH) instead of hardcoding a path.
+
 ## 🌟 What's New in 2.2.0
 
 > **2.2.0.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). Use it if `2.2.0` reports a torch ABI mismatch on import.
@@ -337,12 +349,33 @@ matches your PyTorch, so the extension loads without an ABI mismatch:
 
 | Wheel | PyTorch | ROCm |
 |---|---|---|
-| `hip-quant==2.2.0` | 2.9.x | ROCm 7.2.1 |
-| `hip-quant==2.2.0.post215` | 2.15 / TheRock | ROCm 7.14 |
+| `hip-quant==2.2.1` | 2.9.x | ROCm 7.2.1 |
+| `hip-quant==2.2.1.post215` | 2.15 / TheRock | ROCm 7.14 |
 
 ```powershell
-pip install "hip-quant==2.2.0.post215"   # PyTorch 2.15 / TheRock
+pip install "hip-quant==2.2.1.post215"   # PyTorch 2.15 / TheRock
 ```
+
+#### Custom PyTorch 2.15 (self-hosted wheels)
+
+The `post215` wheel targets a custom PyTorch 2.15 build that is not on PyPI.
+Its wheels live in a public Backblaze B2 bucket; point pip at the index page
+with `--find-links`:
+
+```powershell
+pip install "hip-quant==2.2.1.post215" `
+  --find-links https://dl.hipquant.download/file/Torchs/torch_index.html
+```
+
+This resolves `torch==2.15.0a0+gitf07882e` (plus matching `torchvision` /
+`torchaudio`). `gpu-smi` is bundled in the wheel, so monitoring needs no extra
+step.
+
+The wheels can also be fetched directly, e.g.
+`https://dl.hipquant.download/file/Torchs/torch-2.15.0a0%2Bgitf07882e-cp312-cp312-win_amd64.whl`
+— the `+` **must** be percent-encoded as `%2B` (a literal `+` 404s on B2).
+Because wheel filenames must match their metadata version, the objects are
+named `torch-2.15.0a0+gitf07882e-…`, not `torch-2.15.0-…`.
 
 On Windows, DLL resolution order is:
 - `HIP_QUANT_DLL` or `HIP_QUANT_DLL_PATH`, if set

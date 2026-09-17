@@ -1,5 +1,6 @@
 import glob
 import os
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -186,6 +187,30 @@ def _torch_extension_config():
 
 
 ext_modules, cmdclass = _torch_extension_config()
+
+
+def _fetch_gpu_smi() -> None:
+    """Best-effort refresh of the bundled gpu-smi binary from GitHub Releases.
+
+    gpu-smi is a separate project; tools/fetch_gpu_smi.py downloads the current
+    release asset into tools/ (checksum-verified) so it is bundled in the wheel.
+    Offline / opted-out builds keep whatever binary is already present.
+    """
+    if os.environ.get("HIP_QUANT_SKIP_GPU_SMI", "").lower() in ("1", "true", "yes", "on"):
+        return
+    script = Path(__file__).parent / "tools" / "fetch_gpu_smi.py"
+    if not script.is_file():
+        return
+    try:
+        import subprocess
+
+        subprocess.run([sys.executable, str(script)], check=False)
+    except Exception as exc:  # never fail the build over an optional asset
+        print(f"[hip-quant] gpu-smi fetch skipped: {exc}")
+
+
+_fetch_gpu_smi()
+
 
 setup(
     ext_modules=ext_modules,

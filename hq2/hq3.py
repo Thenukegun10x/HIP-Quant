@@ -13,6 +13,7 @@ specialised device quantizer is available.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,7 @@ def validate_hq3_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 def hq3_block_count(shape: tuple[int, ...]) -> int:
     shape = validate_hq3_shape(shape)
-    return int(np.prod(shape, dtype=np.int64) // HQ3_BLOCK_SIZE)
+    return math.prod(shape) // HQ3_BLOCK_SIZE
 
 
 def hq3_packed_nbytes(shape: tuple[int, ...]) -> int:

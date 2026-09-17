@@ -144,43 +144,54 @@ Write-Host $result
 Write-Host "DLL created: $out_file"
 Write-Host "Architectures: $($archs -join ', ')"
 
-# ── gpu-smi vendoring (913KB single-exe, HIP→ADL→WMI→sysfs) ──────────────
+# ── gpu-smi bundling ─────────────────────────────────────────────────────
+# gpu-smi is its own project (github.com/Thenukegun10x/GPU-SMI). Fetch the
+# current release asset (checksum-verified) into tools/ on every build; it is
+# bundled in the wheel via package-data. Falls back to a local Rust build, then
+# to shipping without it. Set -SkipSmi to skip.
 if ($SmiOnly) { $SkipSmi = $false }
 if (-not $SkipSmi) {
     $toolsDir = Join-Path $src_dir "tools"
     if (!(Test-Path $toolsDir)) { New-Item -ItemType Directory -Path $toolsDir | Out-Null }
-    $cargoCandidates = @(
-        (Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"),
-        (Get-Command cargo -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
-    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique -First 1
-    if (-not $cargoCandidates) { $cargoCandidates = "cargo" }
-    $smiManifest = Join-Path $src_dir "gpu-smi-src\Cargo.toml"
-    $smiSrc = Join-Path $src_dir "gpu-smi-src"
-    if (Test-Path $smiManifest) {
-        Write-Host "`nBuilding gpu-smi (cargo)..."
-        $cargoBin = $cargoCandidates
-        if ($cargoBin -is [array]) { $cargoBin = $cargoBin[0] }
-        Write-Host "  cargo: $cargoBin"
-        Write-Host "  manifest: $smiManifest"
-        $smiOut = Join-Path $toolsDir "gpu-smi.exe"
-        $prev = $LASTEXITCODE
-        & $cargoBin build --release --manifest-path $smiManifest 2>&1 | Write-Host
-        if ($LASTEXITCODE -eq 0) {
-            $built = Join-Path $smiSrc "target\release\gpu-smi.exe"
-            if (Test-Path $built) {
-                Copy-Item -Force $built $smiOut
-                Write-Host "gpu-smi vendored: $smiOut ($( (Get-Item $smiOut).Length / 1KB ) KB)"
-                # also copy to package root for pip wheel (tools/ is package-data)
-                $binSize = (Get-Item $smiOut).Length
-                if ($binSize -gt 2MB) { Write-Warning "gpu-smi $binSize >2MB — check lto+strip" }
+    $fetchScript = Join-Path $toolsDir "fetch_gpu_smi.py"
+
+    $py = (Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+    if (-not $py) { $py = (Get-Command py -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source) }
+
+    $haveSmi = $false
+    if ($py -and (Test-Path $fetchScript)) {
+        Write-Host "`nFetching gpu-smi from GitHub Releases..."
+        & $py $fetchScript
+        $haveSmi = ($LASTEXITCODE -eq 0)
+    }
+
+    if (-not $haveSmi) {
+        $smiManifest = Join-Path $src_dir "gpu-smi-src\Cargo.toml"
+        $smiSrc = Join-Path $src_dir "gpu-smi-src"
+        if (Test-Path $smiManifest) {
+            Write-Host "`nRelease fetch unavailable — building gpu-smi from gpu-smi-src (cargo)..."
+            $cargoBin = @(
+                (Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"),
+                (Get-Command cargo -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+            ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique -First 1
+            if (-not $cargoBin) { $cargoBin = "cargo" }
+            if ($cargoBin -is [array]) { $cargoBin = $cargoBin[0] }
+            $smiOut = Join-Path $toolsDir "gpu-smi.exe"
+            & $cargoBin build --release --manifest-path $smiManifest 2>&1 | Write-Host
+            if ($LASTEXITCODE -eq 0) {
+                $built = Join-Path $smiSrc "target\release\gpu-smi.exe"
+                if (Test-Path $built) {
+                    Copy-Item -Force $built $smiOut
+                    Write-Host "gpu-smi vendored: $smiOut ($( (Get-Item $smiOut).Length / 1KB ) KB)"
+                } else {
+                    Write-Warning "cargo built but $built not found"
+                }
             } else {
-                Write-Warning "cargo built but $built not found"
+                Write-Warning "cargo build failed (exit $LASTEXITCODE)"
             }
         } else {
-            Write-Warning "cargo build failed (exit $LASTEXITCODE) — skipping gpu-smi vendor. Install Rust or set -SkipSmi"
+            Write-Warning "gpu-smi could not be fetched and gpu-smi-src is absent — wheel ships without a bundled gpu-smi"
         }
-    } else {
-        Write-Host "gpu-smi-src not found — skipping gpu-smi vendor (clone https://github.com/Thenukegun10x/GPU-SMI to gpu-smi-src/)"
     }
 }
 if ($SmiOnly) { exit 0 }

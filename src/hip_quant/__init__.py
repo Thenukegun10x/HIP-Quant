@@ -164,7 +164,7 @@ class HipQuant:
             self._quantize_tensor_hq2_iters = None
         self._dll.ggml_type_size_for.restype = ctypes.c_size_t
         self._dll.ggml_type_size_for.argtypes = [ctypes.c_int]
-        self._dll.ggml_blck_size_for.restype = ctypes.c_size_t
+        self._dll.ggml_blck_size_for.restype = ctypes.c_int
         self._dll.ggml_blck_size_for.argtypes = [ctypes.c_int]
         self._dll.ggml_row_size_for.restype = ctypes.c_size_t
         self._dll.ggml_row_size_for.argtypes = [ctypes.c_int, ctypes.c_int64]

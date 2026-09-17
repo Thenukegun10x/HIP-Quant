@@ -17,6 +17,7 @@
 
 #include <hip/hip_runtime.h>
 #include <math.h>
+#include <mutex>
 #include <string.h>
 #include "../hip_quant_util.h"
 
@@ -83,18 +84,20 @@ static float mxfp4_ue8m0_to_scale(uint8_t encoded) {
 }
 
 extern "C" void init_mxfp4_lut() {
-    static bool done = false;
-    if (done) return;
-    uint8_t lut[4096];
-    for (int code = 0; code < 16; ++code) {
-        float fp32 = mxfp4_e2m1_to_fp32(code);
-        for (int scale = 0; scale < 256; ++scale) {
-            float scaled = fp32 * mxfp4_ue8m0_to_scale(scale);
-            lut[code * 256 + scale] = host_fp32_to_fp8_e4m3(scaled);
+    // std::call_once: the LUT build + hipMemcpyToSymbol must happen exactly
+    // once even if several host threads hit the first launch concurrently.
+    static std::once_flag once;
+    std::call_once(once, [] {
+        uint8_t lut[4096];
+        for (int code = 0; code < 16; ++code) {
+            float fp32 = mxfp4_e2m1_to_fp32(code);
+            for (int scale = 0; scale < 256; ++scale) {
+                float scaled = fp32 * mxfp4_ue8m0_to_scale(scale);
+                lut[code * 256 + scale] = host_fp32_to_fp8_e4m3(scaled);
+            }
         }
-    }
-    hipMemcpyToSymbol(HIP_SYMBOL(mxfp4_e2m1_ue8m0_to_e4m3_lut), lut, 4096, 0, hipMemcpyHostToDevice);
-    done = true;
+        hipMemcpyToSymbol(HIP_SYMBOL(mxfp4_e2m1_ue8m0_to_e4m3_lut), lut, 4096, 0, hipMemcpyHostToDevice);
+    });
 }
 
 // ── Main kernel ─────────────────────────────────────────────────────

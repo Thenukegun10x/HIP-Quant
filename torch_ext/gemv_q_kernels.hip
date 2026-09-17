@@ -31,10 +31,12 @@
 #define GGML_TYPE_IQ4_XS 23
 #define GGML_TYPE_IQ1_M 29
 
-// Benchmark-only host-side dispatch selector.  It is read while queuing the
-// kernel launch, so resetting it immediately after a launch is safe.
+// Benchmark-only host-side dispatch selector. It is both set and read on the
+// calling host thread (dispatch_gemv_q runs inline during the launch), so
+// thread_local gives per-thread isolation and removes the data race between
+// concurrent launches; regular inference always sees variant 0.
 extern "C" {
-static int gemv_tune_variant_storage = 0;
+static thread_local int gemv_tune_variant_storage = 0;
 void gemv_tune_set_variant(int variant) { gemv_tune_variant_storage = variant; }
 int gemv_tune_get_variant() { return gemv_tune_variant_storage; }
 }
@@ -1112,13 +1114,16 @@ __global__ void gemv_iq2s_dot2_kernel(
     const int half_row = lane_id >> 4;
     const int lane16 = lane_id & 15;
     const int n = blockIdx.x * ROWS_PER_BLOCK + 2 * wave_id + half_row;
-    if (n >= N) return;
+    // n is uniform across each 16-lane half-wave. Never return early here:
+    // every lane must reach the __shfl_down reduction below. Guard instead.
+    const bool n_valid = (n < N);
 
     const int l = lane16 >> 2;
     const int j = (lane16 & 3) << 1;
-    const block_iq2_s* row = weights + (size_t)n * row_stride_sb;
+    const block_iq2_s* row = weights + (size_t)(n_valid ? n : 0) * row_stride_sb;
     float sum = 0.0f;
     const int num_superblocks = K / 256;
+    if (n_valid) {
     #pragma unroll 2
     for (int b = 0; b < num_superblocks; ++b) {
         const block_iq2_s* blk = row + b;
@@ -1142,12 +1147,13 @@ __global__ void gemv_iq2s_dot2_kernel(
             sum = fmaf(dl, amd_mixed_dot(w_pair, x_pair, 0.0f, false), sum);
         }
     }
+    }  // if (n_valid)
 
     #pragma unroll
     for (int offset = 8; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset, 16);
     }
-    if (lane16 == 0) {
+    if (n_valid && lane16 == 0) {
         if (has_bias) sum += __half2float(bias[n]);
         y[n] = __float2half(sum);
     }

@@ -151,6 +151,12 @@ def _resolve_dll(dll_path=None):
     if dll_path is not None:
         return dll_path
     env_dll = os.environ.get("HIP_QUANT_DLL") or os.environ.get("HIP_QUANT_DLL_PATH")
+    if env_dll and not os.path.isabs(env_dll):
+        # A relative override resolves against the CWD (DLL hijack); refuse it.
+        raise ValueError(
+            "HIP_QUANT_DLL / HIP_QUANT_DLL_PATH must be an absolute path, got "
+            f"{env_dll!r}"
+        )
     win_names = ["hip_quantize_rocm721.dll", "hip_quantize.dll"]
     if os.environ.get("HIP_QUANT_DLL_VARIANT", "").lower() in ("7.1", "71", "rocm71", "legacy"):
         win_names.reverse()

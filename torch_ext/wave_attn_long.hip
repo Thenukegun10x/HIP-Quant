@@ -78,7 +78,8 @@ __global__ void wave_attn_long_paged(
     int kt_end_global = total_k_tiles;
     if (is_causal) {
         int max_q_in_block = q_start + q_block_start + Q_TILE - 1;
-        int m = (max_q_in_block + K_TILE - 1) / K_TILE;
+        // floor(max/K_TILE) + 1 (see wave_attn.hip); ceil() drops the diagonal.
+        int m = (max_q_in_block + K_TILE) / K_TILE;
         if (kt_end_global > m) kt_end_global = m;
         if (recent_tile_start > kt_end_global) recent_tile_start = kt_end_global;
         if (sink_tile_end > kt_end_global) sink_tile_end = kt_end_global;
@@ -227,6 +228,10 @@ __global__ void wave_attn_long_paged(
             #pragma unroll
             for(int d=0;d<8;d++) acc_o[d][i]*=corr;
         }
+
+        // K and V alias LDS (smem_K). All waves must finish reading K before
+        // any wave overwrites it with V (same requirement as wave_attn.hip).
+        cta.sync();
 
         // --- Load V tile (sink/recent FP8, bulk INT4 dequant) ---
         if (use_fp8_v) {

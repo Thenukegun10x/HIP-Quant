@@ -1880,10 +1880,14 @@ torch::Tensor gemv_q_forward_variant(
     int64_t variant,
     c10::optional<torch::Tensor> bias
 ) {
-    gemv_tune_set_variant((int)variant);
-    auto output = gemv_q_forward(input, weight_packed, ggml_type, output_features, bias);
-    gemv_tune_set_variant(0);
-    return output;
+    // RAII: the variant must be cleared even if gemv_q_forward throws
+    // (a TORCH_CHECK failure would otherwise leave the process stuck in
+    // tuning mode for every later launch).
+    struct VariantGuard {
+        explicit VariantGuard(int v) { gemv_tune_set_variant(v); }
+        ~VariantGuard() { gemv_tune_set_variant(0); }
+    } variant_guard((int)variant);
+    return gemv_q_forward(input, weight_packed, ggml_type, output_features, bias);
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,6 +2311,10 @@ torch::Tensor fast_rms_norm_gated_forward(
     TORCH_CHECK(gate.is_cuda() && gate.is_contiguous(), "fast_rms_norm_gated_forward: gate must be contiguous CUDA tensor");
     TORCH_CHECK(x.scalar_type() == torch::kHalf && w.scalar_type() == torch::kHalf && gate.scalar_type() == torch::kHalf,
                 "fast_rms_norm_gated_forward: x/w/gate must be FP16 (kernel reinterprets bits as half)");
+    // The kernel is specialised for head_dim == 128 (one lane covers
+    // lane+0/32/64/96); any other head_dim reads/writes past the row.
+    TORCH_CHECK(head_dim == 128,
+                "fast_rms_norm_gated_forward: head_dim must be 128 (specialised kernel), got ", head_dim);
     const int64_t head_total = num_heads * head_dim;
     TORCH_CHECK(x.numel() % head_total == 0, "fast_rms_norm_gated_forward: x must be a multiple of num_heads*head_dim elements, got ",
                 x.numel(), " for heads=", num_heads, " dim=", head_dim);
@@ -3299,6 +3307,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         int Dim = q_fp8.size(3);
         int Seq_K = k_fp8.size(2);
 
+        // The kernel keeps `v8f acc_o[8]`, i.e. 8 * 16 = 128 columns. A larger
+        // Dim would index acc_o[dt] out of bounds in the P@V and store loops.
+        TORCH_CHECK(Dim > 0 && Dim % 16 == 0 && Dim <= 128,
+                    "wave_attn_forward: Dim must be a positive multiple of 16 and <= 128 (got ",
+                    Dim, ")");
+
         TORCH_CHECK(k_fp8.size(0) == B && k_fp8.size(1) == H && k_fp8.size(3) == Dim, "K shape mismatch");
         TORCH_CHECK(v_fp8.size(0) == B && v_fp8.size(1) == H && v_fp8.size(3) == Dim, "V shape mismatch");
 
@@ -3380,6 +3394,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         int Seq_Q = q_int4.size(2);
         Dim = q_int4.size(3) * 2;
         Seq_K = k_int4.size(2);
+        // acc_o[8] caps the kernel at 128 columns (see wave_attn_forward).
+        TORCH_CHECK(Dim > 0 && Dim % 16 == 0 && Dim <= 128,
+                    "wave_attn_int4_forward: Dim must be a positive multiple of 16 and <= 128 (got ",
+                    Dim, ")");
         TORCH_CHECK(q_int4.size(0)==B && q_int4.size(1)==H, "Q batch/head mismatch");
         TORCH_CHECK(k_int4.size(0)==B && k_int4.size(1)==H, "K batch/head mismatch");
         TORCH_CHECK(v_fp8.size(0)==B && v_fp8.size(1)==H && v_fp8.size(3)==Dim, "V shape mismatch");

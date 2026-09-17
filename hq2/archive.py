@@ -647,6 +647,8 @@ def _parse_v1(path: Path, raw_header: bytes, file_size: int) -> HQModel:
         raise ValueError(f"Unsupported legacy HQ2 model archive {path}")
     if payload_start < _LEGACY_HEADER.size or payload_start % PAYLOAD_ALIGNMENT:
         raise ValueError(f"Invalid legacy HQ2 payload start {payload_start}")
+    if payload_start > file_size:
+        raise ValueError(f"Legacy HQ2 payload start {payload_start} exceeds file size {file_size}")
     if manifest_size > payload_start - _LEGACY_HEADER.size:
         raise ValueError("Legacy HQ2 archive manifest exceeds reserved header region")
     with path.open("rb") as file:

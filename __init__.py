@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 
-__version__ = "2.2.0.post215"
+__version__ = "2.2.1"
 
 
 _TORCH_EXPORTS = {
@@ -284,6 +284,13 @@ def _add_runtime_dll_dirs():
 def _shared_library_candidates():
     env_dll = os.environ.get("HIP_QUANT_DLL") or os.environ.get("HIP_QUANT_DLL_PATH")
     if env_dll:
+        # Only an absolute override is safe: a bare/relative name is resolved
+        # against the process CWD and can be shadowed by an attacker (DLL hijack).
+        if not os.path.isabs(env_dll):
+            raise ValueError(
+                "HIP_QUANT_DLL / HIP_QUANT_DLL_PATH must be an absolute path, got "
+                f"{env_dll!r}"
+            )
         yield env_dll
 
     win_names = ["hip_quantize_rocm721.dll", "hip_quantize.dll"]
@@ -389,7 +396,7 @@ class HipQuant:
             self._dequantize_tensor_to_fp8 = None
         self._dll.ggml_type_size_for.restype = ctypes.c_size_t
         self._dll.ggml_type_size_for.argtypes = [ctypes.c_int]
-        self._dll.ggml_blck_size_for.restype = ctypes.c_size_t
+        self._dll.ggml_blck_size_for.restype = ctypes.c_int
         self._dll.ggml_blck_size_for.argtypes = [ctypes.c_int]
         self._dll.ggml_row_size_for.restype = ctypes.c_size_t
         self._dll.ggml_row_size_for.argtypes = [ctypes.c_int, ctypes.c_int64]
@@ -855,6 +862,16 @@ class HipQuant:
         im_ptr = None
         if imatrix is not None:
             imatrix = np.ascontiguousarray(imatrix, dtype=np.float32)
+            # The native kernel indexes imatrix + row*n_per_row for every row,
+            # i.e. it reads exactly arr_fp8.size floats. Require at least that
+            # many (a short buffer is a host hipMemcpy + device OOB read), then
+            # reshape so the row indexing is well defined.
+            if imatrix.size != arr_fp8.size:
+                raise ValueError(
+                    f"imatrix has {imatrix.size} elements but FP8 input has "
+                    f"{arr_fp8.size} ({arr_fp8.shape})"
+                )
+            imatrix = imatrix.reshape(arr_fp8.shape)
             im_ptr = imatrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         if isinstance(source_format, str):
             source_format = source_format.upper()

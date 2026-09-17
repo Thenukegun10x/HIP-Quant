@@ -92,9 +92,17 @@ def _load_tensor(gf: gguf.GGUFFile, t: gguf.GGUFTensor,
     if t.ggml_type in GGML_Q_TO_FP8_SUPPORTED and to_fp8:
         _, block_size, _ = GGML_Q_TO_FP8_SUPPORTED[t.ggml_type]
         n_per_row = t.shape[-1]
+        # Validate explicitly: `assert` is stripped under `python -O` and the
+        # GGUF parser only guarantees the *total* element count is block
+        # aligned, not the last dimension (e.g. ne=[16,2] for Q4_0).
+        if n_per_row <= 0:
+            raise gguf.GGUFError(f"tensor {t.name!r}: empty last dimension {t.shape}")
+        if t.n_elements % n_per_row != 0 or n_per_row % block_size != 0:
+            raise gguf.GGUFError(
+                f"tensor {t.name!r} ({t.type_name}, shape {t.shape}): "
+                f"row length {n_per_row} is not a multiple of block size {block_size}"
+            )
         nrows = t.n_elements // n_per_row
-        assert t.n_elements % n_per_row == 0, t.name
-        assert n_per_row % block_size == 0, (t.name, t.shape)
         staged = torch.frombuffer(raw, dtype=torch.uint8).to(device)
         fp8 = dequantize_q_to_e4m3(staged, t.ggml_type, n_per_row)
         fp8 = fp8.reshape(nrows, n_per_row)

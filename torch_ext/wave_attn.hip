@@ -394,7 +394,11 @@ __global__ void wave_attn_kernel_templated(
 
     if (is_causal) {
         int max_q_in_block = q_start + q_block_start + Q_TILE - 1;
-        int m = (max_q_in_block + K_TILE - 1) / K_TILE;
+        // Tiles needed to cover keys 0..max_q_in_block inclusive:
+        // floor(max/K_TILE) + 1 == (max + K_TILE) / K_TILE.  The (x + K_TILE
+        // - 1)/K_TILE form is ceil() and drops the diagonal tile whenever
+        // max_q_in_block is a multiple of K_TILE.
+        int m = (max_q_in_block + K_TILE) / K_TILE;
         if (kt_end > m) kt_end = m;
     }
 
@@ -490,6 +494,11 @@ __global__ void wave_attn_kernel_templated(
                 acc_o[d][i] *= corr_alpha;
             }
         }
+
+        // K and V alias LDS (smem_K). Every wave must finish reading K in
+        // Phase 1 before any wave overwrites it with V. This barrier is
+        // required and mirrors wave_attn_prefill.hip.
+        cta.sync();
 
         // ── Load V tile (all threads, reuses K's LDS) ──────────
         load_v_tile_transposed_wave_fast<K_TILE, LDV>(V_fp8 + v_off, smem_K, ks, K_TILE, Dim, Seq_K,

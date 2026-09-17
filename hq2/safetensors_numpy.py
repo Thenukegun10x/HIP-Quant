@@ -11,6 +11,7 @@ it is for bounded, read-only analysis rather than checkpoint loading.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import struct
 from typing import Any
@@ -92,7 +93,7 @@ class SafeTensorNumpyFile:
         nbytes = end - begin
         if byte_offset + nbytes > self._file_size:
             raise ValueError(f"{name!r} extends beyond the end of {self.path}")
-        count = int(np.prod(shape, dtype=np.int64))
+        count = math.prod(shape)
 
         if dtype_name == "BF16":
             if nbytes != count * 2:
@@ -139,7 +140,7 @@ class SafeTensorNumpyFile:
         stop = rows if stop is None else int(stop)
         if start < 0 or stop < start or stop > rows:
             raise ValueError(f"Row range [{start}, {stop}) is invalid for {name!r} with {rows} rows")
-        row_values = int(np.prod(shape[1:], dtype=np.int64))
+        row_values = math.prod(shape[1:])
 
         if dtype_name == "BF16":
             element_dtype = np.dtype("<u2")
@@ -148,7 +149,7 @@ class SafeTensorNumpyFile:
                 element_dtype = _NUMPY_DTYPES[dtype_name]
             except KeyError as error:
                 raise ValueError(f"{name!r} uses unsupported SafeTensors dtype {dtype_name!r}") from error
-        expected_bytes = int(np.prod(shape, dtype=np.int64)) * element_dtype.itemsize
+        expected_bytes = math.prod(shape) * element_dtype.itemsize
         if offsets[1] - offsets[0] != expected_bytes:
             raise ValueError(f"{name!r} payload length does not match its shape and dtype")
         byte_offset = self._data_start + offsets[0] + start * row_values * element_dtype.itemsize

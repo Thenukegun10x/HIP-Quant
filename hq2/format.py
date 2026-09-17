@@ -7,6 +7,7 @@ bytes here are valid on CPU, CUDA, ROCm, and future Vulkan implementations.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,9 @@ def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 def block_count(shape: tuple[int, ...]) -> int:
     shape = validate_shape(shape)
-    return int(np.prod(shape, dtype=np.int64) // BLOCK_SIZE)
+    # math.prod keeps Python big-ints: np.prod(dtype=int64) wraps negative for
+    # large multi-dim shapes and would defeat the size check.
+    return math.prod(shape) // BLOCK_SIZE
 
 
 def packed_nbytes(shape: tuple[int, ...]) -> int:

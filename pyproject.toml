@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hip-quant"
-version = "2.2.0.post215"
+version = "2.2.1"
 description = "High-performance GPU tensor quantization and inference engine for AMD ROCm. Native AOT GEMV (K-Quants & I-Quants), State Space Model (SSM/DeltaNet) kernels, FP8 WMMA WaveAttention, and portable HIP C++ kernels for RDNA4, RDNA3, and CDNA."
 readme = "README.md"
 
@@ -45,6 +45,12 @@ Issues = "https://github.com/Thenukegun10x/HIP-Quant/issues"
 [project.optional-dependencies]
 torch = [
     "torch>=2.0"
+]
+# Custom PyTorch 2.15 (ROCm 7.14) build; needs --find-links to the index page.
+torch215 = [
+    "torch==2.15.0a0+gitf07882e"
+    # torchvision==0.30.0a0+ac8d215
+    # torchaudio==2.11.0a0+b85c99c
 ]
 
 [project.scripts]
@@ -88,6 +94,8 @@ include-package-data = false
     "smi.py",
     "tools/gpu-smi.exe",
     "tools/gpu-smi",
+    "tools/.gpu-smi-version",
+    "tools/fetch_gpu_smi.py",
     "device_info.py",
     "cdna_compat.py",
     "setup_torch.py",

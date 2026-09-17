@@ -1091,7 +1091,7 @@ HIP_QUANT_EXPORT size_t quantize_tensor_aq2_iters(
     const float* imatrix,
     int aq2_iterations
 ) {
-    if (type != 39 && type != 40 && type != 41) {
+    if (type != 31 && type != 32 && type != 33) {
         fprintf(stderr, "hip_quantize: quantize_tensor_aq2_iters only supports AQ2/AQ2_QK/AQ2_VO (types 31-33)\n");
         return 0;
     }
