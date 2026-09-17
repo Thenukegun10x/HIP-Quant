@@ -259,7 +259,10 @@ static bool load_iq_host_codebook(
     return true;
 }
 
-static bool ensure_initialized() {
+// Device-only init: enumerate, select, and cache device properties. Kept
+// separate from I-Quant codebook loading so a missing codebook cannot brick
+// device detection (arch/name/selected_device) for every other format.
+static bool ensure_device() {
     if (!hip_initialized) {
         int count = 0;
         if (!hip_check(hipGetDeviceCount(&count), "hipGetDeviceCount")) return false;
@@ -297,6 +300,14 @@ static bool ensure_initialized() {
         if (!hip_check(hipGetDeviceProperties(&props, device_id), "hipGetDeviceProperties")) return false;
         hip_initialized = true;
     }
+    return true;
+}
+
+// Full init: device + all I-Quant codebooks. Used by the format entry points
+// that may need a codebook, so a missing file fails those calls loudly instead
+// of letting kernels read un-uploaded device tables and return wrong results.
+static bool ensure_initialized() {
+    if (!ensure_device()) return false;
     if (!iq3xxs_tables_loaded) {
         iq_host_codebook table = {};
         if (!load_iq_host_codebook("iq3_xxs", 256 * 4, 4096 * sizeof(int), 22825 * sizeof(uint16_t), &table)) return false;
@@ -544,7 +555,7 @@ HIP_QUANT_EXPORT size_t ggml_row_size_for(int type, int64_t n_per_row) {
 
 HIP_QUANT_EXPORT const char* get_device_name() {
     static thread_local char name[256];
-    if (!ensure_initialized()) return "";
+    if (!ensure_device()) return "";
     strncpy(name, props.name, 255);
     name[255] = '\0';
     return name;
@@ -1839,7 +1850,7 @@ HIP_QUANT_EXPORT int get_device_prop(
 }
 
 HIP_QUANT_EXPORT int get_arch_name(char *buf, int buf_size) {
-    if (!ensure_initialized()) return 1;
+    if (!ensure_device()) return 1;
     strncpy(buf, props.gcnArchName, (size_t)(buf_size - 1));
     buf[buf_size - 1] = '\0';
     return 0;
@@ -1849,7 +1860,7 @@ HIP_QUANT_EXPORT int get_arch_name(char *buf, int buf_size) {
 // index is relative to HIP_VISIBLE_DEVICES when that environment variable is
 // set before the process starts.
 HIP_QUANT_EXPORT int get_selected_device() {
-    return ensure_initialized() ? device_id : -1;
+    return ensure_device() ? device_id : -1;
 }
 
 HIP_QUANT_EXPORT int get_hip_runtime_version() {
@@ -1859,7 +1870,7 @@ HIP_QUANT_EXPORT int get_hip_runtime_version() {
 }
 
 HIP_QUANT_EXPORT int get_device_memory(size_t *free_bytes, size_t *total_bytes) {
-    if (!ensure_initialized()) {
+    if (!ensure_device()) {
         *free_bytes = 0;
         *total_bytes = 0;
         return 1;
@@ -1874,7 +1885,7 @@ HIP_QUANT_EXPORT int get_device_memory(size_t *free_bytes, size_t *total_bytes) 
 }
 
 HIP_QUANT_EXPORT int device_has_wmma() {
-    if (!ensure_initialized()) return 0;
+    if (!ensure_device()) return 0;
     const char *arch = props.gcnArchName;
     // This reports support for the FP8/BF8 gfx12 w32 intrinsics used by
     // fp8_gemm_wmma_kernel, not general matrix-core or rocWMMA capability.

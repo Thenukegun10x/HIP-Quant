@@ -64,7 +64,8 @@ __pycache__/
 
 # Debug / scratch dump directories
 debug_dump/
-codebooks/
+# NOTE: codebooks/*.bin are RUNTIME assets required by hip_quantize.cpp
+# (ensure_initialized). They MUST stay tracked — do not ignore codebooks/.
 
 # Separately-versioned vendored copy of llama.cpp + benchmark outputs (not part of this repo)
 Own Quant/

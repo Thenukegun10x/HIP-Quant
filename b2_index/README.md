@@ -18,7 +18,7 @@ rclone copyto b2_index/torch_index.html torch-upload:Torchs/torch_index.html
 
 ## Install
 ```powershell
-pip install "hip-quant==2.2.1.post215" `
+pip install "hip-quant==2.2.2.post215" `
   --find-links https://dl.hipquant.download/file/Torchs/torch_index.html
 ```
 

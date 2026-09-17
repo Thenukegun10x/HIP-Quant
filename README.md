@@ -14,6 +14,14 @@
 
 `hip-quant` is a standalone Python library and highly optimized HIP C++ backend for tensor quantization and accelerated LLM inference on AMD GPUs with zero CPU round-trips.
 
+## 🌟 What's New in 2.2.2
+
+> **2.2.2.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14).
+
+- **Fixed a packaging bug that silently disabled the gfx12 FP8 WMMA path.** `codebooks/iq2_s.bin` was matched by `.gitignore` and never tracked, so it was missing from git, the sdist, and every wheel built from a clean tree. `ensure_initialized()` requires all six I-Quant codebooks and returned failure, which made `get_arch_name`/`get_device_name`/`get_selected_device` report empty — and the `gfx12` gate then failed closed. The codebook is now tracked and shipped, and `codebooks/` is no longer ignored.
+- **Device detection is decoupled from codebook loading.** `get_device_name`, `get_arch_name`, `get_selected_device`, `get_device_memory` and `device_has_wmma` now only require the device to initialise, so a missing or corrupt codebook fails the I-Quant formats loudly instead of bricking GPU detection for every format.
+- The `_C` extension is unchanged from 2.2.1; the Windows `hip_quantize*.dll` were rebuilt with the init split (both all-arch targets).
+
 ## 🌟 What's New in 2.2.1
 
 > **2.2.1.post215** is the same release rebuilt against PyTorch 2.15 (TheRock / ROCm 7.14). See *Custom PyTorch 2.15* below for a self-hosted install index.
@@ -349,11 +357,11 @@ matches your PyTorch, so the extension loads without an ABI mismatch:
 
 | Wheel | PyTorch | ROCm |
 |---|---|---|
-| `hip-quant==2.2.1` | 2.9.x | ROCm 7.2.1 |
-| `hip-quant==2.2.1.post215` | 2.15 / TheRock | ROCm 7.14 |
+| `hip-quant==2.2.2` | 2.9.x | ROCm 7.2.1 |
+| `hip-quant==2.2.2.post215` | 2.15 / TheRock | ROCm 7.14 |
 
 ```powershell
-pip install "hip-quant==2.2.1.post215"   # PyTorch 2.15 / TheRock
+pip install "hip-quant==2.2.2.post215"   # PyTorch 2.15 / TheRock
 ```
 
 #### Custom PyTorch 2.15 (self-hosted wheels)
@@ -363,7 +371,7 @@ Its wheels live in a public Backblaze B2 bucket; point pip at the index page
 with `--find-links`:
 
 ```powershell
-pip install "hip-quant==2.2.1.post215" `
+pip install "hip-quant==2.2.2.post215" `
   --find-links https://dl.hipquant.download/file/Torchs/torch_index.html
 ```
 
